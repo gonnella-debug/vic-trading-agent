@@ -238,12 +238,19 @@ async def execute_trade(strategy: str, side: str, entry: float):
     }
     strat["trades_today"] += 1
 
+    strategy_labels = {
+        "tv_webhook": "1️⃣ TradingView",
+        "ema_crossover": "2️⃣ EMA Crossover",
+        "rsi_divergence": "3️⃣ RSI Divergence",
+        "vwap_bounce": "4️⃣ VWAP Bounce",
+        "bb_squeeze": "5️⃣ BB Squeeze",
+    }
+    label = strategy_labels.get(strategy, strategy)
+    arrow = "🟢" if side == "long" else "🔴"
     msg = (
-        f"📈 <b>NEW {side.upper()}</b> — {strategy}\n"
-        f"Entry: ${entry:,.2f}\n"
-        f"SL: ${sl:,.2f}  |  TP: ${tp:,.2f}\n"
-        f"Size: {size:.6f} BTC\n"
-        f"Mode: {state.mode.upper()}"
+        f"{arrow} <b>{side.upper()}</b> — {label}\n"
+        f"Entry ${entry:,.2f} | SL ${sl:,.2f} | TP ${tp:,.2f}\n"
+        f"Risk $20 → Target $60"
     )
     await tg_send(msg)
     log.info(msg.replace("<b>", "").replace("</b>", ""))
@@ -288,12 +295,19 @@ async def close_position(strategy: str, exit_price: float, reason: str):
         "time": datetime.now(timezone.utc).isoformat(),
     })
 
-    emoji = "✅" if pnl >= 0 else "❌"
+    strategy_labels = {
+        "tv_webhook": "1️⃣ TradingView",
+        "ema_crossover": "2️⃣ EMA Crossover",
+        "rsi_divergence": "3️⃣ RSI Divergence",
+        "vwap_bounce": "4️⃣ VWAP Bounce",
+        "bb_squeeze": "5️⃣ BB Squeeze",
+    }
+    label = strategy_labels.get(strategy, strategy)
+    emoji = "💰" if pnl >= 0 else "💸"
     msg = (
-        f"{emoji} <b>CLOSED {pos['side'].upper()}</b> — {strategy}\n"
-        f"Entry: ${pos['entry']:,.2f}  →  Exit: ${exit_price:,.2f}\n"
-        f"PnL: ${pnl:+,.2f}  |  Reason: {reason}\n"
-        f"Daily PnL: ${strat['daily_pnl']:+,.2f}"
+        f"{emoji} <b>CLOSED</b> — {label}\n"
+        f"${pos['entry']:,.2f} → ${exit_price:,.2f} | <b>${pnl:+,.2f}</b>\n"
+        f"Strategy today: ${strat['daily_pnl']:+,.2f}"
     )
     await tg_send(msg)
     log.info(msg.replace("<b>", "").replace("</b>", ""))
@@ -694,12 +708,16 @@ async def startup():
 
     webhook_url = f"{RAILWAY_URL}/webhook/tradingview?token={WEBHOOK_SECRET}" if RAILWAY_URL else "N/A"
     startup_msg = (
-        f"🤖 <b>Vic is online</b>\n"
-        f"Mode: {state.mode.upper()} trading\n"
-        f"Strategies: 5 active\n"
-        f"Pair: BTC/USDT perp\n"
-        f"Leverage: {LEVERAGE}x\n"
-        f"Capital: $1,000 ($200/strategy)\n"
+        f"🤖 <b>Vic is online — {state.mode.upper()} MODE</b>\n"
+        f"BTC/USDT perp | {LEVERAGE}x leverage | $1,000 capital\n\n"
+        f"<b>5 Strategies Active:</b>\n"
+        f"1️⃣ <b>TradingView Webhook</b> — AYN-INDICATOR signals via webhook\n"
+        f"2️⃣ <b>EMA Crossover</b> — 9/21 EMA cross on 1m candles + RSI filter\n"
+        f"3️⃣ <b>RSI Divergence</b> — Price vs RSI divergence on 5m candles\n"
+        f"4️⃣ <b>VWAP Bounce</b> — Price bouncing off VWAP on 1m candles\n"
+        f"5️⃣ <b>BB Squeeze</b> — Bollinger Band squeeze breakout on 5m candles\n\n"
+        f"$200 per strategy | $20 risk per trade | 1:3 R/R\n"
+        f"Max daily loss: $40/strategy (auto-pauses)\n\n"
         f"Webhook: {webhook_url}"
     )
     await tg_send(startup_msg)
@@ -716,7 +734,6 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     log.info("Vic shutting down.")
-    await tg_send("⚠️ Vic is shutting down.")
     await close_exchange()
 
 
