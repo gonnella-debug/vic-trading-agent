@@ -122,7 +122,7 @@ async def tg_send(text: str):
 async def init_exchange():
     """Create and configure the OKX ccxt instance."""
     global exchange
-    exchange = ccxt.okx({
+    config = {
         "apiKey": OKX_API_KEY,
         "secret": OKX_SECRET_KEY,
         "password": OKX_PASSPHRASE,
@@ -130,12 +130,13 @@ async def init_exchange():
         "options": {
             "defaultType": "swap",   # perpetual futures
         },
-    })
+    }
     if state.mode == "paper":
-        exchange.set_sandbox_mode(True)
+        config["sandbox"] = True
+    exchange = ccxt.okx(config)
     try:
         await exchange.load_markets()
-        log.info("OKX exchange connected. Markets loaded.")
+        log.info(f"OKX exchange connected ({'sandbox' if state.mode == 'paper' else 'live'}). Markets loaded.")
     except Exception as exc:
         log.error("Exchange init error (non-fatal, will retry): %s", exc)
 
