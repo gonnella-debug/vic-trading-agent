@@ -249,8 +249,7 @@ async def execute_trade(strategy: str, side: str, entry: float):
     arrow = "🟢" if side == "long" else "🔴"
     msg = (
         f"{arrow} <b>{side.upper()}</b> — {label}\n"
-        f"Entry ${entry:,.2f} | SL ${sl:,.2f} | TP ${tp:,.2f}\n"
-        f"Risk $20 → Target $60"
+        f"Entry ${entry:,.2f} | SL ${sl:,.2f} | TP ${tp:,.2f}"
     )
     await tg_send(msg)
     log.info(msg.replace("<b>", "").replace("</b>", ""))
