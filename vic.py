@@ -1,6 +1,6 @@
 """
 Vic — BTC/USDT Perpetual Futures Scalping Agent (v2)
-Runs 4 strategies simultaneously on OKX via ccxt.
+Runs 5 strategies simultaneously on OKX via ccxt.
 Paper trading mode by default. Production-ready for Railway.
 
 Strategies:
@@ -8,10 +8,17 @@ Strategies:
   2. RSI Divergence ($300 capital)
   3. BB Squeeze Breakout ($300 capital)
   4. VWAP Bounce ($200 capital)
+  5. Yilmaz AO+Stoch+RSI+ATR ($200 capital)
 
 Regime filter: TRENDING / RANGING / TRANSITIONAL / VOLATILE
 1H bias: Strong bullish/bearish or neutral
 Risk: $20 per trade, 1:3 R:R, max 4 trades/day, -3R daily cap
+
+Env vars needed:
+  OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+  TRADING_MODE (paper|live), WEBHOOK_SECRET, RAILWAY_URL
+  CLAUDE_API_KEY (for Telegram chat feature)
 """
 
 import os
@@ -51,6 +58,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 TRADING_MODE = os.getenv("TRADING_MODE", "paper")  # paper | live
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
 RAILWAY_URL = os.getenv("RAILWAY_URL", "")
+CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -71,6 +79,7 @@ STRATEGY_CAPITAL = {
     "rsi_divergence": 300.0,
     "bb_squeeze": 300.0,
     "vwap_bounce": 200.0,
+    "yilmaz": 200.0,
 }
 
 # Strategy max hold times in minutes
@@ -79,13 +88,23 @@ STRATEGY_MAX_HOLD = {
     "rsi_divergence": 240,
     "bb_squeeze": 90,
     "vwap_bounce": 60,
+    "yilmaz": 120,
 }
 
-STRATEGY_NAMES = ["tv_webhook", "rsi_divergence", "bb_squeeze", "vwap_bounce"]
+STRATEGY_NAMES = ["tv_webhook", "rsi_divergence", "bb_squeeze", "vwap_bounce", "yilmaz"]
 
 # Paper test: 50 trades OR 2 weeks
 PAPER_TEST_MIN_TRADES = 50
 PAPER_TEST_MAX_DAYS = 14
+
+# Strategy labels for Telegram messages
+STRATEGY_LABELS = {
+    "tv_webhook": "1\ufe0f\u20e3 TradingView",
+    "rsi_divergence": "2\ufe0f\u20e3 RSI Divergence",
+    "bb_squeeze": "3\ufe0f\u20e3 BB Squeeze",
+    "vwap_bounce": "4\ufe0f\u20e3 VWAP Bounce",
+    "yilmaz": "5\ufe0f\u20e3 Yilmaz AO+Stoch",
+}
 
 # ---------------------------------------------------------------------------
 # Regime enum
@@ -161,6 +180,11 @@ class TradingState:
         # Cache for OHLCV data
         self._ohlcv_cache: dict = {}
 
+        # Signal tracking for periodic status log
+        self.signals_checked: int = 0
+        self.signals_blocked: int = 0
+        self.last_block_reasons: list = []  # keep last 20
+
     def reset_daily(self):
         self.trades_today = 0
         self.daily_pnl = 0.0
@@ -171,6 +195,9 @@ class TradingState:
             self.strategies[name]["daily_pnl"] = 0.0
             self.strategies[name]["trades_today"] = 0
             self.strategies[name]["paused"] = False
+        self.signals_checked = 0
+        self.signals_blocked = 0
+        self.last_block_reasons = []
         log.info("Daily PnL and trade counts reset.")
 
 
@@ -194,6 +221,21 @@ async def tg_send(text: str):
                 log.error("Telegram send failed: %s", resp.text)
     except Exception as exc:
         log.error("Telegram error: %s", exc)
+
+
+async def tg_reply(chat_id: str, text: str):
+    """Send a reply to a specific Telegram chat_id."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(url, json=payload)
+            if resp.status_code != 200:
+                log.error("Telegram reply failed: %s", resp.text)
+    except Exception as exc:
+        log.error("Telegram reply error: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +336,24 @@ def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     """Calculate ATR using ta library."""
     indicator = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=period)
     return indicator.average_true_range()
+
+
+def calc_stochastic(df: pd.DataFrame, k_period: int = 14, d_period: int = 3, smooth_k: int = 3) -> tuple:
+    """Calculate Stochastic Oscillator K and D lines."""
+    indicator = ta.momentum.StochasticOscillator(
+        df["high"], df["low"], df["close"],
+        window=k_period, smooth_window=smooth_k
+    )
+    k = indicator.stoch()
+    d = indicator.stoch_signal()
+    return k, d
+
+
+def calc_awesome_oscillator(df: pd.DataFrame) -> pd.Series:
+    """Calculate Awesome Oscillator: SMA(HL2, 5) - SMA(HL2, 34)."""
+    hl2 = (df["high"] + df["low"]) / 2
+    ao = hl2.rolling(window=5).mean() - hl2.rolling(window=34).mean()
+    return ao
 
 
 # ---------------------------------------------------------------------------
@@ -494,7 +554,7 @@ def vwap_chop_filter(df: pd.DataFrame, vwap_series: pd.Series) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Pre-Trade Checklist (Change 15)
+# Pre-Trade Checklist (Change 15) — with verbose logging
 # ---------------------------------------------------------------------------
 
 def bias_allows_direction(side: str) -> bool:
@@ -502,9 +562,16 @@ def bias_allows_direction(side: str) -> bool:
     Check if 1H bias allows this trade direction.
     Strong bias: enforce direction only.
     Weak/neutral: allow both directions.
+    In PAPER mode: weak bias allows both directions (same as default),
+    only strong bias enforces direction.
     """
-    if state.htf_bias_strength == "weak" or state.htf_bias == "neutral":
+    if state.htf_bias == "neutral":
         return True
+    if state.htf_bias_strength == "weak":
+        # Paper mode: weak bias allows both directions
+        # Live mode: also allows both (same behavior — weak = permissive)
+        return True
+    # Strong bias — enforce direction
     if state.htf_bias == "bullish" and side == "long":
         return True
     if state.htf_bias == "bearish" and side == "short":
@@ -516,17 +583,22 @@ def bias_allows_direction(side: str) -> bool:
 def regime_allows_strategy(strategy: str) -> bool:
     """
     Check if current regime allows this strategy.
-    TRENDING: VWAP pullback + BB Squeeze
-    RANGING: RSI Divergence + VWAP Bounce
-    TRANSITIONAL: RSI Divergence only
-    VOLATILE: nothing
+    TRENDING: VWAP pullback + BB Squeeze + TV Webhook
+    RANGING: RSI Divergence + VWAP Bounce + TV Webhook + Yilmaz
+    TRANSITIONAL: RSI Divergence + TV Webhook (+ ALL strategies in paper mode)
+    VOLATILE: nothing (in live) / nothing (in paper) — too dangerous
     """
     if state.regime == Regime.VOLATILE:
         return False
+
+    # Paper mode relaxation: TRANSITIONAL allows ALL strategies
+    if state.mode == "paper" and state.regime == Regime.TRANSITIONAL:
+        return True
+
     if state.regime == Regime.TRENDING:
         return strategy in ("vwap_bounce", "bb_squeeze", "tv_webhook")
     if state.regime == Regime.RANGING:
-        return strategy in ("rsi_divergence", "vwap_bounce", "tv_webhook")
+        return strategy in ("rsi_divergence", "vwap_bounce", "tv_webhook", "yilmaz")
     if state.regime == Regime.TRANSITIONAL:
         return strategy in ("rsi_divergence", "tv_webhook")
     return False
@@ -547,36 +619,103 @@ def correlation_filter_ok(side: str) -> bool:
 def can_execute_trade(strategy: str, side: str) -> tuple[bool, str]:
     """
     Master pre-trade checklist. Returns (allowed, reason).
+    Logs EVERY check with pass/fail for debugging.
     """
-    # 2. Regime allows this strategy?
-    if not regime_allows_strategy(strategy):
+    state.signals_checked += 1
+
+    # 1. Regime allows this strategy?
+    regime_ok = regime_allows_strategy(strategy)
+    log.info("CHECK %s %s — regime_allows: %s (regime=%s, mode=%s)",
+             strategy, side.upper(), regime_ok, state.regime.value, state.mode)
+    if not regime_ok:
+        reason = f"BLOCKED: {strategy} {side.upper()} — regime {state.regime.value} not allowed"
+        log.info(reason)
+        state.signals_blocked += 1
+        state.last_block_reasons.append(reason)
+        if len(state.last_block_reasons) > 20:
+            state.last_block_reasons.pop(0)
         return False, f"Regime {state.regime.value} blocks {strategy}"
 
-    # 3. 1H bias agrees or is neutral?
-    if not bias_allows_direction(side):
+    # 2. 1H bias agrees or is neutral?
+    bias_ok = bias_allows_direction(side)
+    log.info("CHECK %s %s — bias_allows: %s (bias=%s, strength=%s)",
+             strategy, side.upper(), bias_ok, state.htf_bias, state.htf_bias_strength)
+    if not bias_ok:
+        reason = f"BLOCKED: {strategy} {side.upper()} — HTF bias {state.htf_bias} (strong) blocks {side}"
+        log.info(reason)
+        state.signals_blocked += 1
+        state.last_block_reasons.append(reason)
+        if len(state.last_block_reasons) > 20:
+            state.last_block_reasons.pop(0)
         return False, f"1H bias ({state.htf_bias} strong) opposes {side}"
 
-    # 7. Trade count < 4 today?
-    if state.trades_today >= MAX_TRADES_PER_DAY:
+    # 3. Trade count < 4 today?
+    trades_ok = state.trades_today < MAX_TRADES_PER_DAY
+    log.info("CHECK %s %s — trades_ok: %s (%d/%d)",
+             strategy, side.upper(), trades_ok, state.trades_today, MAX_TRADES_PER_DAY)
+    if not trades_ok:
+        reason = f"BLOCKED: {strategy} {side.upper()} — daily trade cap {state.trades_today}/{MAX_TRADES_PER_DAY}"
+        log.info(reason)
+        state.signals_blocked += 1
+        state.last_block_reasons.append(reason)
+        if len(state.last_block_reasons) > 20:
+            state.last_block_reasons.pop(0)
         return False, f"Daily trade cap reached ({state.trades_today}/{MAX_TRADES_PER_DAY})"
 
-    # 8. No recent same-direction trade?
-    if not correlation_filter_ok(side):
+    # 4. No recent same-direction trade?
+    corr_ok = correlation_filter_ok(side)
+    log.info("CHECK %s %s — correlation_ok: %s (last_dir=%s)",
+             strategy, side.upper(), corr_ok, state.last_trade_direction)
+    if not corr_ok:
+        reason = f"BLOCKED: {strategy} {side.upper()} — correlation cooldown {CORRELATION_COOLDOWN_MIN}min"
+        log.info(reason)
+        state.signals_blocked += 1
+        state.last_block_reasons.append(reason)
+        if len(state.last_block_reasons) > 20:
+            state.last_block_reasons.pop(0)
         return False, f"Correlation cooldown: {side} blocked for {CORRELATION_COOLDOWN_MIN}min"
 
-    # 9. Daily loss cap not hit?
-    if state.daily_loss_cap_hit:
+    # 5. Daily loss cap not hit?
+    loss_ok = not state.daily_loss_cap_hit
+    log.info("CHECK %s %s — loss_cap_ok: %s (daily_pnl=%.2f)",
+             strategy, side.upper(), loss_ok, state.daily_pnl)
+    if not loss_ok:
+        reason = f"BLOCKED: {strategy} {side.upper()} — daily loss cap hit (${state.daily_pnl:.2f})"
+        log.info(reason)
+        state.signals_blocked += 1
+        state.last_block_reasons.append(reason)
+        if len(state.last_block_reasons) > 20:
+            state.last_block_reasons.pop(0)
         return False, "Daily loss cap hit (-$60)"
 
-    # 10. Strategy not paused?
+    # 6. Strategy not paused?
     strat = state.strategies[strategy]
-    if strat["paused"] or state.paused:
+    paused = strat["paused"] or state.paused
+    log.info("CHECK %s %s — not_paused: %s (strat_paused=%s, global_paused=%s)",
+             strategy, side.upper(), not paused, strat["paused"], state.paused)
+    if paused:
+        reason = f"BLOCKED: {strategy} {side.upper()} — paused (strat={strat['paused']}, global={state.paused})"
+        log.info(reason)
+        state.signals_blocked += 1
+        state.last_block_reasons.append(reason)
+        if len(state.last_block_reasons) > 20:
+            state.last_block_reasons.pop(0)
         return False, f"{strategy} or global paused"
 
-    # 11. No existing position on this strategy?
-    if strat["position"] is not None:
+    # 7. No existing position on this strategy?
+    has_pos = strat["position"] is not None
+    log.info("CHECK %s %s — no_position: %s",
+             strategy, side.upper(), not has_pos)
+    if has_pos:
+        reason = f"BLOCKED: {strategy} {side.upper()} — already has open position"
+        log.info(reason)
+        state.signals_blocked += 1
+        state.last_block_reasons.append(reason)
+        if len(state.last_block_reasons) > 20:
+            state.last_block_reasons.pop(0)
         return False, f"{strategy} already has an open position"
 
+    log.info("PASSED: %s %s — all checks OK", strategy, side.upper())
     return True, "OK"
 
 
@@ -603,10 +742,6 @@ async def execute_trade(strategy: str, side: str, entry: float):
     capital = STRATEGY_CAPITAL.get(strategy, 200.0)
 
     # Calculate SL / TP based on risk
-    # Size the SL so that $20 is at risk
-    # notional = capital * leverage, position_btc = notional / entry
-    # For a $20 risk: sl_distance = $20 / position_size_btc
-    # But we want consistent $20 risk, so: sl_distance = RISK_PER_TRADE / (capital * LEVERAGE / entry)
     position_notional = capital * LEVERAGE
     position_btc = position_notional / entry
     sl_distance = RISK_PER_TRADE / position_btc
@@ -638,7 +773,7 @@ async def execute_trade(strategy: str, side: str, entry: float):
             log.info("%s LIVE order placed: %s", strategy, order.get("id"))
         except Exception as exc:
             log.error("%s — order error: %s", strategy, exc)
-            await tg_send(f"⚠️ <b>{strategy}</b> order FAILED: {exc}")
+            await tg_send(f"\u26a0\ufe0f <b>{strategy}</b> order FAILED: {exc}")
             return
     else:
         log.info("%s PAPER trade: %s %.6f BTC @ %.2f", strategy, side.upper(), size, entry)
@@ -659,14 +794,8 @@ async def execute_trade(strategy: str, side: str, entry: float):
     state.trades_today += 1
     state.total_trade_count += 1
 
-    strategy_labels = {
-        "tv_webhook": "1️⃣ TradingView",
-        "rsi_divergence": "2️⃣ RSI Divergence",
-        "bb_squeeze": "3️⃣ BB Squeeze",
-        "vwap_bounce": "4️⃣ VWAP Bounce",
-    }
-    label = strategy_labels.get(strategy, strategy)
-    arrow = "🟢" if side == "long" else "🔴"
+    label = STRATEGY_LABELS.get(strategy, strategy)
+    arrow = "\U0001f7e2" if side == "long" else "\U0001f534"
     msg = (
         f"{arrow} <b>{side.upper()}</b> — {label}\n"
         f"Entry ${entry:,.2f} | SL ${sl:,.2f} | TP ${tp:,.2f}\n"
@@ -746,17 +875,11 @@ async def close_position(strategy: str, exit_price: float, reason: str):
     state.last_trade_direction = pos["side"]
     state.last_trade_close_time = datetime.now(timezone.utc)
 
-    strategy_labels = {
-        "tv_webhook": "1️⃣ TradingView",
-        "rsi_divergence": "2️⃣ RSI Divergence",
-        "bb_squeeze": "3️⃣ BB Squeeze",
-        "vwap_bounce": "4️⃣ VWAP Bounce",
-    }
-    label = strategy_labels.get(strategy, strategy)
-    emoji = "💰" if pnl >= 0 else "💸"
+    label = STRATEGY_LABELS.get(strategy, strategy)
+    emoji = "\U0001f4b0" if pnl >= 0 else "\U0001f4b8"
     msg = (
         f"{emoji} <b>CLOSED</b> — {label}\n"
-        f"${pos['entry']:,.2f} → ${exit_price:,.2f} | <b>${pnl:+,.2f}</b> ({r_achieved:+.1f}R)\n"
+        f"${pos['entry']:,.2f} \u2192 ${exit_price:,.2f} | <b>${pnl:+,.2f}</b> ({r_achieved:+.1f}R)\n"
         f"Reason: {reason}\n"
         f"Strategy today: ${strat['daily_pnl']:+,.2f} | Total today: ${state.daily_pnl:+,.2f}"
     )
@@ -769,7 +892,7 @@ async def close_position(strategy: str, exit_price: float, reason: str):
     if state.daily_pnl <= -MAX_DAILY_LOSS:
         state.daily_loss_cap_hit = True
         alert = (
-            f"🛑 <b>Daily loss limit hit (${state.daily_pnl:+,.2f})</b>\n"
+            f"\U0001f6d1 <b>Daily loss limit hit (${state.daily_pnl:+,.2f})</b>\n"
             f"ALL trading stopped until tomorrow."
         )
         await tg_send(alert)
@@ -857,6 +980,10 @@ async def strategy_rsi_divergence():
 
     close_vals = df["close"].values[-20:]
     rsi_vals = df["rsi"].values[-20:]
+
+    rsi_now = float(df["rsi"].iloc[-1]) if not np.isnan(df["rsi"].iloc[-1]) else 50.0
+    log.info("Checking rsi_divergence... RSI=%.1f", rsi_now)
+
     high_20 = np.nanmax(close_vals)
     low_20 = np.nanmin(close_vals)
 
@@ -881,6 +1008,8 @@ async def strategy_rsi_divergence():
     context_ok = near_support or near_resistance or away_from_vwap
 
     if not context_ok:
+        log.info("rsi_divergence — no S/R context (near_sup=%s, near_res=%s, away_vwap=%s)",
+                 near_support, near_resistance, away_from_vwap)
         return
 
     # Bullish divergence: price lower low, RSI higher low
@@ -888,6 +1017,8 @@ async def strategy_rsi_divergence():
         prev_low = price_lows[-2]
         curr_low = price_lows[-1]
         if curr_low[1] < prev_low[1] and curr_low[2] > prev_low[2]:
+            log.info("rsi_divergence — BULLISH divergence detected: price LL (%.2f<%.2f), RSI HL (%.1f>%.1f)",
+                     curr_low[1], prev_low[1], curr_low[2], prev_low[2])
             allowed, reason = can_execute_trade(name, "long")
             if allowed:
                 await execute_trade(name, "long", price_now)
@@ -898,6 +1029,8 @@ async def strategy_rsi_divergence():
         prev_high = price_highs[-2]
         curr_high = price_highs[-1]
         if curr_high[1] > prev_high[1] and curr_high[2] < prev_high[2]:
+            log.info("rsi_divergence — BEARISH divergence detected: price HH (%.2f>%.2f), RSI LH (%.1f<%.1f)",
+                     curr_high[1], prev_high[1], curr_high[2], prev_high[2])
             allowed, reason = can_execute_trade(name, "short")
             if allowed:
                 await execute_trade(name, "short", price_now)
@@ -929,6 +1062,9 @@ async def strategy_bb_squeeze():
     price = float(df["close"].iloc[-1])
     bb_upper = float(df["bb_upper"].iloc[-1])
     bb_lower = float(df["bb_lower"].iloc[-1])
+
+    log.info("Checking bb_squeeze... BW_prev=%.4f, BW_curr=%.4f, price=%.2f, upper=%.2f, lower=%.2f",
+             prev_bw, curr_bw, price, bb_upper, bb_lower)
 
     if np.isnan(bb_upper) or np.isnan(bb_lower):
         return
@@ -971,6 +1107,9 @@ async def strategy_vwap_bounce():
     if np.isnan(vwap_val):
         return
 
+    rsi_val = float(curr["rsi"]) if not np.isnan(curr["rsi"]) else 50.0
+    log.info("Checking vwap_bounce... price=%.2f, VWAP=%.2f, RSI=%.1f", price, vwap_val, rsi_val)
+
     # VWAP distance filter (Change 4, 11): must have moved >= 0.2% away before returning
     if not vwap_distance_ok(df, df["vwap"]):
         return
@@ -980,7 +1119,6 @@ async def strategy_vwap_bounce():
         return
 
     # RSI must be 40-60 (mean reversion zone)
-    rsi_val = float(curr["rsi"]) if not np.isnan(curr["rsi"]) else 50.0
     if rsi_val < 40 or rsi_val > 60:
         return
 
@@ -1017,6 +1155,60 @@ async def strategy_vwap_bounce():
 
 
 # ---------------------------------------------------------------------------
+# Strategy 5 — Yilmaz AO+Stoch+RSI+ATR (5m)
+# ---------------------------------------------------------------------------
+
+async def strategy_yilmaz():
+    """
+    Yilmaz strategy: AO + Stochastic + RSI confluence on 5m candles.
+    LONG: Stoch K < 20, RSI(10) < 30, AO rising
+    SHORT: Stoch K > 80, RSI(10) > 70, AO falling
+    SL/TP: ATR-based, enforcing $20 risk / $60 target.
+    """
+    name = "yilmaz"
+
+    df = await fetch_ohlcv("5m", 50)
+    if df.empty or len(df) < 35:
+        return
+
+    # Calculate indicators
+    ao = calc_awesome_oscillator(df)
+    stoch_k, stoch_d = calc_stochastic(df, k_period=14, d_period=3, smooth_k=3)
+    rsi_series = calc_rsi(df["close"], 10)
+    atr_series = calc_atr(df, 14)
+
+    ao_now = float(ao.iloc[-1]) if not np.isnan(ao.iloc[-1]) else 0.0
+    ao_prev = float(ao.iloc[-2]) if not np.isnan(ao.iloc[-2]) else 0.0
+    stoch_k_now = float(stoch_k.iloc[-1]) if not np.isnan(stoch_k.iloc[-1]) else 50.0
+    rsi_now = float(rsi_series.iloc[-1]) if not np.isnan(rsi_series.iloc[-1]) else 50.0
+    atr_now = float(atr_series.iloc[-1]) if not np.isnan(atr_series.iloc[-1]) else 0.0
+    price = float(df["close"].iloc[-1])
+
+    log.info("Checking yilmaz... AO=%.2f, AO_prev=%.2f, StochK=%.1f, RSI(10)=%.1f, ATR=%.2f, price=%.2f",
+             ao_now, ao_prev, stoch_k_now, rsi_now, atr_now, price)
+
+    if atr_now <= 0 or price <= 0:
+        return
+
+    # LONG: Stoch K < 20 (oversold) + RSI < 30 (oversold) + AO rising
+    if stoch_k_now < 20 and rsi_now < 30 and ao_now > ao_prev:
+        log.info("yilmaz — LONG signal: StochK=%.1f<20, RSI=%.1f<30, AO rising (%.2f>%.2f)",
+                 stoch_k_now, rsi_now, ao_now, ao_prev)
+        allowed, reason = can_execute_trade(name, "long")
+        if allowed:
+            await execute_trade(name, "long", price)
+        return
+
+    # SHORT: Stoch K > 80 (overbought) + RSI > 70 (overbought) + AO falling
+    if stoch_k_now > 80 and rsi_now > 70 and ao_now < ao_prev:
+        log.info("yilmaz — SHORT signal: StochK=%.1f>80, RSI=%.1f>70, AO falling (%.2f<%.2f)",
+                 stoch_k_now, rsi_now, ao_now, ao_prev)
+        allowed, reason = can_execute_trade(name, "short")
+        if allowed:
+            await execute_trade(name, "short", price)
+
+
+# ---------------------------------------------------------------------------
 # Background tasks
 # ---------------------------------------------------------------------------
 
@@ -1035,7 +1227,7 @@ async def strategy_monitor_loop():
     """
     Check strategies only on candle close boundaries (Change 5).
     1m strategies (vwap_bounce): check when new 1m candle closes
-    5m strategies (rsi_divergence, bb_squeeze): check when new 5m candle closes
+    5m strategies (rsi_divergence, bb_squeeze, yilmaz): check when new 5m candle closes
     """
     while True:
         try:
@@ -1074,6 +1266,10 @@ async def strategy_monitor_loop():
                     await strategy_bb_squeeze()
                 except Exception as exc:
                     log.error("bb_squeeze error: %s", exc)
+                try:
+                    await strategy_yilmaz()
+                except Exception as exc:
+                    log.error("yilmaz error: %s", exc)
 
         except Exception as exc:
             log.error("Strategy monitor error: %s", exc)
@@ -1118,7 +1314,7 @@ async def position_monitor_loop():
                     pos["sl"] = entry
                     pos["be_moved"] = True
                     sl = entry
-                    msg = f"🔄 <b>{name}</b> — SL moved to break-even (entry ${entry:,.2f})"
+                    msg = f"\U0001f504 <b>{name}</b> — SL moved to break-even (entry ${entry:,.2f})"
                     await tg_send(msg)
                     log.info(msg.replace("<b>", "").replace("</b>", ""))
 
@@ -1147,6 +1343,38 @@ async def position_monitor_loop():
         await asyncio.sleep(10)
 
 
+async def periodic_status_log():
+    """Log a periodic status summary every 5 minutes for debugging."""
+    while True:
+        await asyncio.sleep(300)  # 5 minutes
+        try:
+            open_positions = []
+            for name in STRATEGY_NAMES:
+                pos = state.strategies[name]["position"]
+                if pos is not None:
+                    open_positions.append(f"{name}({pos['side']}@{pos['entry']:.0f})")
+
+            recent_blocks = state.last_block_reasons[-5:] if state.last_block_reasons else ["none"]
+
+            log.info(
+                "=== PERIODIC STATUS ===\n"
+                "  Regime: %s | HTF Bias: %s (%s) | BTC: $%.2f | Mode: %s\n"
+                "  Signals checked: %d | Signals blocked: %d\n"
+                "  Trades today: %d/%d | Daily PnL: $%.2f | Loss cap: %s\n"
+                "  Open positions: %s\n"
+                "  Recent blocks: %s",
+                state.regime.value, state.htf_bias, state.htf_bias_strength,
+                state.last_btc_price, state.mode,
+                state.signals_checked, state.signals_blocked,
+                state.trades_today, MAX_TRADES_PER_DAY,
+                state.daily_pnl, state.daily_loss_cap_hit,
+                ", ".join(open_positions) if open_positions else "none",
+                " | ".join(recent_blocks),
+            )
+        except Exception as exc:
+            log.error("Periodic status error: %s", exc)
+
+
 async def news_sentiment_monitor():
     """Poll for BTC price moves and basic news sentiment every 5 min."""
     prev_price = 0.0
@@ -1160,9 +1388,9 @@ async def news_sentiment_monitor():
                     if change_pct >= 2.0:
                         state.paused = True
                         msg = (
-                            f"🚨 <b>VOLATILITY ALERT</b>\n"
+                            f"\U0001f6a8 <b>VOLATILITY ALERT</b>\n"
                             f"BTC moved {change_pct:.1f}% in 5 min "
-                            f"(${prev_price:,.0f} → ${price:,.0f})\n"
+                            f"(${prev_price:,.0f} \u2192 ${price:,.0f})\n"
                             f"ALL trading PAUSED."
                         )
                         await tg_send(msg)
@@ -1201,7 +1429,7 @@ async def _check_crypto_news():
                         if age_minutes < 10:
                             state.paused = True
                             msg = (
-                                f"📰 <b>NEWS ALERT</b>: \"{article.get('title', 'N/A')}\"\n"
+                                f"\U0001f4f0 <b>NEWS ALERT</b>: \"{article.get('title', 'N/A')}\"\n"
                                 f"Keyword: {kw}\n"
                                 f"ALL trading PAUSED."
                             )
@@ -1233,7 +1461,7 @@ async def send_daily_summary():
     """Build and send the daily summary with metrics (Change 17) to Telegram."""
     total_pnl = 0.0
     total_trades = 0
-    lines = ["📊 <b>DAILY SUMMARY</b>\n"]
+    lines = ["\U0001f4ca <b>DAILY SUMMARY</b>\n"]
 
     for name in STRATEGY_NAMES:
         s = state.strategies[name]
@@ -1269,7 +1497,7 @@ async def send_daily_summary():
 
 async def send_paper_test_report():
     """Send full performance report after 50 paper trades (Change 16)."""
-    lines = ["📋 <b>PAPER TEST REPORT — {0} TRADES COMPLETED</b>\n".format(state.total_trade_count)]
+    lines = ["\U0001f4cb <b>PAPER TEST REPORT \u2014 {0} TRADES COMPLETED</b>\n".format(state.total_trade_count)]
 
     overall_wins = 0
     overall_losses = 0
@@ -1314,7 +1542,139 @@ async def daily_reset_scheduler():
         log.info("Daily reset in %.0f seconds.", wait_seconds)
         await asyncio.sleep(wait_seconds)
         state.reset_daily()
-        await tg_send("🔄 Daily reset complete. All strategies resumed.")
+        await tg_send("\U0001f504 Daily reset complete. All strategies resumed.")
+
+
+# ---------------------------------------------------------------------------
+# Telegram Chat — Claude-powered market Q&A
+# ---------------------------------------------------------------------------
+
+async def telegram_polling_loop():
+    """
+    Poll Telegram for incoming text messages and respond using Claude API.
+    Does NOT conflict with webhook functionality (webhooks use FastAPI routes).
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        log.warning("TELEGRAM_BOT_TOKEN not set — Telegram polling disabled.")
+        return
+    if not CLAUDE_API_KEY:
+        log.warning("CLAUDE_API_KEY not set — Telegram chat responses disabled.")
+        return
+
+    last_update_id = 0
+    log.info("Telegram polling loop started.")
+
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+            params = {"offset": last_update_id + 1, "timeout": 30, "allowed_updates": ["message"]}
+
+            async with httpx.AsyncClient(timeout=40) as client:
+                resp = await client.get(url, params=params)
+                if resp.status_code != 200:
+                    log.error("Telegram getUpdates failed: %s", resp.text)
+                    await asyncio.sleep(5)
+                    continue
+
+                data = resp.json()
+                results = data.get("result", [])
+
+                for update in results:
+                    update_id = update.get("update_id", 0)
+                    if update_id > last_update_id:
+                        last_update_id = update_id
+
+                    message = update.get("message", {})
+                    text = message.get("text", "")
+                    chat_id = str(message.get("chat", {}).get("id", ""))
+
+                    if not text or not chat_id:
+                        continue
+
+                    # Skip bot commands that aren't questions
+                    if text.startswith("/start"):
+                        await tg_reply(chat_id, "Hey! I'm Vic, your BTC trading agent. Ask me anything about the market.")
+                        continue
+
+                    # Process the question with Claude
+                    try:
+                        answer = await ask_claude_market_question(text)
+                        await tg_reply(chat_id, answer)
+                    except Exception as exc:
+                        log.error("Claude chat error: %s", exc)
+                        await tg_reply(chat_id, f"Sorry, I hit an error: {exc}")
+
+        except Exception as exc:
+            log.error("Telegram polling error: %s", exc)
+            await asyncio.sleep(5)
+
+
+async def ask_claude_market_question(question: str) -> str:
+    """Send a market question to Claude API with current trading state context."""
+    # Build position summary
+    open_positions = []
+    for name in STRATEGY_NAMES:
+        pos = state.strategies[name]["position"]
+        if pos is not None:
+            pnl_label = ""
+            if state.last_btc_price > 0:
+                if pos["side"] == "long":
+                    unrealized = (state.last_btc_price - pos["entry"]) * pos["size"]
+                else:
+                    unrealized = (pos["entry"] - state.last_btc_price) * pos["size"]
+                pnl_label = f", unrealized ${unrealized:+.2f}"
+            open_positions.append(
+                f"{name}: {pos['side'].upper()} @ ${pos['entry']:,.2f} "
+                f"(SL ${pos['sl']:,.2f}, TP ${pos['tp']:,.2f}{pnl_label})"
+            )
+
+    positions_text = "\n".join(open_positions) if open_positions else "No open positions"
+
+    system_prompt = (
+        f"You are Vic, an AI crypto trading agent monitoring BTC/USDT perpetual futures on OKX. "
+        f"You have real-time data and run 5 strategies simultaneously.\n\n"
+        f"Current state:\n"
+        f"- BTC Price: ${state.last_btc_price:,.2f}\n"
+        f"- Regime: {state.regime.value}\n"
+        f"- 1H Bias: {state.htf_bias} ({state.htf_bias_strength})\n"
+        f"- Mode: {state.mode.upper()}\n"
+        f"- Trades today: {state.trades_today}/{MAX_TRADES_PER_DAY}\n"
+        f"- Daily PnL: ${state.daily_pnl:+,.2f}\n"
+        f"- Lifetime trades: {state.total_trade_count}\n"
+        f"- Daily loss cap: {'HIT' if state.daily_loss_cap_hit else 'OK'}\n"
+        f"- Paused: {state.paused}\n"
+        f"- Signals checked today: {state.signals_checked}, blocked: {state.signals_blocked}\n\n"
+        f"Open positions:\n{positions_text}\n\n"
+        f"Answer the user's question about the market concisely. "
+        f"Be direct, use numbers, and keep it under 300 words."
+    )
+
+    payload = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 1024,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": question}],
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": CLAUDE_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json=payload,
+        )
+        if resp.status_code != 200:
+            log.error("Claude API error: %s", resp.text)
+            return f"Claude API error ({resp.status_code}). Try again in a moment."
+
+        data = resp.json()
+        content_blocks = data.get("content", [])
+        if content_blocks:
+            return content_blocks[0].get("text", "No response from Claude.")
+        return "No response from Claude."
 
 
 # ---------------------------------------------------------------------------
@@ -1335,13 +1695,14 @@ async def startup():
 
     webhook_url = f"{RAILWAY_URL}/webhook/tradingview?token={WEBHOOK_SECRET}" if RAILWAY_URL else "N/A"
     startup_msg = (
-        f"🤖 <b>Vic is online — {state.mode.upper()} MODE</b>\n"
+        f"\U0001f916 <b>Vic is online \u2014 {state.mode.upper()} MODE</b>\n"
         f"BTC/USDT perp | {LEVERAGE}x leverage\n\n"
-        f"<b>4 Strategies Active:</b>\n"
-        f"1️⃣ <b>TradingView Webhook</b> — Filtered: regime + bias + confirmations ($200 shared)\n"
-        f"2️⃣ <b>RSI Divergence</b> — Price/RSI divergence at S/R on 5m ($300)\n"
-        f"3️⃣ <b>BB Squeeze</b> — Bollinger squeeze breakout on 5m ($300)\n"
-        f"4️⃣ <b>VWAP Bounce</b> — VWAP bounce with distance + chop filter on 1m ($200)\n\n"
+        f"<b>5 Strategies Active:</b>\n"
+        f"1\ufe0f\u20e3 <b>TradingView Webhook</b> \u2014 Filtered: regime + bias + confirmations ($200 shared)\n"
+        f"2\ufe0f\u20e3 <b>RSI Divergence</b> \u2014 Price/RSI divergence at S/R on 5m ($300)\n"
+        f"3\ufe0f\u20e3 <b>BB Squeeze</b> \u2014 Bollinger squeeze breakout on 5m ($300)\n"
+        f"4\ufe0f\u20e3 <b>VWAP Bounce</b> \u2014 VWAP bounce with distance + chop filter on 1m ($200)\n"
+        f"5\ufe0f\u20e3 <b>Yilmaz AO+Stoch</b> \u2014 AO+Stoch+RSI confluence on 5m ($200)\n\n"
         f"$20 risk/trade | 1:3 R:R | Max 4 trades/day\n"
         f"Daily loss cap: -$60 (auto-stops all)\n"
         f"Break-even at +1.5R | Candle-close entries only\n\n"
@@ -1356,6 +1717,8 @@ async def startup():
     asyncio.create_task(news_sentiment_monitor())
     asyncio.create_task(daily_summary_scheduler())
     asyncio.create_task(daily_reset_scheduler())
+    asyncio.create_task(periodic_status_log())
+    asyncio.create_task(telegram_polling_loop())
 
     log.info("All background tasks started.")
 
@@ -1426,6 +1789,8 @@ async def full_status():
         "daily_pnl": state.daily_pnl,
         "daily_loss_cap_hit": state.daily_loss_cap_hit,
         "total_lifetime_trades": state.total_trade_count,
+        "signals_checked": state.signals_checked,
+        "signals_blocked": state.signals_blocked,
         "correlation_filter": {
             "last_direction": state.last_trade_direction,
             "last_close_time": state.last_trade_close_time.isoformat() if state.last_trade_close_time else None,
@@ -1461,7 +1826,7 @@ async def tradingview_webhook(request: Request, token: str = Query("")):
     # Pre-trade checklist
     allowed, reason = can_execute_trade("tv_webhook", action)
     if not allowed:
-        msg = f"📨 Signal received: {action.upper()} @ ${price:,.2f}\n⏭️ Blocked: {reason}"
+        msg = f"\U0001f4e8 Signal received: {action.upper()} @ ${price:,.2f}\n\u23ed\ufe0f Blocked: {reason}"
         await tg_send(msg)
         return {"status": "blocked", "reason": reason}
 
@@ -1469,8 +1834,8 @@ async def tradingview_webhook(request: Request, token: str = Query("")):
     confirmed, conf_reason = await evaluate_webhook_signal(action, price)
     if not confirmed:
         msg = (
-            f"📨 Signal received: {action.upper()} @ ${price:,.2f}\n"
-            f"⏭️ Signal received but no confirmation — skipped\n"
+            f"\U0001f4e8 Signal received: {action.upper()} @ ${price:,.2f}\n"
+            f"\u23ed\ufe0f Signal received but no confirmation \u2014 skipped\n"
             f"Reason: {conf_reason}"
         )
         await tg_send(msg)
@@ -1491,7 +1856,7 @@ async def go_live():
     await close_exchange()
     await init_exchange()
 
-    await tg_send("🔴 <b>LIVE TRADING ENABLED</b> — Vic is now trading with real funds.")
+    await tg_send("\U0001f534 <b>LIVE TRADING ENABLED</b> \u2014 Vic is now trading with real funds.")
     log.warning("Switched to LIVE trading mode.")
     return {"status": "live", "warning": "Real money is now at risk."}
 
@@ -1500,7 +1865,7 @@ async def go_live():
 async def pause_trading():
     """Pause all trading globally."""
     state.paused = True
-    await tg_send("⏸️ All trading PAUSED by manual command.")
+    await tg_send("\u23f8\ufe0f All trading PAUSED by manual command.")
     return {"status": "paused"}
 
 
@@ -1508,5 +1873,5 @@ async def pause_trading():
 async def resume_trading():
     """Resume all trading globally."""
     state.paused = False
-    await tg_send("▶️ Trading RESUMED by manual command.")
+    await tg_send("\u25b6\ufe0f Trading RESUMED by manual command.")
     return {"status": "resumed"}
