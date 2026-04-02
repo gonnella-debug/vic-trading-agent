@@ -1394,6 +1394,10 @@ async def position_monitor_loop():
             state.last_btc_price = price
 
             for name in STRATEGY_NAMES:
+                # AYN holds until opposite signal — no SL/TP/BE/partial/max hold
+                if name == "ayn":
+                    continue
+
                 pos = state.strategies[name]["position"]
                 if pos is None:
                     continue
@@ -2318,8 +2322,9 @@ async def tradingview_webhook(request: Request, token: str = Query("")):
 @app.post("/webhook/ayn")
 async def ayn_webhook(request: Request, token: str = Query("")):
     """Receive AYN indicator (Snurk) alerts from TradingView.
-    No regime, bias, confirmation, or AI filters — just execute on signal.
-    Only respects: daily loss cap, max trades/day, existing position conflict.
+    Trend-following flip mode: always in a position.
+    Buy signal → close short + open long. Sell signal → close long + open short.
+    No SL/TP/regime/bias/session filters. No position monitor.
     """
     if token != WEBHOOK_SECRET:
         return JSONResponse(status_code=403, content={"error": "Invalid token"})
@@ -2340,31 +2345,71 @@ async def ayn_webhook(request: Request, token: str = Query("")):
 
     log.info("AYN webhook: %s @ %.2f", action, price)
 
-    # Minimal checks only — daily cap, max trades, no duplicate position
-    if state.daily_loss_cap_hit:
-        msg = f"📨 AYN signal: {action.upper()} @ ${price:,.2f}\n⏭️ Blocked: daily loss cap hit"
-        await tg_send(msg)
-        return {"status": "blocked", "reason": "daily loss cap hit"}
-
-    if state.trades_today >= MAX_TRADES_PER_DAY:
-        msg = f"📨 AYN signal: {action.upper()} @ ${price:,.2f}\n⏭️ Blocked: max trades ({MAX_TRADES_PER_DAY}) reached"
-        await tg_send(msg)
-        return {"status": "blocked", "reason": "max daily trades reached"}
-
     strat = state.strategies["ayn"]
-    if strat["position"] is not None:
-        msg = f"📨 AYN signal: {action.upper()} @ ${price:,.2f}\n⏭️ Blocked: already in AYN position"
-        await tg_send(msg)
-        return {"status": "blocked", "reason": "ayn already has open position"}
+    pos = strat["position"]
 
-    # Fetch ATR for SL
-    df_5m = await fetch_ohlcv("5m", 30)
-    atr_val = 0.0
-    if not df_5m.empty and len(df_5m) >= 14:
-        atr_s = calc_atr(df_5m, 14)
-        atr_val = float(atr_s.iloc[-1]) if not atr_s.empty and not np.isnan(atr_s.iloc[-1]) else 0.0
+    # If already in same direction, ignore
+    if pos is not None and pos["side"] == action:
+        log.info("AYN — already %s, ignoring duplicate signal", action)
+        return {"status": "ignored", "reason": f"already {action}"}
 
-    await execute_trade("ayn", action, price, atr_value=atr_val)
+    # Close existing position if in opposite direction
+    if pos is not None:
+        await close_position("ayn", price, f"AYN flip to {action.upper()}")
+
+    # Open new position — fixed size based on max notional
+    size = round(MAX_NOTIONAL / price, 6) if price > 0 else 0.0
+    if size <= 0:
+        log.warning("AYN — invalid size, skipping.")
+        return {"status": "error", "reason": "invalid size"}
+
+    # Open order on exchange
+    if state.mode == "live":
+        try:
+            await exchange.set_leverage(LEVERAGE, SYMBOL)
+            order = await exchange.create_order(
+                symbol=SYMBOL,
+                type="market",
+                side="buy" if action == "long" else "sell",
+                amount=size,
+                params={"tdMode": "cross"},
+            )
+            log.info("AYN LIVE order placed: %s", order.get("id"))
+        except Exception as exc:
+            log.error("AYN — order error: %s", exc)
+            await tg_send(f"⚠️ <b>AYN</b> order FAILED: {exc}")
+            return {"status": "error", "reason": str(exc)}
+    else:
+        log.info("AYN PAPER trade: %s %.6f BTC @ %.2f", action.upper(), size, price)
+
+    # Record position — no SL/TP
+    strat["position"] = {
+        "side": action,
+        "entry": price,
+        "sl": 0,
+        "tp": 0,
+        "size": size,
+        "open_time": datetime.now(timezone.utc).isoformat(),
+        "be_moved": False,
+        "partial_closed": False,
+        "regime": state.regime.value,
+        "bias": f"{state.htf_bias} ({state.htf_bias_strength})",
+    }
+    strat["trades_today"] += 1
+    state.trades_today += 1
+    state.total_trade_count += 1
+
+    arrow = "\U0001f7e2" if action == "long" else "\U0001f534"
+    label = STRATEGY_LABELS.get("ayn", "AYN")
+    msg = (
+        f"{arrow} <b>{action.upper()}</b> — {label}\n"
+        f"Entry ${price:,.2f} | Size {size:.6f} BTC\n"
+        f"Mode: FLIP (holds until opposite signal)\n"
+        f"Trades today: {state.trades_today}/{MAX_TRADES_PER_DAY}"
+    )
+    await tg_send(msg)
+    log.info(msg.replace("<b>", "").replace("</b>", ""))
+
     return {"status": "ok", "action": action, "price": price}
 
 
