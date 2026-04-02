@@ -14,7 +14,7 @@ Regime filter: TRENDING / RANGING / TRANSITIONAL / VOLATILE
 Risk: $20 per trade, 1:3 R:R, max 4 trades/day, -3R daily cap
 Session filter: London open (07-11 UTC) + NY open (13-17 UTC)
 AI Market Brain: Claude pre-trade analysis gate
-Trade Journal: /tmp/vic_journal.json
+Trade Journal: /data/vic_journal.json (persistent)
 
 Env vars needed:
   OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE
@@ -59,7 +59,7 @@ OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 TRADING_MODE = os.getenv("TRADING_MODE", "paper")  # paper | live
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", os.urandom(16).hex())
 RAILWAY_URL = os.getenv("RAILWAY_URL", "")
 CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
 
@@ -119,7 +119,7 @@ PARTIAL_R = 2.0               # take partial at 2R
 PARTIAL_CLOSE_PCT = 0.5       # close 50% of position
 
 # Trade journal
-JOURNAL_FILE = "/tmp/vic_journal.json"
+JOURNAL_FILE = os.getenv("JOURNAL_FILE", "/data/vic_journal.json")
 
 # ---------------------------------------------------------------------------
 # Regime enum
@@ -2108,6 +2108,16 @@ async def ask_claude_market_question(question: str) -> str:
 
 @app.on_event("startup")
 async def startup():
+    _required = ["OKX_API_KEY", "OKX_SECRET_KEY", "OKX_PASSPHRASE", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "CLAUDE_API_KEY"]
+    _missing = [v for v in _required if not os.getenv(v)]
+    if _missing:
+        log.error(f"MISSING REQUIRED ENV VARS: {', '.join(_missing)} — Vic cannot start properly")
+
+    # Ensure journal directory exists
+    journal_dir = os.path.dirname(JOURNAL_FILE)
+    if journal_dir:
+        os.makedirs(journal_dir, exist_ok=True)
+
     state.startup_time = datetime.now(timezone.utc).isoformat()
     log.info("Vic starting up — mode: %s", state.mode)
 
