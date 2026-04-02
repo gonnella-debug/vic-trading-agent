@@ -1494,8 +1494,10 @@ async def periodic_status_log():
 
 
 async def news_sentiment_monitor():
-    """Poll for BTC price moves and basic news sentiment every 5 min."""
+    """Poll for BTC price moves and basic news sentiment every 5 min.
+    Also runs a deeper macro scan via web search every 30 min."""
     prev_price = 0.0
+    _macro_scan_counter = 0  # runs deep scan every 6 cycles (30 min)
     while True:
         try:
             price = await get_btc_price()
@@ -1516,9 +1518,81 @@ async def news_sentiment_monitor():
                 prev_price = price
 
             await _check_crypto_news()
+
+            # Deep macro scan every 30 minutes via web search
+            _macro_scan_counter += 1
+            if _macro_scan_counter >= 6:
+                _macro_scan_counter = 0
+                await _run_macro_scan()
+
         except Exception as exc:
             log.error("News monitor error: %s", exc)
         await asyncio.sleep(300)
+
+
+# Cached macro intelligence — updated every 30 min by _run_macro_scan
+_macro_intel_cache = {"text": "", "fetched_at": 0}
+
+
+async def _run_macro_scan():
+    """Web search for macro events that affect BTC trading decisions."""
+    if not CLAUDE_API_KEY:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": CLAUDE_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 1024,
+                    "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
+                    "messages": [{"role": "user", "content": (
+                        "Search for the latest macro events affecting Bitcoin and crypto markets RIGHT NOW. "
+                        "Check: 1) Fed/FOMC decisions or speeches today, 2) US CPI/jobs data releases, "
+                        "3) Tariff or trade war developments, 4) SEC/regulatory actions on crypto, "
+                        "5) Major exchange issues or hacks, 6) Geopolitical events affecting risk assets. "
+                        "Give a concise factual summary. Flag anything that should STOP a trader from "
+                        "entering new BTC positions right now. End with: RISK_LEVEL: LOW/MEDIUM/HIGH/CRITICAL"
+                    )}],
+                },
+            )
+            if resp.status_code != 200:
+                log.warning("Macro scan API error: %d", resp.status_code)
+                return
+
+            data = resp.json()
+            texts = [b["text"] for b in data.get("content", []) if b.get("type") == "text"]
+            result = "\n".join(texts) if texts else ""
+
+            if result:
+                _macro_intel_cache["text"] = result
+                _macro_intel_cache["fetched_at"] = time.time()
+                log.info("Macro scan complete")
+
+                # Auto-pause on CRITICAL risk level
+                if "RISK_LEVEL: CRITICAL" in result.upper():
+                    if not state.paused:
+                        state.paused = True
+                        await tg_send(
+                            f"\U0001f6a8 <b>MACRO RISK — CRITICAL</b>\n\n"
+                            f"Auto-scan detected critical macro conditions.\n"
+                            f"ALL trading PAUSED.\n\n"
+                            f"Details:\n{result[:500]}"
+                        )
+                        log.warning("Trading paused by macro scan — CRITICAL risk")
+                elif "RISK_LEVEL: HIGH" in result.upper():
+                    await tg_send(
+                        f"\u26a0\ufe0f <b>MACRO RISK — HIGH</b>\n\n"
+                        f"{result[:400]}\n\n"
+                        f"Trading continues but AI Market Brain will factor this in."
+                    )
+    except Exception as exc:
+        log.error("Macro scan error: %s", exc)
 
 
 async def _check_crypto_news():
@@ -1699,6 +1773,7 @@ async def ai_market_analysis(strategy: str, side: str, price: float) -> tuple[bo
     AI Market Brain: ask Claude Haiku whether this trade should be taken.
     Called after all mechanical checks pass, before execute_trade.
     Returns (should_trade, reason).
+    Uses cached macro intel + web search for real-time awareness.
     Defaults to YES on API errors.
     """
     if not CLAUDE_API_KEY:
@@ -1708,24 +1783,37 @@ async def ai_market_analysis(strategy: str, side: str, price: float) -> tuple[bo
         headlines = await _fetch_recent_news_headlines()
         news_text = "\n".join(f"- {h}" for h in headlines) if headlines else "No recent news available"
 
+        # Inject cached macro intelligence from 30-min scans
+        macro_text = ""
+        if _macro_intel_cache["text"]:
+            age_min = int((time.time() - _macro_intel_cache["fetched_at"]) / 60)
+            macro_text = f"\n\nMACRO INTELLIGENCE (updated {age_min}min ago):\n{_macro_intel_cache['text']}"
+
         prompt = (
             f"You are a BTC futures trading risk analyst. Evaluate this proposed trade:\n\n"
             f"Strategy: {strategy}\n"
             f"Direction: {side.upper()}\n"
             f"Entry price: ${price:,.2f}\n"
             f"Current regime: {state.regime.value}\n"
-            f"1H bias: {state.htf_bias} ({state.htf_bias_strength})\n\n"
-            f"Recent BTC news:\n{news_text}\n\n"
+            f"1H bias: {state.htf_bias} ({state.htf_bias_strength})\n"
+            f"Daily PnL: ${state.daily_pnl:+,.2f}\n"
+            f"Trades today: {state.trades_today}/{MAX_TRADES_PER_DAY}\n\n"
+            f"Recent BTC news:\n{news_text}"
+            f"{macro_text}\n\n"
+            f"You have web_search — if the macro intel above is older than 30 minutes or mentions "
+            f"a developing situation (Fed speaking, data release pending, breaking event), "
+            f"SEARCH for the latest update before deciding.\n\n"
             f"Should this trade be taken? Reply YES or NO with a 1-sentence reason."
         )
 
         payload = {
             "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 100,
+            "max_tokens": 256,
+            "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 1}],
             "messages": [{"role": "user", "content": prompt}],
         }
 
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={
@@ -1740,10 +1828,12 @@ async def ai_market_analysis(strategy: str, side: str, price: float) -> tuple[bo
                 return True, "API error — defaulting to YES"
 
             data = resp.json()
-            content = data.get("content", [{}])[0].get("text", "").strip()
+            # Extract text from potentially mixed content blocks
+            text_blocks = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
+            content = " ".join(text_blocks).strip()
             log.info("AI Market Brain response for %s %s: %s", strategy, side, content)
 
-            if content.upper().startswith("NO"):
+            if content.upper().startswith("NO") or "NO —" in content.upper() or "NO." in content.upper():
                 return False, content
             return True, content
 
