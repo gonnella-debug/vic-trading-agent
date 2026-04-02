@@ -1962,17 +1962,34 @@ async def ask_claude_market_question(question: str) -> str:
         f"Risk: $20/trade, TP $60, max 4 trades/day, -$60 daily cap.\n"
         f"Sessions: London 07-11 UTC, NY 13-17 UTC. AI pre-trade analysis enabled.\n\n"
         f"Answer the user's question about the market concisely. "
-        f"Be direct, use numbers, and keep it under 300 words."
+        f"Be direct, use numbers, and keep it under 300 words.\n\n"
+        f"WEB SEARCH: You have access to web_search. USE IT when the user asks about macro events, "
+        f"Fed decisions, tariffs, regulations, breaking news, on-chain data, or anything you can't "
+        f"answer from the trading state above. Search first, then answer with real data."
     )
+
+    # Detect if question needs live web data
+    q_lower = question.lower()
+    search_keywords = [
+        "news", "macro", "fed", "cpi", "fomc", "inflation", "tariff", "regulation",
+        "sec", "etf", "halving", "on-chain", "whale", "liquidat", "funding rate",
+        "what's happening", "why is btc", "why did btc", "crash", "pump", "dump",
+        "sentiment", "fear", "greed", "dominance", "altcoin", "eth", "sol",
+        "geopolit", "war", "sanction", "trump", "policy", "rate cut", "rate hike",
+        "latest", "today", "this week", "current", "search", "look up", "find out",
+    ]
+    needs_search = any(kw in q_lower for kw in search_keywords)
 
     payload = {
         "model": "claude-sonnet-4-20250514",
-        "max_tokens": 1024,
+        "max_tokens": 2048 if needs_search else 1024,
         "system": system_prompt,
         "messages": [{"role": "user", "content": question}],
     }
+    if needs_search:
+        payload["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=60 if needs_search else 30) as client:
         resp = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -1988,8 +2005,10 @@ async def ask_claude_market_question(question: str) -> str:
 
         data = resp.json()
         content_blocks = data.get("content", [])
-        if content_blocks:
-            return content_blocks[0].get("text", "No response from Claude.")
+        # Extract text blocks (response may contain mixed search result + text blocks)
+        text_blocks = [b.get("text", "") for b in content_blocks if b.get("type") == "text" and b.get("text", "").strip()]
+        if text_blocks:
+            return "\n".join(text_blocks)
         return "No response from Claude."
 
 
