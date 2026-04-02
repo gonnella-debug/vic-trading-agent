@@ -575,23 +575,31 @@ def is_trading_session() -> bool:
 def bias_allows_direction(side: str) -> bool:
     """
     Check if 1H bias allows this trade direction.
-    Strong bias: enforce direction only.
-    Weak/neutral: allow both directions.
-    In PAPER mode: weak bias allows both directions (same as default),
-    only strong bias enforces direction.
+    RANGING: bias enforces direction at ANY strength.
+      - bearish (strong or weak) → shorts only
+      - bullish (strong or weak) → longs only
+      - neutral → both directions
+    TRENDING / other regimes: only strong bias enforces direction.
+      - weak bias → both directions allowed
     """
     if state.htf_bias == "neutral":
         return True
+
+    # RANGING: bias filters direction regardless of strength
+    if state.regime == Regime.RANGING:
+        if state.htf_bias == "bullish" and side == "long":
+            return True
+        if state.htf_bias == "bearish" and side == "short":
+            return True
+        return False
+
+    # TRENDING / TRANSITIONAL: only strong bias enforces direction
     if state.htf_bias_strength == "weak":
-        # Paper mode: weak bias allows both directions
-        # Live mode: also allows both (same behavior — weak = permissive)
         return True
-    # Strong bias — enforce direction
     if state.htf_bias == "bullish" and side == "long":
         return True
     if state.htf_bias == "bearish" and side == "short":
         return True
-    # Strong bias opposes this direction
     return False
 
 
@@ -2071,7 +2079,7 @@ async def ask_claude_market_question(question: str) -> str:
     needs_search = any(kw in q_lower for kw in search_keywords)
 
     payload = {
-        "model": "claude-sonnet-4-20250514",
+        "model": "claude-sonnet-4-6-20250514",
         "max_tokens": 2048 if needs_search else 1024,
         "system": system_prompt,
         "messages": [{"role": "user", "content": question}],
