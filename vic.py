@@ -1,27 +1,30 @@
 """
 Vic — BTC/USDT Perpetual Futures Scalping Agent (v2)
-Runs 5 strategies simultaneously on OKX via ccxt.
+Runs 4 strategies simultaneously on OKX via ccxt.
 Paper trading mode by default. Production-ready for Railway.
 
 Strategies:
-  1. TradingView Webhook (filtered with regime + bias + confirmations)
-  2. RSI Divergence ($300 capital)
-  3. BB Squeeze Breakout ($300 capital)
-  4. VWAP Bounce ($200 capital)
-  5. Yilmaz AO+Stoch+RSI+ATR ($200 capital)
+  1. TradingView Webhook (filtered with regime + bias + 2 confirmations)
+  2. RSI Divergence — Price/RSI divergence at S/R on 5m
+  3. BB Squeeze Breakout — Bollinger squeeze breakout on 5m
+  4. VWAP Bounce — VWAP bounce with distance + chop filter on 1m
 
 Regime filter: TRENDING / RANGING / TRANSITIONAL / VOLATILE
 1H bias: Strong bullish/bearish or neutral
 Risk: $20 per trade, 1:3 R:R, max 4 trades/day, -3R daily cap
+Session filter: London open (07-11 UTC) + NY open (13-17 UTC)
+AI Market Brain: Claude pre-trade analysis gate
+Trade Journal: /tmp/vic_journal.json
 
 Env vars needed:
   OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
   TRADING_MODE (paper|live), WEBHOOK_SECRET, RAILWAY_URL
-  CLAUDE_API_KEY (for Telegram chat feature)
+  CLAUDE_API_KEY (for Telegram chat + AI Market Brain)
 """
 
 import os
+import json
 import asyncio
 import logging
 import time
@@ -72,14 +75,14 @@ MAX_TRADES_PER_DAY = 4
 CORRELATION_COOLDOWN_MIN = 15  # minutes cooldown same direction after close
 BREAK_EVEN_R_MULTIPLE = 1.5   # move SL to entry at +1.5R
 BB_SQUEEZE_THRESHOLD = 0.02   # bandwidth threshold for BB squeeze
+MAX_NOTIONAL = 2000.0         # max position notional to prevent absurdly large positions
 
-# Strategy capital allocations
-STRATEGY_CAPITAL = {
-    "tv_webhook": 200.0,       # shared reserve
-    "rsi_divergence": 300.0,
-    "bb_squeeze": 300.0,
-    "vwap_bounce": 200.0,
-    "yilmaz": 200.0,
+# ATR multipliers for SL distance per strategy
+STRATEGY_ATR_SL = {
+    "tv_webhook": 1.5,         # 1.5 x ATR(14) on 5m
+    "rsi_divergence": 1.5,     # 1.5 x ATR(14) on 5m
+    "bb_squeeze": 1.0,         # 1.0 x ATR(14) on 5m
+    "vwap_bounce": 1.0,        # 1.0 x ATR(14) on 1m
 }
 
 # Strategy max hold times in minutes
@@ -88,10 +91,9 @@ STRATEGY_MAX_HOLD = {
     "rsi_divergence": 240,
     "bb_squeeze": 90,
     "vwap_bounce": 60,
-    "yilmaz": 120,
 }
 
-STRATEGY_NAMES = ["tv_webhook", "rsi_divergence", "bb_squeeze", "vwap_bounce", "yilmaz"]
+STRATEGY_NAMES = ["tv_webhook", "rsi_divergence", "bb_squeeze", "vwap_bounce"]
 
 # Paper test: 50 trades OR 2 weeks
 PAPER_TEST_MIN_TRADES = 50
@@ -103,8 +105,21 @@ STRATEGY_LABELS = {
     "rsi_divergence": "2\ufe0f\u20e3 RSI Divergence",
     "bb_squeeze": "3\ufe0f\u20e3 BB Squeeze",
     "vwap_bounce": "4\ufe0f\u20e3 VWAP Bounce",
-    "yilmaz": "5\ufe0f\u20e3 Yilmaz AO+Stoch",
 }
+
+# Session filter — London + NY open only
+TRADING_SESSIONS = [
+    (7, 11),   # London open: 07:00-11:00 UTC
+    (13, 17),  # NY open: 13:00-17:00 UTC
+]
+
+# Partial profit settings
+PARTIAL_PROFIT_ENABLED = True
+PARTIAL_R = 2.0               # take partial at 2R
+PARTIAL_CLOSE_PCT = 0.5       # close 50% of position
+
+# Trade journal
+JOURNAL_FILE = "/tmp/vic_journal.json"
 
 # ---------------------------------------------------------------------------
 # Regime enum
@@ -338,23 +353,6 @@ def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return indicator.average_true_range()
 
 
-def calc_stochastic(df: pd.DataFrame, k_period: int = 14, d_period: int = 3, smooth_k: int = 3) -> tuple:
-    """Calculate Stochastic Oscillator K and D lines."""
-    indicator = ta.momentum.StochasticOscillator(
-        df["high"], df["low"], df["close"],
-        window=k_period, smooth_window=smooth_k
-    )
-    k = indicator.stoch()
-    d = indicator.stoch_signal()
-    return k, d
-
-
-def calc_awesome_oscillator(df: pd.DataFrame) -> pd.Series:
-    """Calculate Awesome Oscillator: SMA(HL2, 5) - SMA(HL2, 34)."""
-    hl2 = (df["high"] + df["low"]) / 2
-    ao = hl2.rolling(window=5).mean() - hl2.rolling(window=34).mean()
-    return ao
-
 
 # ---------------------------------------------------------------------------
 # Structure Analysis (Change 1)
@@ -534,28 +532,45 @@ def vwap_distance_ok(df: pd.DataFrame, vwap_series: pd.Series) -> bool:
 
 def vwap_chop_filter(df: pd.DataFrame, vwap_series: pd.Series) -> bool:
     """
-    No trade if VWAP touched > 3 times in last 20 candles.
+    Skip if price stays within +/-0.1% of VWAP for more than 10 consecutive candles.
     Returns True if NOT in chop zone (OK to trade).
     """
-    if len(df) < 20 or len(vwap_series) < 20:
+    if len(df) < 12 or len(vwap_series) < 12:
         return True
 
-    touch_count = 0
+    consecutive = 0
+    max_consecutive = 0
     for i in range(-20, 0):
-        if i >= len(df) or np.isnan(vwap_series.iloc[i]):
+        if abs(i) > len(df):
             continue
-        low = df["low"].iloc[i]
-        high = df["high"].iloc[i]
-        vw = vwap_series.iloc[i]
-        if low <= vw <= high:
-            touch_count += 1
+        close_val = float(df["close"].iloc[i])
+        vw = float(vwap_series.iloc[i])
+        if np.isnan(vw) or vw == 0:
+            consecutive = 0
+            continue
+        dist_pct = abs(close_val - vw) / vw * 100
+        if dist_pct < 0.1:
+            consecutive += 1
+            if consecutive > max_consecutive:
+                max_consecutive = consecutive
+        else:
+            consecutive = 0
 
-    return touch_count <= 3
+    return max_consecutive <= 10
 
 
 # ---------------------------------------------------------------------------
 # Pre-Trade Checklist (Change 15) — with verbose logging
 # ---------------------------------------------------------------------------
+
+def is_trading_session() -> bool:
+    """Check if current UTC hour is within London or NY open sessions."""
+    hour = datetime.now(timezone.utc).hour
+    for start, end in TRADING_SESSIONS:
+        if start <= hour < end:
+            return True
+    return False
+
 
 def bias_allows_direction(side: str) -> bool:
     """
@@ -584,7 +599,7 @@ def regime_allows_strategy(strategy: str) -> bool:
     """
     Check if current regime allows this strategy.
     TRENDING: VWAP pullback + BB Squeeze + TV Webhook
-    RANGING: RSI Divergence + VWAP Bounce + TV Webhook + Yilmaz
+    RANGING: RSI Divergence + VWAP Bounce + TV Webhook
     TRANSITIONAL: RSI Divergence + TV Webhook (+ ALL strategies in paper mode)
     VOLATILE: nothing (in live) / nothing (in paper) — too dangerous
     """
@@ -598,7 +613,7 @@ def regime_allows_strategy(strategy: str) -> bool:
     if state.regime == Regime.TRENDING:
         return strategy in ("vwap_bounce", "bb_squeeze", "tv_webhook")
     if state.regime == Regime.RANGING:
-        return strategy in ("rsi_divergence", "vwap_bounce", "tv_webhook", "yilmaz")
+        return strategy in ("rsi_divergence", "vwap_bounce", "tv_webhook")
     if state.regime == Regime.TRANSITIONAL:
         return strategy in ("rsi_divergence", "tv_webhook")
     return False
@@ -622,6 +637,19 @@ def can_execute_trade(strategy: str, side: str) -> tuple[bool, str]:
     Logs EVERY check with pass/fail for debugging.
     """
     state.signals_checked += 1
+
+    # 0. Trading session check
+    session_ok = is_trading_session()
+    log.info("CHECK %s %s — session_ok: %s (hour=%d UTC)",
+             strategy, side.upper(), session_ok, datetime.now(timezone.utc).hour)
+    if not session_ok:
+        reason = f"BLOCKED: {strategy} {side.upper()} — Outside trading session"
+        log.info(reason)
+        state.signals_blocked += 1
+        state.last_block_reasons.append(reason)
+        if len(state.last_block_reasons) > 20:
+            state.last_block_reasons.pop(0)
+        return False, "Outside trading session"
 
     # 1. Regime allows this strategy?
     regime_ok = regime_allows_strategy(strategy)
@@ -732,32 +760,48 @@ def calc_position_size(entry: float, sl: float) -> float:
     return round(size_btc, 6)
 
 
-async def execute_trade(strategy: str, side: str, entry: float):
-    """Open a position (paper or live) for the given strategy."""
+async def execute_trade(strategy: str, side: str, entry: float, atr_value: float = 0.0):
+    """Open a position (paper or live) for the given strategy.
+
+    Args:
+        strategy: strategy name
+        side: 'long' or 'short'
+        entry: entry price
+        atr_value: ATR value for SL computation (fetched by calling strategy)
+    """
     allowed, reason = can_execute_trade(strategy, side)
     if not allowed:
         log.info("%s — trade blocked: %s", strategy, reason)
         return
 
-    capital = STRATEGY_CAPITAL.get(strategy, 200.0)
-
-    # Calculate SL / TP based on risk
-    position_notional = capital * LEVERAGE
-    position_btc = position_notional / entry
-    sl_distance = RISK_PER_TRADE / position_btc
-    tp_distance = TP_PER_TRADE / position_btc
+    # ATR-based SL distance
+    atr_mult = STRATEGY_ATR_SL.get(strategy, 1.5)
+    sl_distance = atr_value * atr_mult if atr_value > 0 else entry * 0.003  # fallback 0.3%
 
     if side == "long":
         sl = round(entry - sl_distance, 2)
-        tp = round(entry + tp_distance, 2)
     else:
         sl = round(entry + sl_distance, 2)
-        tp = round(entry - tp_distance, 2)
 
+    # Risk-based position size: $20 risk / SL distance
     size = calc_position_size(entry, sl)
     if size <= 0:
         log.warning("%s — invalid size, skipping.", strategy)
         return
+
+    # Max notional cap
+    notional = size * entry
+    if notional > MAX_NOTIONAL:
+        size = round(MAX_NOTIONAL / entry, 6)
+        log.info("%s — capped size to %.6f BTC (max notional $%.0f)", strategy, size, MAX_NOTIONAL)
+
+    # TP distance: guarantees $60 at TP
+    tp_distance = TP_PER_TRADE / size
+
+    if side == "long":
+        tp = round(entry + tp_distance, 2)
+    else:
+        tp = round(entry - tp_distance, 2)
 
     # Open order
     if state.mode == "live":
@@ -787,8 +831,10 @@ async def execute_trade(strategy: str, side: str, entry: float):
         "tp": tp,
         "size": size,
         "open_time": datetime.now(timezone.utc).isoformat(),
-        "capital": capital,
         "be_moved": False,  # break-even not yet moved
+        "partial_closed": False,  # partial profit not yet taken
+        "regime": state.regime.value,
+        "bias": f"{state.htf_bias} ({state.htf_bias_strength})",
     }
     strat["trades_today"] += 1
     state.trades_today += 1
@@ -804,6 +850,32 @@ async def execute_trade(strategy: str, side: str, entry: float):
     )
     await tg_send(msg)
     log.info(msg.replace("<b>", "").replace("</b>", ""))
+
+
+def _append_journal(entry: dict):
+    """Append a trade entry to the JSON journal file."""
+    try:
+        if os.path.exists(JOURNAL_FILE):
+            with open(JOURNAL_FILE, "r") as f:
+                journal = json.load(f)
+        else:
+            journal = []
+        journal.append(entry)
+        with open(JOURNAL_FILE, "w") as f:
+            json.dump(journal, f, indent=2)
+    except Exception as exc:
+        log.error("Journal write error: %s", exc)
+
+
+def _read_journal() -> list:
+    """Read the trade journal from file."""
+    try:
+        if os.path.exists(JOURNAL_FILE):
+            with open(JOURNAL_FILE, "r") as f:
+                return json.load(f)
+    except Exception as exc:
+        log.error("Journal read error: %s", exc)
+    return []
 
 
 async def close_position(strategy: str, exit_price: float, reason: str):
@@ -825,6 +897,10 @@ async def close_position(strategy: str, exit_price: float, reason: str):
     # Calculate actual R achieved
     r_achieved = pnl / RISK_PER_TRADE if RISK_PER_TRADE > 0 else 0.0
 
+    # Calculate hold time
+    open_time = datetime.fromisoformat(pos["open_time"])
+    elapsed_min = (datetime.now(timezone.utc) - open_time).total_seconds() / 60.0
+
     # Close on exchange if live
     if state.mode == "live":
         try:
@@ -839,7 +915,7 @@ async def close_position(strategy: str, exit_price: float, reason: str):
         except Exception as exc:
             log.error("%s — close order error: %s", strategy, exc)
 
-    # Update metrics (Change 17)
+    # Update metrics
     m = state.metrics[strategy]
     m["trade_count"] += 1
     m["total_r_achieved"] += r_achieved
@@ -869,6 +945,7 @@ async def close_position(strategy: str, exit_price: float, reason: str):
         "r_achieved": round(r_achieved, 2),
         "reason": reason,
         "time": datetime.now(timezone.utc).isoformat(),
+        "hold_time_min": round(elapsed_min, 1),
     })
 
     # Correlation filter update
@@ -880,11 +957,36 @@ async def close_position(strategy: str, exit_price: float, reason: str):
     msg = (
         f"{emoji} <b>CLOSED</b> — {label}\n"
         f"${pos['entry']:,.2f} \u2192 ${exit_price:,.2f} | <b>${pnl:+,.2f}</b> ({r_achieved:+.1f}R)\n"
-        f"Reason: {reason}\n"
+        f"Reason: {reason} | Hold: {elapsed_min:.0f}min\n"
         f"Strategy today: ${strat['daily_pnl']:+,.2f} | Total today: ${state.daily_pnl:+,.2f}"
     )
     await tg_send(msg)
     log.info(msg.replace("<b>", "").replace("</b>", ""))
+
+    # Write to trade journal
+    now_utc = datetime.now(timezone.utc)
+    journal_entry = {
+        "id": state.total_trade_count,
+        "date": now_utc.strftime("%Y-%m-%d"),
+        "time_utc": now_utc.strftime("%H:%M:%S"),
+        "strategy": strategy,
+        "side": pos["side"],
+        "entry_price": pos["entry"],
+        "exit_price": exit_price,
+        "sl_price": pos["sl"],
+        "tp_price": pos["tp"],
+        "size_btc": pos["size"],
+        "pnl_usd": pnl,
+        "r_achieved": round(r_achieved, 2),
+        "exit_reason": reason,
+        "regime_at_entry": pos.get("regime", "unknown"),
+        "bias_at_entry": pos.get("bias", "unknown"),
+        "hold_time_min": round(elapsed_min, 1),
+        "be_moved": pos["be_moved"],
+        "session": "london" if 7 <= now_utc.hour < 11 else "ny" if 13 <= now_utc.hour < 17 else "off-hours",
+        "cumulative_pnl": round(state.daily_pnl, 2),
+    }
+    _append_journal(journal_entry)
 
     strat["position"] = None
 
@@ -958,8 +1060,8 @@ async def evaluate_webhook_signal(action: str, price: float) -> tuple[bool, str]
                 confirmations += 1
                 reasons.append(f"Near VWAP ({dist_pct:.2f}%)")
 
-    if confirmations == 0:
-        return False, "No confirmations (RSI/structure/VWAP)"
+    if confirmations < 2:
+        return False, f"Need 2 confirmations, got {confirmations} (RSI/structure/VWAP)"
 
     return True, f"Confirmed: {', '.join(reasons)}"
 
@@ -971,23 +1073,27 @@ async def evaluate_webhook_signal(action: str, price: float) -> tuple[bool, str]
 async def strategy_rsi_divergence():
     name = "rsi_divergence"
 
-    df = await fetch_ohlcv("5m", 50)
-    if df.empty or len(df) < 30:
+    df = await fetch_ohlcv("5m", 60)
+    if df.empty or len(df) < 50:
         return
 
     df["rsi"] = calc_rsi(df["close"], 14)
     df["vwap"] = calc_vwap(df)
+    atr_series = calc_atr(df, 14)
+    atr_val = float(atr_series.iloc[-1]) if not atr_series.empty and not np.isnan(atr_series.iloc[-1]) else 0.0
 
     close_vals = df["close"].values[-20:]
     rsi_vals = df["rsi"].values[-20:]
 
     rsi_now = float(df["rsi"].iloc[-1]) if not np.isnan(df["rsi"].iloc[-1]) else 50.0
-    log.info("Checking rsi_divergence... RSI=%.1f", rsi_now)
+    log.info("Checking rsi_divergence... RSI=%.1f, ATR=%.2f", rsi_now, atr_val)
 
-    high_20 = np.nanmax(close_vals)
-    low_20 = np.nanmin(close_vals)
+    # 50-candle lookback for swing high/low S/R levels
+    lookback_50 = df["close"].values[-50:]
+    high_50 = float(np.nanmax(df["high"].values[-50:]))
+    low_50 = float(np.nanmin(df["low"].values[-50:]))
 
-    # Find local lows (triplets)
+    # Find local lows (triplets) in last 20 candles for divergence detection
     price_lows = []
     for i in range(1, len(close_vals) - 1):
         if close_vals[i] < close_vals[i - 1] and close_vals[i] < close_vals[i + 1]:
@@ -1001,9 +1107,9 @@ async def strategy_rsi_divergence():
     price_now = float(df["close"].iloc[-1])
     vwap_now = float(df["vwap"].iloc[-1]) if not np.isnan(df["vwap"].iloc[-1]) else price_now
 
-    # Support/resistance context check (Change 10)
-    near_support = (price_now - low_20) / low_20 * 100 < 0.3 if low_20 > 0 else False
-    near_resistance = (high_20 - price_now) / high_20 * 100 < 0.3 if high_20 > 0 else False
+    # Support/resistance context check: within 0.25% of 50-candle swing high/low
+    near_support = (price_now - low_50) / low_50 * 100 < 0.25 if low_50 > 0 else False
+    near_resistance = (high_50 - price_now) / high_50 * 100 < 0.25 if high_50 > 0 else False
     away_from_vwap = abs(price_now - vwap_now) / vwap_now * 100 > 0.2 if vwap_now > 0 else False
     context_ok = near_support or near_resistance or away_from_vwap
 
@@ -1021,7 +1127,12 @@ async def strategy_rsi_divergence():
                      curr_low[1], prev_low[1], curr_low[2], prev_low[2])
             allowed, reason = can_execute_trade(name, "long")
             if allowed:
-                await execute_trade(name, "long", price_now)
+                ai_ok, ai_reason = await ai_market_analysis(name, "long", price_now)
+                if ai_ok:
+                    await execute_trade(name, "long", price_now, atr_value=atr_val)
+                else:
+                    log.info("rsi_divergence LONG blocked by AI: %s", ai_reason)
+                    await tg_send(f"🧠 <b>AI blocked</b> rsi_divergence LONG: {ai_reason}")
             return
 
     # Bearish divergence: price higher high, RSI lower high
@@ -1033,7 +1144,12 @@ async def strategy_rsi_divergence():
                      curr_high[1], prev_high[1], curr_high[2], prev_high[2])
             allowed, reason = can_execute_trade(name, "short")
             if allowed:
-                await execute_trade(name, "short", price_now)
+                ai_ok, ai_reason = await ai_market_analysis(name, "short", price_now)
+                if ai_ok:
+                    await execute_trade(name, "short", price_now, atr_value=atr_val)
+                else:
+                    log.info("rsi_divergence SHORT blocked by AI: %s", ai_reason)
+                    await tg_send(f"🧠 <b>AI blocked</b> rsi_divergence SHORT: {ai_reason}")
 
 
 # ---------------------------------------------------------------------------
@@ -1052,6 +1168,8 @@ async def strategy_bb_squeeze():
     df["bb_upper"] = upper
     df["bb_lower"] = lower
     df["bb_bw"] = bandwidth
+    atr_series = calc_atr(df, 14)
+    atr_val = float(atr_series.iloc[-1]) if not atr_series.empty and not np.isnan(atr_series.iloc[-1]) else 0.0
 
     prev_bw = float(df["bb_bw"].iloc[-2])
     curr_bw = float(df["bb_bw"].iloc[-1])
@@ -1063,26 +1181,44 @@ async def strategy_bb_squeeze():
     bb_upper = float(df["bb_upper"].iloc[-1])
     bb_lower = float(df["bb_lower"].iloc[-1])
 
-    log.info("Checking bb_squeeze... BW_prev=%.4f, BW_curr=%.4f, price=%.2f, upper=%.2f, lower=%.2f",
-             prev_bw, curr_bw, price, bb_upper, bb_lower)
+    log.info("Checking bb_squeeze... BW_prev=%.4f, BW_curr=%.4f, price=%.2f, upper=%.2f, lower=%.2f, ATR=%.2f",
+             prev_bw, curr_bw, price, bb_upper, bb_lower, atr_val)
 
     if np.isnan(bb_upper) or np.isnan(bb_lower):
         return
 
     # Squeeze: previous bandwidth below threshold, current expanding
     if prev_bw < BB_SQUEEZE_THRESHOLD and curr_bw > prev_bw:
-        # Change 9: candle must CLOSE at least 0.1% beyond the band
+        # Candle must CLOSE at least 0.1% beyond the band
         upper_threshold = bb_upper * 1.001
         lower_threshold = bb_lower * 0.999
 
-        if price > upper_threshold:
-            allowed, reason = can_execute_trade(name, "long")
-            if allowed:
-                await execute_trade(name, "long", price)
-        elif price < lower_threshold:
-            allowed, reason = can_execute_trade(name, "short")
-            if allowed:
-                await execute_trade(name, "short", price)
+        if price > upper_threshold or price < lower_threshold:
+            # Body filter: candle body must be >= 60% of full range
+            body = abs(float(df["close"].iloc[-1]) - float(df["open"].iloc[-1]))
+            full_range = float(df["high"].iloc[-1]) - float(df["low"].iloc[-1])
+            if full_range == 0 or body / full_range < 0.6:
+                log.info("bb_squeeze — weak candle body (%.1f%%), skipping", (body / full_range * 100) if full_range > 0 else 0)
+                return
+
+            if price > upper_threshold:
+                allowed, reason = can_execute_trade(name, "long")
+                if allowed:
+                    ai_ok, ai_reason = await ai_market_analysis(name, "long", price)
+                    if ai_ok:
+                        await execute_trade(name, "long", price, atr_value=atr_val)
+                    else:
+                        log.info("bb_squeeze LONG blocked by AI: %s", ai_reason)
+                        await tg_send(f"🧠 <b>AI blocked</b> bb_squeeze LONG: {ai_reason}")
+            elif price < lower_threshold:
+                allowed, reason = can_execute_trade(name, "short")
+                if allowed:
+                    ai_ok, ai_reason = await ai_market_analysis(name, "short", price)
+                    if ai_ok:
+                        await execute_trade(name, "short", price, atr_value=atr_val)
+                    else:
+                        log.info("bb_squeeze SHORT blocked by AI: %s", ai_reason)
+                        await tg_send(f"🧠 <b>AI blocked</b> bb_squeeze SHORT: {ai_reason}")
 
 
 # ---------------------------------------------------------------------------
@@ -1098,6 +1234,8 @@ async def strategy_vwap_bounce():
 
     df["vwap"] = calc_vwap(df)
     df["rsi"] = calc_rsi(df["close"], 14)
+    atr_series = calc_atr(df, 14)
+    atr_val = float(atr_series.iloc[-1]) if not atr_series.empty and not np.isnan(atr_series.iloc[-1]) else 0.0
 
     curr = df.iloc[-1]
     prev = df.iloc[-2]
@@ -1146,66 +1284,23 @@ async def strategy_vwap_bounce():
     if is_bullish and price > vwap_val:
         allowed, reason = can_execute_trade(name, "long")
         if allowed:
-            await execute_trade(name, "long", price)
+            ai_ok, ai_reason = await ai_market_analysis(name, "long", price)
+            if ai_ok:
+                await execute_trade(name, "long", price, atr_value=atr_val)
+            else:
+                log.info("vwap_bounce LONG blocked by AI: %s", ai_reason)
+                await tg_send(f"🧠 <b>AI blocked</b> vwap_bounce LONG: {ai_reason}")
     # Short: price touched VWAP and rejected with bearish candle
     elif is_bearish and price < vwap_val:
         allowed, reason = can_execute_trade(name, "short")
         if allowed:
-            await execute_trade(name, "short", price)
+            ai_ok, ai_reason = await ai_market_analysis(name, "short", price)
+            if ai_ok:
+                await execute_trade(name, "short", price, atr_value=atr_val)
+            else:
+                log.info("vwap_bounce SHORT blocked by AI: %s", ai_reason)
+                await tg_send(f"🧠 <b>AI blocked</b> vwap_bounce SHORT: {ai_reason}")
 
-
-# ---------------------------------------------------------------------------
-# Strategy 5 — Yilmaz AO+Stoch+RSI+ATR (5m)
-# ---------------------------------------------------------------------------
-
-async def strategy_yilmaz():
-    """
-    Yilmaz strategy: AO + Stochastic + RSI confluence on 5m candles.
-    LONG: Stoch K < 20, RSI(10) < 30, AO rising
-    SHORT: Stoch K > 80, RSI(10) > 70, AO falling
-    SL/TP: ATR-based, enforcing $20 risk / $60 target.
-    """
-    name = "yilmaz"
-
-    df = await fetch_ohlcv("5m", 50)
-    if df.empty or len(df) < 35:
-        return
-
-    # Calculate indicators
-    ao = calc_awesome_oscillator(df)
-    stoch_k, stoch_d = calc_stochastic(df, k_period=14, d_period=3, smooth_k=3)
-    rsi_series = calc_rsi(df["close"], 10)
-    atr_series = calc_atr(df, 14)
-
-    ao_now = float(ao.iloc[-1]) if not np.isnan(ao.iloc[-1]) else 0.0
-    ao_prev = float(ao.iloc[-2]) if not np.isnan(ao.iloc[-2]) else 0.0
-    stoch_k_now = float(stoch_k.iloc[-1]) if not np.isnan(stoch_k.iloc[-1]) else 50.0
-    rsi_now = float(rsi_series.iloc[-1]) if not np.isnan(rsi_series.iloc[-1]) else 50.0
-    atr_now = float(atr_series.iloc[-1]) if not np.isnan(atr_series.iloc[-1]) else 0.0
-    price = float(df["close"].iloc[-1])
-
-    log.info("Checking yilmaz... AO=%.2f, AO_prev=%.2f, StochK=%.1f, RSI(10)=%.1f, ATR=%.2f, price=%.2f",
-             ao_now, ao_prev, stoch_k_now, rsi_now, atr_now, price)
-
-    if atr_now <= 0 or price <= 0:
-        return
-
-    # LONG: Stoch K < 20 (oversold) + RSI < 30 (oversold) + AO rising
-    if stoch_k_now < 20 and rsi_now < 30 and ao_now > ao_prev:
-        log.info("yilmaz — LONG signal: StochK=%.1f<20, RSI=%.1f<30, AO rising (%.2f>%.2f)",
-                 stoch_k_now, rsi_now, ao_now, ao_prev)
-        allowed, reason = can_execute_trade(name, "long")
-        if allowed:
-            await execute_trade(name, "long", price)
-        return
-
-    # SHORT: Stoch K > 80 (overbought) + RSI > 70 (overbought) + AO falling
-    if stoch_k_now > 80 and rsi_now > 70 and ao_now < ao_prev:
-        log.info("yilmaz — SHORT signal: StochK=%.1f>80, RSI=%.1f>70, AO falling (%.2f<%.2f)",
-                 stoch_k_now, rsi_now, ao_now, ao_prev)
-        allowed, reason = can_execute_trade(name, "short")
-        if allowed:
-            await execute_trade(name, "short", price)
 
 
 # ---------------------------------------------------------------------------
@@ -1227,7 +1322,7 @@ async def strategy_monitor_loop():
     """
     Check strategies only on candle close boundaries (Change 5).
     1m strategies (vwap_bounce): check when new 1m candle closes
-    5m strategies (rsi_divergence, bb_squeeze, yilmaz): check when new 5m candle closes
+    5m strategies (rsi_divergence, bb_squeeze): check when new 5m candle closes
     """
     while True:
         try:
@@ -1266,10 +1361,6 @@ async def strategy_monitor_loop():
                     await strategy_bb_squeeze()
                 except Exception as exc:
                     log.error("bb_squeeze error: %s", exc)
-                try:
-                    await strategy_yilmaz()
-                except Exception as exc:
-                    log.error("yilmaz error: %s", exc)
 
         except Exception as exc:
             log.error("Strategy monitor error: %s", exc)
@@ -1308,35 +1399,68 @@ async def position_monitor_loop():
                 else:
                     unrealized_pnl = (entry - price) * size
 
-                # Break-even check (Change 12): at +1.5R, move SL to entry
+                # 1. Stop Loss check (highest priority)
+                if side == "long" and price <= sl:
+                    await close_position(name, price, "Stop Loss")
+                    continue
+                if side == "short" and price >= sl:
+                    await close_position(name, price, "Stop Loss")
+                    continue
+
+                # 2. Take Profit check
+                if side == "long" and price >= tp:
+                    await close_position(name, price, "Take Profit")
+                    continue
+                if side == "short" and price <= tp:
+                    await close_position(name, price, "Take Profit")
+                    continue
+
+                # 3. Break-even move: at +1.5R, move SL to entry
                 be_threshold = RISK_PER_TRADE * BREAK_EVEN_R_MULTIPLE  # $30
                 if not pos["be_moved"] and unrealized_pnl >= be_threshold:
                     pos["sl"] = entry
                     pos["be_moved"] = True
-                    sl = entry
                     msg = f"\U0001f504 <b>{name}</b> — SL moved to break-even (entry ${entry:,.2f})"
                     await tg_send(msg)
                     log.info(msg.replace("<b>", "").replace("</b>", ""))
 
-                # Max hold time check (Change 13)
+                # 4. Partial profit at 2R
+                if PARTIAL_PROFIT_ENABLED and not pos.get("partial_closed", False):
+                    partial_threshold = PARTIAL_R * RISK_PER_TRADE  # $40
+                    if unrealized_pnl >= partial_threshold:
+                        old_size = pos["size"]
+                        new_size = round(old_size * (1 - PARTIAL_CLOSE_PCT), 6)
+                        if state.mode == "live":
+                            try:
+                                close_side = "sell" if side == "long" else "buy"
+                                partial_amount = round(old_size * PARTIAL_CLOSE_PCT, 6)
+                                await exchange.create_order(
+                                    symbol=SYMBOL,
+                                    type="market",
+                                    side=close_side,
+                                    amount=partial_amount,
+                                    params={"tdMode": "cross", "reduceOnly": True},
+                                )
+                            except Exception as exc:
+                                log.error("%s — partial close error: %s", name, exc)
+                        pos["size"] = new_size
+                        pos["partial_closed"] = True
+                        partial_pnl = round(unrealized_pnl * PARTIAL_CLOSE_PCT, 2)
+                        msg = (
+                            f"✂️ <b>{name}</b> — Partial close at +{PARTIAL_R:.0f}R\n"
+                            f"Closed {PARTIAL_CLOSE_PCT*100:.0f}% ({old_size:.6f} → {new_size:.6f} BTC)\n"
+                            f"Locked ~${partial_pnl:+,.2f}"
+                        )
+                        await tg_send(msg)
+                        log.info(msg.replace("<b>", "").replace("</b>", ""))
+
+                # 5. Max hold time check (lowest priority)
                 max_hold_min = STRATEGY_MAX_HOLD.get(name, 120)
                 open_time = datetime.fromisoformat(pos["open_time"])
                 elapsed_min = (datetime.now(timezone.utc) - open_time).total_seconds() / 60.0
                 if elapsed_min >= max_hold_min:
                     await close_position(name, price, f"Max hold time ({max_hold_min}min)")
                     continue
-
-                # SL/TP check
-                if side == "long":
-                    if price <= sl:
-                        await close_position(name, price, "Stop Loss")
-                    elif price >= tp:
-                        await close_position(name, price, "Take Profit")
-                else:
-                    if price >= sl:
-                        await close_position(name, price, "Stop Loss")
-                    elif price <= tp:
-                        await close_position(name, price, "Take Profit")
 
         except Exception as exc:
             log.error("Position monitor error: %s", exc)
@@ -1475,14 +1599,22 @@ async def send_daily_summary():
         win_rate = (m["wins"] / m["trade_count"] * 100) if m["trade_count"] > 0 else 0.0
         avg_r = (m["total_r_achieved"] / m["trade_count"]) if m["trade_count"] > 0 else 0.0
 
+        expectancy = (m["total_r_achieved"] / m["trade_count"]) if m["trade_count"] > 0 else 0.0
+
         lines.append(
             f"  <b>{name}</b>: ${pnl:+,.2f} ({trades} trades) [{status}]\n"
-            f"    WR: {win_rate:.0f}% | Avg R: {avg_r:+.2f} | "
-            f"MaxDD: ${m['max_drawdown']:,.2f} | "
+            f"    WR: {win_rate:.0f}% | Avg R: {avg_r:+.2f} | Expectancy: {expectancy:+.2f}R/trade\n"
+            f"    MaxDD: ${m['max_drawdown']:,.2f} | "
             f"Streak: {m['current_losing_streak']}/{m['max_losing_streak']}"
         )
 
+    # Overall expectancy
+    total_r = sum(state.metrics[n]["total_r_achieved"] for n in STRATEGY_NAMES)
+    total_tc = sum(state.metrics[n]["trade_count"] for n in STRATEGY_NAMES)
+    overall_expectancy = total_r / total_tc if total_tc > 0 else 0.0
+
     lines.append(f"\n<b>Total PnL:</b> ${total_pnl:+,.2f}")
+    lines.append(f"<b>Expectancy:</b> {overall_expectancy:+.2f}R per trade")
     lines.append(f"<b>Total daily PnL:</b> ${state.daily_pnl:+,.2f}")
     lines.append(f"<b>Total trades today:</b> {state.trades_today}/{MAX_TRADES_PER_DAY}")
     lines.append(f"<b>Lifetime trades:</b> {state.total_trade_count}")
@@ -1527,8 +1659,11 @@ async def send_paper_test_report():
 
     total_trades = overall_wins + overall_losses
     overall_wr = (overall_wins / total_trades * 100) if total_trades > 0 else 0.0
+    total_r = sum(state.metrics[n]["total_r_achieved"] for n in STRATEGY_NAMES)
+    overall_expectancy = total_r / total_trades if total_trades > 0 else 0.0
     lines.append(f"\n<b>OVERALL:</b>")
     lines.append(f"  Total: {total_trades} | WR: {overall_wr:.1f}% | PnL: ${overall_pnl:+,.2f}")
+    lines.append(f"  Expectancy: {overall_expectancy:+.2f}R per trade")
 
     await tg_send("\n".join(lines))
 
@@ -1543,6 +1678,84 @@ async def daily_reset_scheduler():
         await asyncio.sleep(wait_seconds)
         state.reset_daily()
         await tg_send("\U0001f504 Daily reset complete. All strategies resumed.")
+
+
+# ---------------------------------------------------------------------------
+# AI Market Brain — Pre-trade analysis
+# ---------------------------------------------------------------------------
+
+async def _fetch_recent_news_headlines() -> list[str]:
+    """Fetch recent BTC news headlines from CryptoCompare."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://min-api.cryptocompare.com/data/v2/news/?lang=EN&categories=BTC"
+            )
+            if resp.status_code != 200:
+                return []
+            data = resp.json()
+            articles = data.get("Data", [])[:5]
+            return [a.get("title", "") for a in articles if a.get("title")]
+    except Exception:
+        return []
+
+
+async def ai_market_analysis(strategy: str, side: str, price: float) -> tuple[bool, str]:
+    """
+    AI Market Brain: ask Claude Haiku whether this trade should be taken.
+    Called after all mechanical checks pass, before execute_trade.
+    Returns (should_trade, reason).
+    Defaults to YES on API errors.
+    """
+    if not CLAUDE_API_KEY:
+        return True, "No API key — defaulting to YES"
+
+    try:
+        headlines = await _fetch_recent_news_headlines()
+        news_text = "\n".join(f"- {h}" for h in headlines) if headlines else "No recent news available"
+
+        prompt = (
+            f"You are a BTC futures trading risk analyst. Evaluate this proposed trade:\n\n"
+            f"Strategy: {strategy}\n"
+            f"Direction: {side.upper()}\n"
+            f"Entry price: ${price:,.2f}\n"
+            f"Current regime: {state.regime.value}\n"
+            f"1H bias: {state.htf_bias} ({state.htf_bias_strength})\n\n"
+            f"Recent BTC news:\n{news_text}\n\n"
+            f"Should this trade be taken? Reply YES or NO with a 1-sentence reason."
+        )
+
+        payload = {
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": CLAUDE_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json=payload,
+            )
+            if resp.status_code != 200:
+                log.warning("AI Market Brain API error %d — defaulting YES", resp.status_code)
+                return True, "API error — defaulting to YES"
+
+            data = resp.json()
+            content = data.get("content", [{}])[0].get("text", "").strip()
+            log.info("AI Market Brain response for %s %s: %s", strategy, side, content)
+
+            if content.upper().startswith("NO"):
+                return False, content
+            return True, content
+
+    except Exception as exc:
+        log.warning("AI Market Brain error: %s — defaulting YES", exc)
+        return True, f"Error: {exc} — defaulting to YES"
 
 
 # ---------------------------------------------------------------------------
@@ -1593,7 +1806,66 @@ async def telegram_polling_loop():
 
                     # Skip bot commands that aren't questions
                     if text.startswith("/start"):
-                        await tg_reply(chat_id, "Hey! I'm Vic, your BTC trading agent. Ask me anything about the market.")
+                        await tg_reply(chat_id, "Hey! I'm Vic, your BTC trading agent. Ask me anything about the market.\n\nCommands: /journal /metrics /regime /news")
+                        continue
+
+                    # Handle special commands before sending to Claude
+                    if text.strip().lower() == "/journal":
+                        journal = _read_journal()
+                        last_5 = journal[-5:] if journal else []
+                        if not last_5:
+                            await tg_reply(chat_id, "No trades in journal yet.")
+                        else:
+                            lines = ["📒 <b>Last 5 Trades</b>\n"]
+                            for t in reversed(last_5):
+                                emoji = "✅" if t.get("pnl_usd", 0) >= 0 else "❌"
+                                lines.append(
+                                    f"{emoji} #{t.get('id','-')} {t.get('strategy','-')} {t.get('side','').upper()}\n"
+                                    f"  ${t.get('entry_price',0):,.2f} → ${t.get('exit_price',0):,.2f} | "
+                                    f"<b>${t.get('pnl_usd',0):+,.2f}</b> ({t.get('r_achieved',0):+.1f}R)\n"
+                                    f"  {t.get('exit_reason','-')} | {t.get('hold_time_min',0):.0f}min | {t.get('session','-')}"
+                                )
+                            await tg_reply(chat_id, "\n".join(lines))
+                        continue
+
+                    if text.strip().lower() == "/metrics":
+                        lines = ["📊 <b>Per-Strategy Metrics</b>\n"]
+                        for n in STRATEGY_NAMES:
+                            m = state.metrics[n]
+                            tc = m["trade_count"]
+                            wr = (m["wins"] / tc * 100) if tc > 0 else 0
+                            exp = (m["total_r_achieved"] / tc) if tc > 0 else 0
+                            lines.append(
+                                f"<b>{n}</b>: {tc} trades | WR {wr:.0f}% | Exp {exp:+.2f}R\n"
+                                f"  PnL ${m['current_pnl']:+,.2f} | MaxDD ${m['max_drawdown']:,.2f} | "
+                                f"Streak {m['current_losing_streak']}/{m['max_losing_streak']}"
+                            )
+                        await tg_reply(chat_id, "\n".join(lines))
+                        continue
+
+                    if text.strip().lower() == "/regime":
+                        msg = (
+                            f"🔍 <b>Current Regime: {state.regime.value}</b>\n\n"
+                            f"Math:\n"
+                            f"- TRENDING: ADX > 25 AND structure aligned (HH/HL or LH/LL)\n"
+                            f"- TRANSITIONAL: ADX > 25 but structure breaking\n"
+                            f"- RANGING: ADX < 20 AND BB bandwidth < 0.03\n"
+                            f"- VOLATILE: ATR% > 0.4% OR >1.5% move in 30min\n\n"
+                            f"1H Bias: {state.htf_bias} ({state.htf_bias_strength})\n"
+                            f"BTC: ${state.last_btc_price:,.2f}"
+                        )
+                        await tg_reply(chat_id, msg)
+                        continue
+
+                    if text.strip().lower() == "/news":
+                        headlines = await _fetch_recent_news_headlines()
+                        if headlines:
+                            lines = ["📰 <b>Recent BTC News</b>\n"]
+                            for h in headlines:
+                                lines.append(f"• {h}")
+                            await tg_reply(chat_id, "\n".join(lines))
+                        else:
+                            await tg_reply(chat_id, "No recent news available.")
                         continue
 
                     # Process the question with Claude
@@ -1610,8 +1882,8 @@ async def telegram_polling_loop():
 
 
 async def ask_claude_market_question(question: str) -> str:
-    """Send a market question to Claude API with current trading state context."""
-    # Build position summary
+    """Send a market question to Claude API with full trading state context."""
+    # Build position summary with unrealized PnL
     open_positions = []
     for name in STRATEGY_NAMES:
         pos = state.strategies[name]["position"]
@@ -1625,15 +1897,59 @@ async def ask_claude_market_question(question: str) -> str:
                 pnl_label = f", unrealized ${unrealized:+.2f}"
             open_positions.append(
                 f"{name}: {pos['side'].upper()} @ ${pos['entry']:,.2f} "
-                f"(SL ${pos['sl']:,.2f}, TP ${pos['tp']:,.2f}{pnl_label})"
+                f"(SL ${pos['sl']:,.2f}, TP ${pos['tp']:,.2f}{pnl_label}, BE={'yes' if pos['be_moved'] else 'no'})"
             )
-
     positions_text = "\n".join(open_positions) if open_positions else "No open positions"
+
+    # Per-strategy metrics
+    metrics_lines = []
+    for n in STRATEGY_NAMES:
+        m = state.metrics[n]
+        tc = m["trade_count"]
+        wr = (m["wins"] / tc * 100) if tc > 0 else 0
+        exp = (m["total_r_achieved"] / tc) if tc > 0 else 0
+        metrics_lines.append(
+            f"  {n}: {tc} trades, WR {wr:.0f}%, expectancy {exp:+.2f}R, "
+            f"PnL ${m['current_pnl']:+,.2f}, MaxDD ${m['max_drawdown']:,.2f}, "
+            f"losing streak {m['current_losing_streak']}/{m['max_losing_streak']}"
+        )
+    metrics_text = "\n".join(metrics_lines)
+
+    # Recent trade history from journal
+    journal = _read_journal()
+    recent_trades = journal[-10:] if journal else []
+    trades_text = ""
+    if recent_trades:
+        trade_lines = []
+        for t in recent_trades:
+            trade_lines.append(
+                f"  #{t.get('id','-')} {t.get('strategy','-')} {t.get('side','').upper()} "
+                f"${t.get('entry_price',0):,.2f}->${t.get('exit_price',0):,.2f} "
+                f"PnL ${t.get('pnl_usd',0):+,.2f} ({t.get('r_achieved',0):+.1f}R) "
+                f"[{t.get('exit_reason','-')}, {t.get('hold_time_min',0):.0f}min]"
+            )
+        trades_text = "\n".join(trade_lines)
+    else:
+        trades_text = "  No trades yet"
+
+    # Recent news
+    headlines = await _fetch_recent_news_headlines()
+    news_text = "\n".join(f"  - {h}" for h in headlines) if headlines else "  No recent news"
 
     system_prompt = (
         f"You are Vic, an AI crypto trading agent monitoring BTC/USDT perpetual futures on OKX. "
-        f"You have real-time data and run 5 strategies simultaneously.\n\n"
-        f"Current state:\n"
+        f"You run 4 strategies simultaneously with pure risk-based sizing.\n\n"
+        f"=== STRATEGIES ===\n"
+        f"1. TradingView Webhook: External alerts filtered by regime + bias + 2 confirmations (RSI/structure/VWAP)\n"
+        f"2. RSI Divergence: Price/RSI divergence at support/resistance on 5m (50-candle lookback, 0.25% S/R threshold)\n"
+        f"3. BB Squeeze: Bollinger squeeze breakout on 5m with 60% body filter and 0.1% band penetration\n"
+        f"4. VWAP Bounce: VWAP bounce on 1m with distance, chop filter, volume + body confirmation\n\n"
+        f"=== REGIME DEFINITIONS ===\n"
+        f"TRENDING: ADX > 25 AND structure aligned (HH/HL or LH/LL)\n"
+        f"TRANSITIONAL: ADX > 25 but structure breaking down\n"
+        f"RANGING: ADX < 20 AND BB bandwidth < 0.03\n"
+        f"VOLATILE: ATR% > 0.4% OR >1.5% move in 30min\n\n"
+        f"=== CURRENT STATE ===\n"
         f"- BTC Price: ${state.last_btc_price:,.2f}\n"
         f"- Regime: {state.regime.value}\n"
         f"- 1H Bias: {state.htf_bias} ({state.htf_bias_strength})\n"
@@ -1643,8 +1959,14 @@ async def ask_claude_market_question(question: str) -> str:
         f"- Lifetime trades: {state.total_trade_count}\n"
         f"- Daily loss cap: {'HIT' if state.daily_loss_cap_hit else 'OK'}\n"
         f"- Paused: {state.paused}\n"
+        f"- Session: {'active' if is_trading_session() else 'inactive'}\n"
         f"- Signals checked today: {state.signals_checked}, blocked: {state.signals_blocked}\n\n"
-        f"Open positions:\n{positions_text}\n\n"
+        f"=== OPEN POSITIONS ===\n{positions_text}\n\n"
+        f"=== PER-STRATEGY METRICS ===\n{metrics_text}\n\n"
+        f"=== RECENT TRADES (last 10) ===\n{trades_text}\n\n"
+        f"=== RECENT NEWS ===\n{news_text}\n\n"
+        f"Risk: $20/trade, TP $60, max 4 trades/day, -$60 daily cap.\n"
+        f"Sessions: London 07-11 UTC, NY 13-17 UTC. AI pre-trade analysis enabled.\n\n"
         f"Answer the user's question about the market concisely. "
         f"Be direct, use numbers, and keep it under 300 words."
     )
@@ -1696,16 +2018,18 @@ async def startup():
     webhook_url = f"{RAILWAY_URL}/webhook/tradingview?token={WEBHOOK_SECRET}" if RAILWAY_URL else "N/A"
     startup_msg = (
         f"\U0001f916 <b>Vic is online \u2014 {state.mode.upper()} MODE</b>\n"
-        f"BTC/USDT perp | {LEVERAGE}x leverage\n\n"
-        f"<b>5 Strategies Active:</b>\n"
-        f"1\ufe0f\u20e3 <b>TradingView Webhook</b> \u2014 Filtered: regime + bias + confirmations ($200 shared)\n"
-        f"2\ufe0f\u20e3 <b>RSI Divergence</b> \u2014 Price/RSI divergence at S/R on 5m ($300)\n"
-        f"3\ufe0f\u20e3 <b>BB Squeeze</b> \u2014 Bollinger squeeze breakout on 5m ($300)\n"
-        f"4\ufe0f\u20e3 <b>VWAP Bounce</b> \u2014 VWAP bounce with distance + chop filter on 1m ($200)\n"
-        f"5\ufe0f\u20e3 <b>Yilmaz AO+Stoch</b> \u2014 AO+Stoch+RSI confluence on 5m ($200)\n\n"
+        f"BTC/USDT perp | {LEVERAGE}x leverage | ATR-based sizing\n\n"
+        f"<b>4 Strategies Active:</b>\n"
+        f"1\ufe0f\u20e3 <b>TradingView Webhook</b> \u2014 regime + bias + 2 confirmations\n"
+        f"2\ufe0f\u20e3 <b>RSI Divergence</b> \u2014 Price/RSI divergence at S/R on 5m\n"
+        f"3\ufe0f\u20e3 <b>BB Squeeze</b> \u2014 Bollinger squeeze breakout on 5m (60% body filter)\n"
+        f"4\ufe0f\u20e3 <b>VWAP Bounce</b> \u2014 VWAP bounce + chop filter on 1m\n\n"
         f"$20 risk/trade | 1:3 R:R | Max 4 trades/day\n"
+        f"Session: London 07-11 UTC + NY 13-17 UTC\n"
         f"Daily loss cap: -$60 (auto-stops all)\n"
-        f"Break-even at +1.5R | Candle-close entries only\n\n"
+        f"Break-even at +1.5R | Partial profit at +2R (50%)\n"
+        f"AI Market Brain: pre-trade analysis enabled\n"
+        f"Trade Journal: /journal command in Telegram\n\n"
         f"Paper test: {PAPER_TEST_MIN_TRADES} trades or {PAPER_TEST_MAX_DAYS} days\n\n"
         f"Webhook: {webhook_url}"
     )
@@ -1765,7 +2089,6 @@ async def full_status():
             "paused": s["paused"],
             "has_position": s["position"] is not None,
             "position": s["position"],
-            "capital": STRATEGY_CAPITAL.get(name, 200.0),
             "max_hold_min": STRATEGY_MAX_HOLD.get(name, 120),
             "metrics": {
                 "win_rate": round(win_rate, 1),
@@ -1842,7 +2165,22 @@ async def tradingview_webhook(request: Request, token: str = Query("")):
         log.info("Webhook signal skipped — no confirmation: %s", conf_reason)
         return {"status": "skipped", "reason": conf_reason}
 
-    await execute_trade("tv_webhook", action, price)
+    # Fetch ATR for SL computation
+    df_5m = await fetch_ohlcv("5m", 30)
+    atr_val = 0.0
+    if not df_5m.empty and len(df_5m) >= 14:
+        atr_s = calc_atr(df_5m, 14)
+        atr_val = float(atr_s.iloc[-1]) if not atr_s.empty and not np.isnan(atr_s.iloc[-1]) else 0.0
+
+    # AI Market Brain check
+    ai_ok, ai_reason = await ai_market_analysis("tv_webhook", action, price)
+    if not ai_ok:
+        msg = f"🧠 <b>AI blocked</b> tv_webhook {action.upper()}: {ai_reason}"
+        await tg_send(msg)
+        log.info("Webhook blocked by AI: %s", ai_reason)
+        return {"status": "ai_blocked", "reason": ai_reason}
+
+    await execute_trade("tv_webhook", action, price, atr_value=atr_val)
     return {"status": "ok", "action": action, "price": price, "confirmation": conf_reason}
 
 
@@ -1875,3 +2213,10 @@ async def resume_trading():
     state.paused = False
     await tg_send("\u25b6\ufe0f Trading RESUMED by manual command.")
     return {"status": "resumed"}
+
+
+@app.get("/journal")
+async def get_journal():
+    """Return the trade journal."""
+    journal = _read_journal()
+    return {"trades": journal, "count": len(journal)}
