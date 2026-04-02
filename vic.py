@@ -1132,7 +1132,6 @@ async def strategy_rsi_divergence():
                     await execute_trade(name, "long", price_now, atr_value=atr_val)
                 else:
                     log.info("rsi_divergence LONG blocked by AI: %s", ai_reason)
-                    await tg_send(f"🧠 <b>AI blocked</b> rsi_divergence LONG: {ai_reason}")
             return
 
     # Bearish divergence: price higher high, RSI lower high
@@ -1149,7 +1148,6 @@ async def strategy_rsi_divergence():
                     await execute_trade(name, "short", price_now, atr_value=atr_val)
                 else:
                     log.info("rsi_divergence SHORT blocked by AI: %s", ai_reason)
-                    await tg_send(f"🧠 <b>AI blocked</b> rsi_divergence SHORT: {ai_reason}")
 
 
 # ---------------------------------------------------------------------------
@@ -1209,7 +1207,6 @@ async def strategy_bb_squeeze():
                         await execute_trade(name, "long", price, atr_value=atr_val)
                     else:
                         log.info("bb_squeeze LONG blocked by AI: %s", ai_reason)
-                        await tg_send(f"🧠 <b>AI blocked</b> bb_squeeze LONG: {ai_reason}")
             elif price < lower_threshold:
                 allowed, reason = can_execute_trade(name, "short")
                 if allowed:
@@ -1218,7 +1215,6 @@ async def strategy_bb_squeeze():
                         await execute_trade(name, "short", price, atr_value=atr_val)
                     else:
                         log.info("bb_squeeze SHORT blocked by AI: %s", ai_reason)
-                        await tg_send(f"🧠 <b>AI blocked</b> bb_squeeze SHORT: {ai_reason}")
 
 
 # ---------------------------------------------------------------------------
@@ -1289,7 +1285,6 @@ async def strategy_vwap_bounce():
                 await execute_trade(name, "long", price, atr_value=atr_val)
             else:
                 log.info("vwap_bounce LONG blocked by AI: %s", ai_reason)
-                await tg_send(f"🧠 <b>AI blocked</b> vwap_bounce LONG: {ai_reason}")
     # Short: price touched VWAP and rejected with bearish candle
     elif is_bearish and price < vwap_val:
         allowed, reason = can_execute_trade(name, "short")
@@ -1299,7 +1294,6 @@ async def strategy_vwap_bounce():
                 await execute_trade(name, "short", price, atr_value=atr_val)
             else:
                 log.info("vwap_bounce SHORT blocked by AI: %s", ai_reason)
-                await tg_send(f"🧠 <b>AI blocked</b> vwap_bounce SHORT: {ai_reason}")
 
 
 
@@ -2175,8 +2169,6 @@ async def tradingview_webhook(request: Request, token: str = Query("")):
     # AI Market Brain check
     ai_ok, ai_reason = await ai_market_analysis("tv_webhook", action, price)
     if not ai_ok:
-        msg = f"🧠 <b>AI blocked</b> tv_webhook {action.upper()}: {ai_reason}"
-        await tg_send(msg)
         log.info("Webhook blocked by AI: %s", ai_reason)
         return {"status": "ai_blocked", "reason": ai_reason}
 
