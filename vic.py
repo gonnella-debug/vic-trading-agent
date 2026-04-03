@@ -1,6 +1,6 @@
 """
-Vic — BTC/USDT Perpetual Futures Scalping Agent (v2)
-Runs 4 strategies simultaneously on Hyperliquid via ccxt.
+Vic — BTC/USDT Perpetual Futures Scalping Agent (v3)
+Runs 4 strategies simultaneously on Hyperliquid via native SDK.
 $500 account, full capital available per trade. Production-ready for Railway.
 
 Strategies:
@@ -33,7 +33,11 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 from enum import Enum
 
-import ccxt.async_support as ccxt
+import eth_account
+from eth_account.signers.local import LocalAccount
+from hyperliquid.info import Info
+from hyperliquid.exchange import Exchange as HLExchange
+from hyperliquid.utils import constants as hl_constants
 import httpx
 import numpy as np
 import pandas as pd
@@ -65,7 +69,7 @@ CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-SYMBOL = "BTC/USDC:USDC"
+SYMBOL = "BTC"  # Hyperliquid native SDK uses coin name directly
 LEVERAGE = 5
 ACCOUNT_CAPITAL = 500.0       # total wallet balance
 RISK_PCT = 0.10               # 10% of margin = max SL risk
@@ -131,9 +135,10 @@ class Regime(str, Enum):
 # ---------------------------------------------------------------------------
 # App & state
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Vic Trading Agent", version="2.0.0")
+app = FastAPI(title="Vic Trading Agent", version="3.0.0")
 
-exchange = None
+hl_info: Optional[Info] = None
+hl_exchange: Optional[HLExchange] = None
 
 
 class TradingState:
@@ -279,38 +284,61 @@ async def tg_reply(chat_id: str, text: str):
 # Helpers — Exchange
 # ---------------------------------------------------------------------------
 
-async def init_exchange():
-    """Create and configure the Hyperliquid ccxt instance."""
-    global exchange
-    config = {
-        "walletAddress": HL_WALLET_ADDRESS,
-        "privateKey": HL_PRIVATE_KEY,
-        "enableRateLimit": True,
-        "options": {
-            "defaultType": "swap",
-        },
-    }
-    if state.mode == "paper":
-        config["sandbox"] = True
-    exchange = ccxt.hyperliquid(config)
+def init_exchange():
+    """Create and configure the native Hyperliquid SDK instances."""
+    global hl_info, hl_exchange
+    base_url = hl_constants.TESTNET_API_URL if state.mode == "paper" else hl_constants.MAINNET_API_URL
     try:
-        await exchange.load_markets()
-        log.info(f"Hyperliquid exchange connected ({'testnet' if state.mode == 'paper' else 'live'}). Markets loaded.")
+        wallet: LocalAccount = eth_account.Account.from_key(HL_PRIVATE_KEY)
+        hl_info = Info(base_url, skip_ws=True)
+        hl_exchange = HLExchange(
+            wallet=wallet,
+            base_url=base_url,
+            account_address=HL_WALLET_ADDRESS,
+        )
+        log.info("Hyperliquid SDK connected (%s). Wallet: %s",
+                 "testnet" if state.mode == "paper" else "mainnet", HL_WALLET_ADDRESS[:10] + "...")
     except Exception as exc:
         log.error("Exchange init error (non-fatal, will retry): %s", exc)
 
 
-async def close_exchange():
-    if exchange:
-        await exchange.close()
+def close_exchange():
+    """No persistent connection to close with native SDK."""
+    pass
 
 
 async def fetch_ohlcv(timeframe: str = "1m", limit: int = 100) -> pd.DataFrame:
-    """Fetch OHLCV candles and return a DataFrame."""
+    """Fetch OHLCV candles from Hyperliquid native SDK and return a DataFrame."""
     try:
-        candles = await exchange.fetch_ohlcv(SYMBOL, timeframe=timeframe, limit=limit)
-        df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        now_ms = int(time.time() * 1000)
+        # Calculate start time from limit and timeframe
+        tf_seconds = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+                      "1h": 3600, "2h": 7200, "4h": 14400, "1d": 86400}
+        interval_sec = tf_seconds.get(timeframe, 60)
+        start_ms = now_ms - (limit * interval_sec * 1000)
+
+        # Run sync SDK call in thread pool to avoid blocking event loop
+        loop = asyncio.get_event_loop()
+        raw = await loop.run_in_executor(
+            None, lambda: hl_info.candles_snapshot("BTC", timeframe, start_ms, now_ms)
+        )
+        if not raw:
+            return pd.DataFrame()
+
+        rows = []
+        for c in raw:
+            rows.append({
+                "timestamp": pd.to_datetime(c["t"], unit="ms"),
+                "open": float(c["o"]),
+                "high": float(c["h"]),
+                "low": float(c["l"]),
+                "close": float(c["c"]),
+                "volume": float(c["v"]),
+            })
+        df = pd.DataFrame(rows)
+        # Trim to requested limit
+        if len(df) > limit:
+            df = df.tail(limit).reset_index(drop=True)
         return df
     except Exception as exc:
         log.error("fetch_ohlcv error: %s", exc)
@@ -318,10 +346,11 @@ async def fetch_ohlcv(timeframe: str = "1m", limit: int = 100) -> pd.DataFrame:
 
 
 async def get_btc_price() -> float:
-    """Get the current BTC/USDT mark price."""
+    """Get the current BTC mid price from Hyperliquid."""
     try:
-        ticker = await exchange.fetch_ticker(SYMBOL)
-        return float(ticker.get("last", 0))
+        loop = asyncio.get_event_loop()
+        all_mids = await loop.run_in_executor(None, hl_info.all_mids)
+        return float(all_mids.get("BTC", 0))
     except Exception as exc:
         log.error("get_btc_price error: %s", exc)
         return state.last_btc_price or 0.0
@@ -830,14 +859,17 @@ async def execute_trade(strategy: str, side: str, entry: float, atr_value: float
     # Open order
     if state.mode == "live":
         try:
-            await exchange.set_leverage(LEVERAGE, SYMBOL)
-            order = await exchange.create_order(
-                symbol=SYMBOL,
-                type="market",
-                side="buy" if side == "long" else "sell",
-                amount=size,
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, lambda: hl_exchange.update_leverage(LEVERAGE, "BTC", is_cross=True)
             )
-            log.info("%s LIVE order placed: %s", strategy, order.get("id"))
+            is_buy = side == "long"
+            result = await loop.run_in_executor(
+                None, lambda: hl_exchange.market_open("BTC", is_buy=is_buy, sz=size)
+            )
+            if result.get("status") != "ok":
+                raise Exception(f"Order rejected: {result}")
+            log.info("%s LIVE order placed: %s", strategy, result)
         except Exception as exc:
             log.error("%s — order error: %s", strategy, exc)
             await tg_send(f"\u26a0\ufe0f <b>{strategy}</b> order FAILED: {exc}")
@@ -930,14 +962,13 @@ async def close_position(strategy: str, exit_price: float, reason: str):
     # Close on exchange if live — ABORT if order fails
     if state.mode == "live":
         try:
-            close_side = "sell" if pos["side"] == "long" else "buy"
-            await exchange.create_order(
-                symbol=SYMBOL,
-                type="market",
-                side=close_side,
-                amount=pos["size"],
-                params={"reduceOnly": True},
+            loop = asyncio.get_event_loop()
+            close_size = pos["size"]
+            result = await loop.run_in_executor(
+                None, lambda: hl_exchange.market_close("BTC", sz=close_size)
             )
+            if result.get("status") != "ok":
+                raise Exception(f"Close rejected: {result}")
         except Exception as exc:
             log.error("%s — close order error: %s", strategy, exc)
             await tg_send(
@@ -1466,15 +1497,13 @@ async def position_monitor_loop():
                         new_size = round(old_size * (1 - PARTIAL_CLOSE_PCT), 6)
                         if state.mode == "live":
                             try:
-                                close_side = "sell" if side == "long" else "buy"
                                 partial_amount = round(old_size * PARTIAL_CLOSE_PCT, 6)
-                                await exchange.create_order(
-                                    symbol=SYMBOL,
-                                    type="market",
-                                    side=close_side,
-                                    amount=partial_amount,
-                                    params={"reduceOnly": True},
+                                loop = asyncio.get_event_loop()
+                                result = await loop.run_in_executor(
+                                    None, lambda: hl_exchange.market_close("BTC", sz=partial_amount)
                                 )
+                                if result.get("status") != "ok":
+                                    raise Exception(f"Partial close rejected: {result}")
                             except Exception as exc:
                                 log.error("%s — partial close error: %s", name, exc)
                                 await tg_send(
@@ -1602,7 +1631,8 @@ async def _run_macro_scan():
                         "Check: 1) Fed/FOMC decisions or speeches today, 2) US CPI/jobs data releases, "
                         "3) Tariff or trade war developments, 4) SEC/regulatory actions on crypto, "
                         "5) Major exchange issues or hacks, 6) Geopolitical events affecting risk assets. "
-                        "Give a concise factual summary. Flag anything that should STOP a trader from "
+                        + (_get_intelligence_summary() + "\n\nFactor in what top traders are doing. " if _get_intelligence_summary() else "")
+                        + "Give a concise factual summary. Flag anything that should STOP a trader from "
                         "entering new BTC positions right now. End with: RISK_LEVEL: LOW/MEDIUM/HIGH/CRITICAL"
                     )}],
                 },
@@ -1738,6 +1768,11 @@ async def send_daily_summary():
     lines.append(f"<b>BTC Price:</b> ${state.last_btc_price:,.2f}")
     lines.append(f"<b>Daily loss cap:</b> {'HIT' if state.daily_loss_cap_hit else 'OK'}")
 
+    # Inject top trader intelligence summary
+    intel = _get_intelligence_summary()
+    if intel:
+        lines.append(f"\n<b>🧠 Top Trader Intel:</b>\n{sanitize_html(intel)}")
+
     await tg_send("\n".join(lines))
 
 
@@ -1835,6 +1870,10 @@ async def ai_market_analysis(strategy: str, side: str, price: float) -> tuple[bo
             age_min = int((time.time() - _macro_intel_cache["fetched_at"]) / 60)
             macro_text = f"\n\nMACRO INTELLIGENCE (updated {age_min}min ago):\n{_macro_intel_cache['text']}"
 
+        # Inject top trader intelligence
+        intel_text = _get_intelligence_summary()
+        intel_section = f"\n\n{intel_text}" if intel_text else ""
+
         prompt = (
             f"You are a BTC futures trading risk analyst. Evaluate this proposed trade:\n\n"
             f"Strategy: {strategy}\n"
@@ -1845,10 +1884,12 @@ async def ai_market_analysis(strategy: str, side: str, price: float) -> tuple[bo
             f"Daily PnL: ${state.daily_pnl:+,.2f}\n"
             f"Trades today: {state.trades_today}/{MAX_TRADES_PER_DAY}\n\n"
             f"Recent BTC news:\n{news_text}"
-            f"{macro_text}\n\n"
+            f"{macro_text}"
+            f"{intel_section}\n\n"
             f"You have web_search — if the macro intel above is older than 30 minutes or mentions "
             f"a developing situation (Fed speaking, data release pending, breaking event), "
             f"SEARCH for the latest update before deciding.\n\n"
+            f"Consider the top trader intelligence when evaluating direction and timing.\n"
             f"Should this trade be taken? Reply YES or NO with a 1-sentence reason."
         )
 
@@ -1941,7 +1982,7 @@ async def telegram_polling_loop():
 
                     # Skip bot commands that aren't questions
                     if text.startswith("/start"):
-                        await tg_reply(chat_id, "Hey! I'm Vic, your BTC trading agent. Ask me anything about the market.\n\nCommands: /journal /metrics /regime /news")
+                        await tg_reply(chat_id, "Hey! I'm Vic, your BTC trading agent. Ask me anything about the market.\n\nCommands: /journal /metrics /regime /news /intelligence")
                         continue
 
                     # Handle special commands before sending to Claude
@@ -2001,6 +2042,41 @@ async def telegram_polling_loop():
                             await tg_reply(chat_id, "\n".join(lines))
                         else:
                             await tg_reply(chat_id, "No recent news available.")
+                        continue
+
+                    if text.strip().lower() == "/intelligence":
+                        report = _intelligence_cache.get("report") or _read_intelligence()
+                        if not report or not report.get("traders"):
+                            await tg_reply(chat_id, "No intelligence report available yet. First scan runs ~60s after startup, then every 6 hours.")
+                        else:
+                            ts = report.get("timestamp", "unknown")
+                            traders = report.get("traders", [])
+                            patterns = report.get("patterns", {})
+                            lines = [f"🧠 <b>Top Trader Intelligence</b>\nUpdated: {ts}\n"]
+                            lines.append(f"Scanned: {report.get('total_scanned', 0)} | Qualifying: {report.get('total_qualifying', 0)}")
+                            if patterns:
+                                lines.append(f"\n<b>Patterns:</b>")
+                                if patterns.get("dominant_direction"):
+                                    lines.append(f"  Direction: {patterns['dominant_direction']}")
+                                if patterns.get("avg_win_rate"):
+                                    lines.append(f"  Avg WR: {patterns['avg_win_rate']:.1f}%")
+                                if patterns.get("avg_win_loss_ratio"):
+                                    lines.append(f"  W/L ratio: {patterns['avg_win_loss_ratio']:.2f}")
+                                if patterns.get("best_sessions"):
+                                    lines.append(f"  Best sessions: {', '.join(patterns['best_sessions'])}")
+                                if patterns.get("key_insight"):
+                                    lines.append(f"\n<b>Insight:</b> {sanitize_html(patterns['key_insight'])}")
+                            if traders:
+                                lines.append(f"\n<b>Top Traders:</b>")
+                                for t in traders[:5]:
+                                    lines.append(
+                                        f"  #{t.get('rank','-')} {t.get('address','?')} "
+                                        f"WR:{t.get('win_rate',0):.0f}% "
+                                        f"W/L:{t.get('avg_win_loss_ratio',0):.1f}x "
+                                        f"Bias:{t.get('direction_bias','?')} "
+                                        f"Best:{t.get('best_session','?')}"
+                                    )
+                            await tg_reply(chat_id, "\n".join(lines))
                         continue
 
                     # Process the question with Claude
@@ -2135,6 +2211,7 @@ async def ask_claude_market_question(question: str) -> str:
         f"=== PER-STRATEGY METRICS ===\n{metrics_text}\n\n"
         f"=== RECENT TRADES (last 10) ===\n{trades_text}\n\n"
         f"=== RECENT NEWS ===\n{news_text}\n\n"
+        f"=== TOP TRADER INTELLIGENCE ===\n{_get_intelligence_summary() or 'No report yet'}\n\n"
         f"$500 account, full capital per trade. 10% risk, 20% partial close, 30% full TP.\n"
         f"Max 4 trades/day, 10% daily loss cap (${ACCOUNT_CAPITAL * MAX_DAILY_LOSS_PCT:.0f}).\n"
         f"Sessions: London 07-11 UTC, NY 13-17 UTC. AI pre-trade analysis enabled.\n\n"
@@ -2190,6 +2267,444 @@ async def ask_claude_market_question(question: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Hyperliquid Top Trader Intelligence
+# ---------------------------------------------------------------------------
+
+INTELLIGENCE_FILE = os.getenv("INTELLIGENCE_FILE", "/data/hl_intelligence.json")
+_intelligence_cache = {"report": {}, "fetched_at": 0}
+
+
+def _read_intelligence() -> dict:
+    """Read the latest intelligence report from file."""
+    try:
+        if os.path.exists(INTELLIGENCE_FILE):
+            with open(INTELLIGENCE_FILE, "r") as f:
+                return json.load(f)
+    except Exception as exc:
+        log.error("Intelligence read error: %s", exc)
+    return {}
+
+
+def _write_intelligence(report: dict):
+    """Write intelligence report to file."""
+    try:
+        d = os.path.dirname(INTELLIGENCE_FILE)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(INTELLIGENCE_FILE, "w") as f:
+            json.dump(report, f, indent=2)
+    except Exception as exc:
+        log.error("Intelligence write error: %s", exc)
+
+
+def _get_intelligence_summary() -> str:
+    """Get a formatted intelligence summary for injection into AI contexts."""
+    report = _intelligence_cache.get("report") or _read_intelligence()
+    if not report or not report.get("traders"):
+        return ""
+
+    age_min = int((time.time() - _intelligence_cache.get("fetched_at", 0)) / 60) if _intelligence_cache.get("fetched_at") else 0
+    traders = report.get("traders", [])
+    patterns = report.get("patterns", {})
+
+    lines = [f"HYPERLIQUID TOP TRADER INTELLIGENCE (updated {age_min}min ago, {len(traders)} traders):"]
+
+    if patterns:
+        if patterns.get("dominant_direction"):
+            lines.append(f"  Dominant direction: {patterns['dominant_direction']}")
+        if patterns.get("avg_hold_duration_min"):
+            lines.append(f"  Avg hold duration: {patterns['avg_hold_duration_min']:.0f}min")
+        if patterns.get("avg_win_rate"):
+            lines.append(f"  Avg win rate: {patterns['avg_win_rate']:.1f}%")
+        if patterns.get("best_sessions"):
+            lines.append(f"  Best sessions: {', '.join(patterns['best_sessions'])}")
+        if patterns.get("avg_win_loss_ratio"):
+            lines.append(f"  Win/loss size ratio: {patterns['avg_win_loss_ratio']:.2f}")
+        if patterns.get("key_insight"):
+            lines.append(f"  Key insight: {patterns['key_insight']}")
+
+    # Top 3 trader summaries
+    for t in traders[:3]:
+        lines.append(f"  #{t.get('rank','-')} WR:{t.get('win_rate',0):.0f}% "
+                     f"Trades:{t.get('total_trades',0)} "
+                     f"W/L:{t.get('avg_win_loss_ratio',0):.1f}x "
+                     f"Bias:{t.get('direction_bias','?')}")
+
+    return "\n".join(lines)
+
+
+async def fetch_hl_leaderboard() -> list:
+    """
+    Fetch top traders from Hyperliquid leaderboard API.
+    Returns list of trader dicts with address, performance stats.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            # Hyperliquid leaderboard API — fetch by PnL window
+            resp = await client.post(
+                "https://api.hyperliquid.xyz/info",
+                json={"type": "leaderboard", "window": "30d"},
+            )
+            if resp.status_code != 200:
+                log.warning("Leaderboard API error: %d", resp.status_code)
+                return []
+            data = resp.json()
+            # The leaderboard returns a list of entries
+            entries = data if isinstance(data, list) else data.get("leaderboardRows", [])
+            return entries[:50]  # Top 50
+    except Exception as exc:
+        log.error("Leaderboard fetch error: %s", exc)
+        return []
+
+
+async def analyse_trader(address: str) -> dict:
+    """Analyse a trader's recent trades — entry timing, hold duration, sessions, win/loss ratio."""
+    try:
+        loop = asyncio.get_event_loop()
+
+        # Fetch trader's recent fills
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(
+                "https://api.hyperliquid.xyz/info",
+                json={"type": "userFills", "user": address},
+            )
+            if resp.status_code != 200:
+                return {}
+            fills = resp.json()
+
+        if not fills or not isinstance(fills, list):
+            return {}
+
+        # Take last 20 trades (fills)
+        recent = fills[-20:] if len(fills) > 20 else fills
+
+        wins = 0
+        losses = 0
+        total_win_size = 0.0
+        total_loss_size = 0.0
+        hold_durations = []
+        sessions = {"london": 0, "ny": 0, "asia": 0, "off": 0}
+        long_count = 0
+        short_count = 0
+
+        for fill in recent:
+            pnl = float(fill.get("closedPnl", 0))
+            side = fill.get("side", "")
+            ts = fill.get("time", 0)
+
+            if isinstance(ts, str):
+                try:
+                    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                except Exception:
+                    dt = datetime.now(timezone.utc)
+            else:
+                dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc) if ts > 1e12 else datetime.fromtimestamp(ts, tz=timezone.utc)
+
+            hour = dt.hour
+
+            if side.lower() in ("b", "buy", "long"):
+                long_count += 1
+            else:
+                short_count += 1
+
+            if pnl > 0:
+                wins += 1
+                total_win_size += pnl
+            elif pnl < 0:
+                losses += 1
+                total_loss_size += abs(pnl)
+
+            # Session classification
+            if 7 <= hour < 11:
+                sessions["london"] += 1
+            elif 13 <= hour < 17:
+                sessions["ny"] += 1
+            elif 0 <= hour < 7:
+                sessions["asia"] += 1
+            else:
+                sessions["off"] += 1
+
+        total = wins + losses
+        if total == 0:
+            return {}
+
+        avg_win = total_win_size / wins if wins > 0 else 0
+        avg_loss = total_loss_size / losses if losses > 0 else 1
+        win_loss_ratio = avg_win / avg_loss if avg_loss > 0 else 0
+
+        best_session = max(sessions, key=sessions.get)
+        direction_bias = "LONG" if long_count > short_count * 1.5 else "SHORT" if short_count > long_count * 1.5 else "NEUTRAL"
+
+        return {
+            "wins": wins,
+            "losses": losses,
+            "win_rate": wins / total * 100,
+            "avg_win_loss_ratio": round(win_loss_ratio, 2),
+            "best_session": best_session,
+            "direction_bias": direction_bias,
+            "total_trades": total,
+            "sessions": sessions,
+        }
+    except Exception as exc:
+        log.debug("Trader analysis error for %s: %s", address[:10], exc)
+        return {}
+
+
+async def run_intelligence_scan():
+    """
+    Full intelligence scan: fetch leaderboard, filter, analyse, build report.
+    Stores result at /data/hl_intelligence.json and updates cache.
+    """
+    log.info("Starting Hyperliquid top trader intelligence scan...")
+
+    leaderboard = await fetch_hl_leaderboard()
+    if not leaderboard:
+        log.warning("Intelligence scan: no leaderboard data.")
+        return
+
+    # Filter: min 50 trades and win rate > 60%
+    qualifying = []
+    for entry in leaderboard:
+        # Leaderboard format varies — handle both nested and flat
+        if isinstance(entry, dict):
+            address = entry.get("ethAddress", entry.get("user", entry.get("address", "")))
+            total_trades = int(entry.get("numTrades", entry.get("totalTrades", 0)))
+            wr = float(entry.get("winRate", entry.get("win_rate", 0)))
+
+            # winRate might be 0-1 or 0-100
+            if 0 < wr <= 1:
+                wr *= 100
+
+            if total_trades >= 50 and wr > 60 and address:
+                qualifying.append({
+                    "address": address,
+                    "total_trades": total_trades,
+                    "win_rate": wr,
+                    "pnl": float(entry.get("pnl", entry.get("totalPnl", 0))),
+                })
+
+    log.info("Intelligence scan: %d/%d traders qualify (50+ trades, >60%% WR)", len(qualifying), len(leaderboard))
+
+    if not qualifying:
+        # Still store empty report
+        report = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "traders": [],
+            "patterns": {},
+            "total_scanned": len(leaderboard),
+            "total_qualifying": 0,
+        }
+        _write_intelligence(report)
+        _intelligence_cache["report"] = report
+        _intelligence_cache["fetched_at"] = time.time()
+        return
+
+    # Analyse top qualifying traders (max 15 to avoid rate limits)
+    trader_analyses = []
+    for i, trader in enumerate(qualifying[:15]):
+        analysis = await analyse_trader(trader["address"])
+        if analysis:
+            trader_analyses.append({
+                "rank": i + 1,
+                "address": trader["address"][:10] + "...",
+                "win_rate": trader["win_rate"],
+                "total_trades": trader["total_trades"],
+                "pnl": trader["pnl"],
+                **analysis,
+            })
+        # Rate limit courtesy
+        await asyncio.sleep(0.5)
+
+    # Aggregate patterns
+    if trader_analyses:
+        all_wr = [t["win_rate"] for t in trader_analyses]
+        all_wlr = [t.get("avg_win_loss_ratio", 0) for t in trader_analyses if t.get("avg_win_loss_ratio", 0) > 0]
+        direction_counts = {"LONG": 0, "SHORT": 0, "NEUTRAL": 0}
+        session_totals = {"london": 0, "ny": 0, "asia": 0, "off": 0}
+
+        for t in trader_analyses:
+            direction_counts[t.get("direction_bias", "NEUTRAL")] += 1
+            for s, c in t.get("sessions", {}).items():
+                session_totals[s] = session_totals.get(s, 0) + c
+
+        dominant = max(direction_counts, key=direction_counts.get)
+        best_sessions = sorted(session_totals, key=session_totals.get, reverse=True)[:2]
+
+        # Build key insight using Claude
+        insight = ""
+        if CLAUDE_API_KEY:
+            try:
+                summary_data = json.dumps({
+                    "num_traders": len(trader_analyses),
+                    "avg_win_rate": sum(all_wr) / len(all_wr),
+                    "dominant_direction": dominant,
+                    "best_sessions": best_sessions,
+                    "avg_wl_ratio": sum(all_wlr) / len(all_wlr) if all_wlr else 0,
+                }, indent=2)
+                async with httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.post(
+                        "https://api.anthropic.com/v1/messages",
+                        headers={
+                            "x-api-key": CLAUDE_API_KEY,
+                            "anthropic-version": "2023-06-01",
+                            "content-type": "application/json",
+                        },
+                        json={
+                            "model": "claude-haiku-4-5-20251001",
+                            "max_tokens": 200,
+                            "messages": [{"role": "user", "content": (
+                                f"You are a crypto trading analyst. Based on this data from the top "
+                                f"Hyperliquid traders in the last 30 days, give ONE key actionable insight "
+                                f"for a BTC perp scalper in under 50 words:\n{summary_data}"
+                            )}],
+                        },
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        texts = [b["text"] for b in data.get("content", []) if b.get("type") == "text"]
+                        insight = " ".join(texts).strip()
+            except Exception as exc:
+                log.debug("Intelligence insight generation error: %s", exc)
+
+        patterns = {
+            "dominant_direction": dominant,
+            "avg_win_rate": sum(all_wr) / len(all_wr) if all_wr else 0,
+            "avg_win_loss_ratio": sum(all_wlr) / len(all_wlr) if all_wlr else 0,
+            "best_sessions": best_sessions,
+            "key_insight": insight,
+        }
+    else:
+        patterns = {}
+
+    report = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "traders": trader_analyses,
+        "patterns": patterns,
+        "total_scanned": len(leaderboard),
+        "total_qualifying": len(qualifying),
+    }
+
+    _write_intelligence(report)
+    _intelligence_cache["report"] = report
+    _intelligence_cache["fetched_at"] = time.time()
+    log.info("Intelligence scan complete: %d traders analysed, stored at %s", len(trader_analyses), INTELLIGENCE_FILE)
+
+
+async def intelligence_loop():
+    """Run top trader intelligence scan every 6 hours."""
+    # Initial scan after 60s warmup
+    await asyncio.sleep(60)
+    while True:
+        try:
+            await run_intelligence_scan()
+        except Exception as exc:
+            log.error("Intelligence loop error: %s", exc)
+        await asyncio.sleep(6 * 3600)  # 6 hours
+
+
+# ---------------------------------------------------------------------------
+# Orphaned Position Recovery
+# ---------------------------------------------------------------------------
+
+async def recover_orphaned_positions():
+    """
+    On startup, fetch all open positions from Hyperliquid.
+    If any exist, load them back into memory with reconstructed SL/TP from ATR.
+    Assign to tv_webhook strategy slot (or first available).
+    """
+    if not hl_info:
+        log.warning("Cannot recover positions — exchange not initialized.")
+        return
+
+    try:
+        loop = asyncio.get_event_loop()
+        user_state = await loop.run_in_executor(None, lambda: hl_info.user_state(HL_WALLET_ADDRESS))
+        positions = user_state.get("assetPositions", [])
+
+        btc_positions = []
+        for p in positions:
+            pos = p.get("position", {})
+            coin = pos.get("coin", "")
+            szi = float(pos.get("szi", 0))
+            if coin == "BTC" and szi != 0:
+                btc_positions.append(pos)
+
+        if not btc_positions:
+            log.info("No orphaned positions found on Hyperliquid.")
+            return
+
+        # Fetch 5m ATR for SL/TP reconstruction
+        df_5m = await fetch_ohlcv("5m", 30)
+        atr_val = 0.0
+        if not df_5m.empty and len(df_5m) >= 14:
+            atr_s = calc_atr(df_5m, 14)
+            atr_val = float(atr_s.iloc[-1]) if not atr_s.empty and not np.isnan(atr_s.iloc[-1]) else 0.0
+
+        recovered = []
+        for pos_data in btc_positions:
+            szi = float(pos_data.get("szi", 0))
+            entry_px = float(pos_data.get("entryPx", 0))
+            side = "long" if szi > 0 else "short"
+            size = abs(szi)
+
+            # Reconstruct SL/TP from ATR at entry
+            margin = ACCOUNT_CAPITAL
+            risk_dollars = margin * RISK_PCT
+            sl_distance = risk_dollars / size if size > 0 else 0
+            tp_dollars = margin * TP_PCT
+            tp_distance = tp_dollars / size if size > 0 else 0
+
+            if side == "long":
+                sl = round(entry_px - sl_distance, 2)
+                tp = round(entry_px + tp_distance, 2)
+            else:
+                sl = round(entry_px + sl_distance, 2)
+                tp = round(entry_px - tp_distance, 2)
+
+            # Assign to first available strategy slot
+            assigned_strategy = None
+            for name in STRATEGY_NAMES:
+                if state.strategies[name]["position"] is None:
+                    assigned_strategy = name
+                    break
+
+            if not assigned_strategy:
+                log.warning("No free strategy slot for orphaned position: %s %.6f BTC @ %.2f", side, size, entry_px)
+                continue
+
+            state.strategies[assigned_strategy]["position"] = {
+                "side": side,
+                "entry": entry_px,
+                "sl": sl,
+                "tp": tp,
+                "size": size,
+                "margin": margin,
+                "open_time": datetime.now(timezone.utc).isoformat(),
+                "be_moved": False,
+                "partial_closed": False,
+                "regime": state.regime.value,
+                "bias": f"{state.htf_bias} ({state.htf_bias_strength})",
+            }
+            recovered.append(f"  • {assigned_strategy}: {side.upper()} {size:.6f} BTC @ ${entry_px:,.2f} (SL ${sl:,.2f} / TP ${tp:,.2f})")
+            log.info("Recovered orphaned position into %s: %s %.6f @ %.2f", assigned_strategy, side, size, entry_px)
+
+        if recovered:
+            msg = (
+                f"🔄 <b>ORPHANED POSITION RECOVERY</b>\n\n"
+                f"Found {len(recovered)} open position(s) on Hyperliquid at startup:\n"
+                + "\n".join(recovered) +
+                f"\n\nSL/TP reconstructed from current risk params.\n"
+                f"ATR(14, 5m) = {atr_val:.2f}"
+            )
+            await tg_send(msg)
+            log.info("Recovered %d orphaned position(s).", len(recovered))
+
+    except Exception as exc:
+        log.error("Orphaned position recovery failed: %s", exc)
+        await tg_send(f"⚠️ <b>Position recovery failed</b>\nError: {sanitize_html(str(exc))}\nCHECK HYPERLIQUID MANUALLY.")
+
+
+# ---------------------------------------------------------------------------
 # Startup / Shutdown
 # ---------------------------------------------------------------------------
 
@@ -2213,7 +2728,10 @@ async def startup():
     state.last_1m_candle_ts = int(now_ts // 60) * 60
     state.last_5m_candle_ts = int(now_ts // 300) * 300
 
-    await init_exchange()
+    init_exchange()
+
+    # --- Task 2: Orphaned position recovery ---
+    await recover_orphaned_positions()
 
     startup_msg = (
         f"\U0001f916 <b>Vic is online \u2014 {state.mode.upper()} MODE</b>\n"
@@ -2234,6 +2752,7 @@ async def startup():
     asyncio.create_task(daily_reset_scheduler())
     asyncio.create_task(periodic_status_log())
     asyncio.create_task(telegram_polling_watchdog())
+    asyncio.create_task(intelligence_loop())
 
     log.info("All background tasks started.")
 
@@ -2241,7 +2760,7 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     log.info("Vic shutting down.")
-    await close_exchange()
+    close_exchange()
 
 
 # ---------------------------------------------------------------------------
@@ -2315,9 +2834,43 @@ async def full_status():
     }
 
 
+# =========================================================================
+# TRADINGVIEW WEBHOOK — MCP AUTO-CONFIGURATION REFERENCE
+# =========================================================================
+# Endpoint: POST /webhook/tradingview?token=<WEBHOOK_SECRET>
+#
+# Authentication:
+#   Query parameter "token" must match the WEBHOOK_SECRET env var.
+#   Example: POST https://<RAILWAY_URL>/webhook/tradingview?token=abc123
+#
+# Payload format (JSON body):
+#   {
+#     "action": "long" | "short",     — REQUIRED: trade direction
+#     "price": 84500.00,              — OPTIONAL: entry price (fetched if 0 or missing)
+#     "strategy": "my_indicator"      — OPTIONAL: label for logging (default: tv_indicator)
+#   }
+#
+# TradingView Alert Message (paste into alert body):
+#   {"action": "{{strategy.order.action}}", "price": {{close}}, "strategy": "{{strategy.order.id}}"}
+#
+# TradingView Webhook URL:
+#   https://<RAILWAY_URL>/webhook/tradingview?token=<WEBHOOK_SECRET>
+#
+# Response codes:
+#   200 — Signal processed (check "status" field: ok, blocked, skipped, ai_blocked)
+#   400 — Invalid JSON or action not long/short
+#   403 — Invalid token
+#
+# Processing pipeline:
+#   1. Token validation
+#   2. Pre-trade checklist (session, regime, bias, trade cap, correlation, loss cap, pause)
+#   3. Signal confirmation (needs 2 of: RSI agreement, structure alignment, near VWAP)
+#   4. AI Market Brain gate (Claude evaluates macro + context)
+#   5. Trade execution
+# =========================================================================
 @app.post("/webhook/tradingview")
 async def tradingview_webhook(request: Request, token: str = Query("")):
-    """Receive TradingView webhook alerts for Strategy 1 (Change 8)."""
+    """Receive TradingView webhook alerts for Strategy 1."""
     if token != WEBHOOK_SECRET:
         return JSONResponse(status_code=403, content={"error": "Invalid token"})
 
@@ -2383,8 +2936,8 @@ async def go_live(token: str = Query("")):
         return {"status": "already live"}
 
     state.mode = "live"
-    await close_exchange()
-    await init_exchange()
+    close_exchange()
+    init_exchange()
 
     await tg_send("\U0001f534 <b>LIVE TRADING ENABLED</b> \u2014 Vic is now trading with real funds.")
     log.warning("Switched to LIVE trading mode.")
