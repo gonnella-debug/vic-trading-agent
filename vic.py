@@ -309,6 +309,9 @@ def close_exchange():
 
 async def fetch_ohlcv(timeframe: str = "1m", limit: int = 100) -> pd.DataFrame:
     """Fetch OHLCV candles from Hyperliquid native SDK and return a DataFrame."""
+    if not hl_info:
+        log.warning("fetch_ohlcv called before exchange init.")
+        return pd.DataFrame()
     try:
         now_ms = int(time.time() * 1000)
         # Calculate start time from limit and timeframe
@@ -347,6 +350,8 @@ async def fetch_ohlcv(timeframe: str = "1m", limit: int = 100) -> pd.DataFrame:
 
 async def get_btc_price() -> float:
     """Get the current BTC mid price from Hyperliquid."""
+    if not hl_info:
+        return state.last_btc_price or 0.0
     try:
         loop = asyncio.get_event_loop()
         all_mids = await loop.run_in_executor(None, hl_info.all_mids)
@@ -858,6 +863,10 @@ async def execute_trade(strategy: str, side: str, entry: float, atr_value: float
 
     # Open order
     if state.mode == "live":
+        if not hl_exchange:
+            log.error("%s — exchange not initialized, cannot place order.", strategy)
+            await tg_send(f"⚠️ <b>{strategy}</b> order FAILED: Exchange not initialized")
+            return
         try:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
@@ -961,6 +970,10 @@ async def close_position(strategy: str, exit_price: float, reason: str):
 
     # Close on exchange if live — ABORT if order fails
     if state.mode == "live":
+        if not hl_exchange:
+            log.error("%s — exchange not initialized, cannot close.", strategy)
+            await tg_send(f"🚨 <b>{strategy}</b> close FAILED: Exchange not initialized. CHECK MANUALLY.")
+            return
         try:
             loop = asyncio.get_event_loop()
             close_size = pos["size"]
@@ -2360,8 +2373,6 @@ async def fetch_hl_leaderboard() -> list:
 async def analyse_trader(address: str) -> dict:
     """Analyse a trader's recent trades — entry timing, hold duration, sessions, win/loss ratio."""
     try:
-        loop = asyncio.get_event_loop()
-
         # Fetch trader's recent fills
         async with httpx.AsyncClient(timeout=20) as client:
             resp = await client.post(
