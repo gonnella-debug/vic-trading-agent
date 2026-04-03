@@ -2348,23 +2348,40 @@ def _get_intelligence_summary() -> str:
 
 async def fetch_hl_leaderboard() -> list:
     """
-    Fetch top traders from Hyperliquid leaderboard API.
-    Returns list of trader dicts with address, performance stats.
+    Fetch top traders from the Hyperliquid stats leaderboard.
+    Returns list of trader dicts with address, PnL, ROI.
+    Win rate and trade count are computed separately via userFills.
     """
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            # Hyperliquid leaderboard API — fetch by PnL window
-            resp = await client.post(
-                "https://api.hyperliquid.xyz/info",
-                json={"type": "leaderboard", "window": "30d"},
-            )
+            resp = await client.get("https://stats-data.hyperliquid.xyz/Mainnet/leaderboard")
             if resp.status_code != 200:
                 log.warning("Leaderboard API error: %d", resp.status_code)
                 return []
             data = resp.json()
-            # The leaderboard returns a list of entries
-            entries = data if isinstance(data, list) else data.get("leaderboardRows", [])
-            return entries[:50]  # Top 50
+            rows = data.get("leaderboardRows", [])
+            # Extract top 50 by monthly PnL
+            entries = []
+            for row in rows[:50]:
+                address = row.get("ethAddress", "")
+                if not address:
+                    continue
+                # Find monthly performance
+                monthly_pnl = 0.0
+                monthly_roi = 0.0
+                for window_name, perf in row.get("windowPerformances", []):
+                    if window_name == "month":
+                        monthly_pnl = float(perf.get("pnl", 0))
+                        monthly_roi = float(perf.get("roi", 0))
+                        break
+                entries.append({
+                    "ethAddress": address,
+                    "displayName": row.get("displayName", ""),
+                    "accountValue": float(row.get("accountValue", 0)),
+                    "pnl": monthly_pnl,
+                    "roi": monthly_roi,
+                })
+            return entries
     except Exception as exc:
         log.error("Leaderboard fetch error: %s", exc)
         return []
@@ -2473,31 +2490,43 @@ async def run_intelligence_scan():
         log.warning("Intelligence scan: no leaderboard data.")
         return
 
-    # Filter: min 50 trades and win rate > 60%
-    qualifying = []
-    for entry in leaderboard:
-        # Leaderboard format varies — handle both nested and flat
-        if isinstance(entry, dict):
-            address = entry.get("ethAddress", entry.get("user", entry.get("address", "")))
-            total_trades = int(entry.get("numTrades", entry.get("totalTrades", 0)))
-            wr = float(entry.get("winRate", entry.get("win_rate", 0)))
+    # Analyse top leaderboard traders and filter by win rate + trade count
+    # Leaderboard doesn't include WR/trade count, so we compute from fills
+    log.info("Intelligence scan: analysing top %d traders from leaderboard...", min(len(leaderboard), 25))
+    trader_analyses = []
+    rank = 0
+    for entry in leaderboard[:25]:  # Analyse top 25, keep qualifying ones
+        address = entry.get("ethAddress", "")
+        if not address:
+            continue
 
-            # winRate might be 0-1 or 0-100
-            if 0 < wr <= 1:
-                wr *= 100
+        analysis = await analyse_trader(address)
+        if not analysis:
+            await asyncio.sleep(0.3)
+            continue
 
-            if total_trades >= 50 and wr > 60 and address:
-                qualifying.append({
-                    "address": address,
-                    "total_trades": total_trades,
-                    "win_rate": wr,
-                    "pnl": float(entry.get("pnl", entry.get("totalPnl", 0))),
-                })
+        total_trades = analysis.get("total_trades", 0)
+        win_rate = analysis.get("win_rate", 0)
 
-    log.info("Intelligence scan: %d/%d traders qualify (50+ trades, >60%% WR)", len(qualifying), len(leaderboard))
+        # Filter: min 50 trades and >60% WR
+        if total_trades >= 50 and win_rate > 60:
+            rank += 1
+            trader_analyses.append({
+                "rank": rank,
+                "address": address[:10] + "...",
+                "win_rate": win_rate,
+                "total_trades": total_trades,
+                "pnl": entry.get("pnl", 0),
+                **analysis,
+            })
+            if rank >= 15:  # Cap at 15 qualifying traders
+                break
 
-    if not qualifying:
-        # Still store empty report
+        await asyncio.sleep(0.3)  # Rate limit courtesy
+
+    log.info("Intelligence scan: %d traders qualify (50+ trades, >60%% WR)", len(trader_analyses))
+
+    if not trader_analyses:
         report = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "traders": [],
@@ -2509,22 +2538,6 @@ async def run_intelligence_scan():
         _intelligence_cache["report"] = report
         _intelligence_cache["fetched_at"] = time.time()
         return
-
-    # Analyse top qualifying traders (max 15 to avoid rate limits)
-    trader_analyses = []
-    for i, trader in enumerate(qualifying[:15]):
-        analysis = await analyse_trader(trader["address"])
-        if analysis:
-            trader_analyses.append({
-                "rank": i + 1,
-                "address": trader["address"][:10] + "...",
-                "win_rate": trader["win_rate"],
-                "total_trades": trader["total_trades"],
-                "pnl": trader["pnl"],
-                **analysis,
-            })
-        # Rate limit courtesy
-        await asyncio.sleep(0.5)
 
     # Aggregate patterns
     if trader_analyses:
