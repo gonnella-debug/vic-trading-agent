@@ -853,18 +853,18 @@ async def execute_trade(strategy: str, side: str, entry: float, atr_value: float
     sl_distance = risk_dollars / size
 
     if side == "long":
-        sl = round(entry - sl_distance, 2)
+        sl = round(entry - sl_distance)  # Whole dollar — Hyperliquid BTC tick size = 1
     else:
-        sl = round(entry + sl_distance, 2)
+        sl = round(entry + sl_distance)
 
     # TP: 30% of margin profit
     tp_dollars = margin * TP_PCT
     tp_distance = tp_dollars / size
 
     if side == "long":
-        tp = round(entry + tp_distance, 2)
+        tp = round(entry + tp_distance)  # Whole dollar — Hyperliquid BTC tick size = 1
     else:
-        tp = round(entry - tp_distance, 2)
+        tp = round(entry - tp_distance)
 
     # Open order
     if state.mode == "live":
@@ -894,16 +894,32 @@ async def execute_trade(strategy: str, side: str, entry: float, atr_value: float
             log.info("%s LIVE order placed: %s", strategy, result)
 
             # Place exchange-level SL and TP as trigger orders (safety net if Vic goes down)
+            sl_ok = False
+            tp_ok = False
             try:
                 sl_side = not is_buy  # SL closes position: sell if long, buy if short
-                sl_result = await loop.run_in_executor(
-                    None, lambda: hl_exchange.order(
-                        "BTC", is_buy=sl_side, sz=size, limit_px=sl,
-                        order_type={"trigger": {"triggerPx": sl, "isMarket": True, "tpsl": "sl"}},
-                        reduce_only=True,
+
+                # Retry SL up to 3 times — this is the most critical order
+                for sl_attempt in range(3):
+                    sl_result = await loop.run_in_executor(
+                        None, lambda: hl_exchange.order(
+                            "BTC", is_buy=sl_side, sz=size, limit_px=sl,
+                            order_type={"trigger": {"triggerPx": sl, "isMarket": True, "tpsl": "sl"}},
+                            reduce_only=True,
+                        )
                     )
-                )
-                log.info("%s SL order placed on exchange @ $%.2f: %s", strategy, sl, sl_result)
+                    # Check inner statuses — HL returns status:ok even when orders fail
+                    sl_statuses = sl_result.get("response", {}).get("data", {}).get("statuses", [])
+                    sl_errors = [s.get("error") for s in sl_statuses if "error" in s]
+                    if sl_errors:
+                        log.error("%s SL order REJECTED (attempt %d/3) @ $%.0f: %s", strategy, sl_attempt + 1, sl, sl_errors)
+                        if sl_attempt < 2:
+                            await asyncio.sleep(1)
+                            continue
+                    else:
+                        sl_ok = True
+                        log.info("%s SL order CONFIRMED on exchange @ $%.0f: %s", strategy, sl, sl_result)
+                        break
 
                 tp_result = await loop.run_in_executor(
                     None, lambda: hl_exchange.order(
@@ -912,13 +928,30 @@ async def execute_trade(strategy: str, side: str, entry: float, atr_value: float
                         reduce_only=True,
                     )
                 )
-                log.info("%s TP order placed on exchange @ $%.2f: %s", strategy, tp, tp_result)
+                tp_statuses = tp_result.get("response", {}).get("data", {}).get("statuses", [])
+                tp_errors = [s.get("error") for s in tp_statuses if "error" in s]
+                if tp_errors:
+                    log.error("%s TP order REJECTED @ $%.0f: %s", strategy, tp, tp_errors)
+                else:
+                    tp_ok = True
+                    log.info("%s TP order CONFIRMED on exchange @ $%.0f: %s", strategy, tp, tp_result)
             except Exception as sl_exc:
-                log.error("%s — SL/TP order error (position still open): %s", strategy, sl_exc)
+                log.error("%s — SL/TP order exception (position still open): %s", strategy, sl_exc)
+
+            # CRITICAL: If SL failed to place, alert immediately — position has NO stop loss
+            if not sl_ok:
                 await tg_send(
-                    f"⚠️ <b>{strategy}</b> SL/TP orders FAILED to place on exchange.\n"
-                    f"Error: {sanitize_html(str(sl_exc))}\n"
-                    f"Software monitoring still active, but SET SL/TP MANUALLY as backup."
+                    f"🚨🚨 <b>CRITICAL: {strategy} — NO STOP LOSS ON EXCHANGE</b> 🚨🚨\n"
+                    f"SL order FAILED after 3 attempts.\n"
+                    f"Position: {side.upper()} {size} BTC @ ${entry:,.0f}\n"
+                    f"Intended SL: ${sl:,.0f}\n"
+                    f"<b>SET STOP LOSS MANUALLY NOW</b>\n"
+                    f"Software SL monitoring is active as backup."
+                )
+            if not tp_ok:
+                await tg_send(
+                    f"⚠️ <b>{strategy}</b> TP order failed to place on exchange @ ${tp:,.0f}.\n"
+                    f"Software TP monitoring is active as backup."
                 )
 
         except Exception as exc:
@@ -2797,11 +2830,11 @@ async def recover_orphaned_positions():
             tp_distance = tp_dollars / size if size > 0 else 0
 
             if side == "long":
-                sl = round(entry_px - sl_distance, 2)
-                tp = round(entry_px + tp_distance, 2)
+                sl = round(entry_px - sl_distance)  # Whole dollar — HL BTC tick = 1
+                tp = round(entry_px + tp_distance)
             else:
-                sl = round(entry_px + sl_distance, 2)
-                tp = round(entry_px - tp_distance, 2)
+                sl = round(entry_px + sl_distance)
+                tp = round(entry_px - tp_distance)
 
             # Assign to first available strategy slot
             assigned_strategy = None
