@@ -2989,3 +2989,68 @@ async def get_journal():
     """Return the trade journal."""
     journal = _read_journal()
     return {"trades": journal, "count": len(journal)}
+
+
+@app.post("/test_trade")
+async def test_trade():
+    """Place a minimal $5 test SHORT on BTC to verify exchange access, then close it."""
+    if not hl_exchange:
+        return {"error": "Exchange not initialized"}
+
+    try:
+        # Get current price
+        price = await get_btc_price()
+        if price <= 0:
+            return {"error": "Could not fetch BTC price"}
+
+        # Calculate size for ~$5 notional, floor to 5 dp
+        size = math.floor(5.0 / price * 100000) / 100000
+        if size <= 0:
+            size = 0.00001  # absolute minimum
+
+        loop = asyncio.get_event_loop()
+
+        # Set leverage
+        await loop.run_in_executor(
+            None, lambda: hl_exchange.update_leverage(LEVERAGE, "BTC", is_cross=True)
+        )
+
+        # Open SHORT
+        open_result = await loop.run_in_executor(
+            None, lambda: hl_exchange.market_open("BTC", is_buy=False, sz=size)
+        )
+
+        # Check for errors
+        if open_result.get("status") != "ok":
+            return {"error": f"Open rejected: {open_result}"}
+        statuses = open_result.get("response", {}).get("data", {}).get("statuses", [])
+        for s in statuses:
+            if "error" in s:
+                return {"error": f"Open error: {s['error']}", "raw": open_result}
+
+        await tg_send(
+            f"🧪 <b>TEST TRADE</b> — SHORT {size} BTC @ ${price:,.2f}\n"
+            f"Notional ~${size * price:.2f} | Verifying exchange access..."
+        )
+
+        # Wait 2 seconds then close
+        await asyncio.sleep(2)
+
+        close_result = await loop.run_in_executor(
+            None, lambda: hl_exchange.market_close("BTC", sz=size)
+        )
+        if close_result.get("status") != "ok":
+            await tg_send(f"🚨 <b>TEST TRADE close FAILED</b>: {close_result}\nCHECK HYPERLIQUID.")
+            return {"error": f"Close rejected: {close_result}", "open": open_result}
+        close_statuses = close_result.get("response", {}).get("data", {}).get("statuses", [])
+        for s in close_statuses:
+            if "error" in s:
+                await tg_send(f"🚨 <b>TEST TRADE close FAILED</b>: {s['error']}\nCHECK HYPERLIQUID.")
+                return {"error": f"Close error: {s['error']}", "open": open_result}
+
+        await tg_send(f"✅ <b>TEST TRADE closed</b> — Exchange access CONFIRMED.")
+        return {"status": "ok", "open": open_result, "close": close_result, "size": size, "price": price}
+
+    except Exception as exc:
+        await tg_send(f"🚨 <b>TEST TRADE FAILED</b>: {sanitize_html(str(exc))}")
+        return {"error": str(exc)}
