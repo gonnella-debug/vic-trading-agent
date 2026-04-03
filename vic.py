@@ -1,8 +1,7 @@
 """
 Vic — BTC/USDT Perpetual Futures Scalping Agent (v2)
 Runs 4 strategies simultaneously on Hyperliquid via ccxt.
-$500 account: $100 per strategy, $100 buffer.
-Paper trading mode by default. Production-ready for Railway.
+$500 account, full capital available per trade. Production-ready for Railway.
 
 Strategies:
   1. TradingView Webhook (filtered with regime + bias + 2 confirmations)
@@ -12,7 +11,7 @@ Strategies:
 
 Regime filter: TRENDING / RANGING / TRANSITIONAL / VOLATILE
 1H bias: Strong bullish/bearish or neutral
-Risk: $20 per trade, 1:3 R:R, max 4 trades/day, -3R daily cap
+Risk: 10% of margin, partial close at 20%, full TP at 30%, max 4 trades/day
 Session filter: London open (07-11 UTC) + NY open (13-17 UTC)
 AI Market Brain: Claude pre-trade analysis gate
 Trade Journal: /data/vic_journal.json (persistent)
@@ -68,14 +67,14 @@ CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
 # ---------------------------------------------------------------------------
 SYMBOL = "BTC/USDC:USDC"
 LEVERAGE = 5
-RISK_PER_TRADE = 20.0         # stop-loss dollar risk ($1R)
-TP_PER_TRADE = 60.0           # take-profit dollar target (1:3 R:R)
-MAX_DAILY_LOSS = 60.0         # -3R total across all strategies
+ACCOUNT_CAPITAL = 500.0       # total wallet balance
+RISK_PCT = 0.10               # 10% of margin = max SL risk
+PARTIAL_PROFIT_PCT = 0.20     # 20% of margin = partial close trigger
+TP_PCT = 0.30                 # 30% of margin = full close trigger
+MAX_DAILY_LOSS_PCT = 0.10     # 10% of account = daily loss cap ($50)
 MAX_TRADES_PER_DAY = 4
 CORRELATION_COOLDOWN_MIN = 15  # minutes cooldown same direction after close
-BREAK_EVEN_R_MULTIPLE = 1.5   # move SL to entry at +1.5R
 BB_SQUEEZE_THRESHOLD = 0.02   # bandwidth threshold for BB squeeze
-MAX_NOTIONAL = 500.0          # max position notional per strategy ($100 margin × 5x)
 
 # ATR multipliers for SL distance per strategy
 STRATEGY_ATR_SL = {
@@ -114,9 +113,7 @@ TRADING_SESSIONS = [
 ]
 
 # Partial profit settings
-PARTIAL_PROFIT_ENABLED = True
-PARTIAL_R = 2.0               # take partial at 2R
-PARTIAL_CLOSE_PCT = 0.5       # close 50% of position
+PARTIAL_CLOSE_PCT = 0.5       # close 50% of position at PARTIAL_PROFIT_PCT
 
 # Trade journal
 JOURNAL_FILE = os.getenv("JOURNAL_FILE", "/data/vic_journal.json")
@@ -746,7 +743,7 @@ def can_execute_trade(strategy: str, side: str) -> tuple[bool, str]:
         state.last_block_reasons.append(reason)
         if len(state.last_block_reasons) > 20:
             state.last_block_reasons.pop(0)
-        return False, "Daily loss cap hit (-$60)"
+        return False, f"Daily loss cap hit (-${ACCOUNT_CAPITAL * MAX_DAILY_LOSS_PCT:.0f})"
 
     # 6. Strategy not paused?
     strat = state.strategies[strategy]
@@ -783,13 +780,12 @@ def can_execute_trade(strategy: str, side: str) -> tuple[bool, str]:
 # Position sizing & order execution
 # ---------------------------------------------------------------------------
 
-def calc_position_size(entry: float, sl: float) -> float:
-    """Calculate BTC position size so that $RISK_PER_TRADE is risked."""
-    distance = abs(entry - sl)
-    if distance == 0:
+def calc_position_size(entry: float, margin: float) -> float:
+    """Calculate BTC position size from margin and leverage."""
+    if entry <= 0:
         return 0.0
-    size_btc = RISK_PER_TRADE / distance
-    return round(size_btc, 6)
+    notional = margin * LEVERAGE
+    return round(notional / entry, 6)
 
 
 async def execute_trade(strategy: str, side: str, entry: float, atr_value: float = 0.0):
@@ -799,36 +795,32 @@ async def execute_trade(strategy: str, side: str, entry: float, atr_value: float
         strategy: strategy name
         side: 'long' or 'short'
         entry: entry price
-        atr_value: ATR value for SL computation (fetched by calling strategy)
+        atr_value: ATR value (kept for signal detection, not used for sizing)
     """
     allowed, reason = can_execute_trade(strategy, side)
     if not allowed:
         log.info("%s — trade blocked: %s", strategy, reason)
         return
 
-    # ATR-based SL distance
-    atr_mult = STRATEGY_ATR_SL.get(strategy, 1.5)
-    sl_distance = atr_value * atr_mult if atr_value > 0 else entry * 0.003  # fallback 0.3%
+    # Use full account capital as margin
+    margin = ACCOUNT_CAPITAL
+    size = calc_position_size(entry, margin)
+    if size <= 0:
+        log.warning("%s — invalid size, skipping.", strategy)
+        return
+
+    # SL: 10% of margin risk
+    risk_dollars = margin * RISK_PCT
+    sl_distance = risk_dollars / size
 
     if side == "long":
         sl = round(entry - sl_distance, 2)
     else:
         sl = round(entry + sl_distance, 2)
 
-    # Risk-based position size: $20 risk / SL distance
-    size = calc_position_size(entry, sl)
-    if size <= 0:
-        log.warning("%s — invalid size, skipping.", strategy)
-        return
-
-    # Max notional cap
-    notional = size * entry
-    if notional > MAX_NOTIONAL:
-        size = round(MAX_NOTIONAL / entry, 6)
-        log.info("%s — capped size to %.6f BTC (max notional $%.0f)", strategy, size, MAX_NOTIONAL)
-
-    # TP distance: guarantees $60 at TP
-    tp_distance = TP_PER_TRADE / size
+    # TP: 30% of margin profit
+    tp_dollars = margin * TP_PCT
+    tp_distance = tp_dollars / size
 
     if side == "long":
         tp = round(entry + tp_distance, 2)
@@ -861,6 +853,7 @@ async def execute_trade(strategy: str, side: str, entry: float, atr_value: float
         "sl": sl,
         "tp": tp,
         "size": size,
+        "margin": margin,
         "open_time": datetime.now(timezone.utc).isoformat(),
         "be_moved": False,  # break-even not yet moved
         "partial_closed": False,  # partial profit not yet taken
@@ -871,11 +864,13 @@ async def execute_trade(strategy: str, side: str, entry: float, atr_value: float
     state.trades_today += 1
     state.total_trade_count += 1
 
+    notional = size * entry
     label = STRATEGY_LABELS.get(strategy, strategy)
     arrow = "\U0001f7e2" if side == "long" else "\U0001f534"
     msg = (
         f"{arrow} <b>{side.upper()}</b> — {label}\n"
         f"Entry ${entry:,.2f} | SL ${sl:,.2f} | TP ${tp:,.2f}\n"
+        f"Margin ${margin:,.0f} | Notional ${notional:,.0f} | Risk ${margin * RISK_PCT:,.0f}\n"
         f"Regime: {state.regime.value} | Bias: {state.htf_bias} ({state.htf_bias_strength})\n"
         f"Trades today: {state.trades_today}/{MAX_TRADES_PER_DAY}"
     )
@@ -923,8 +918,10 @@ async def close_position(strategy: str, exit_price: float, reason: str):
 
     pnl = round(pnl, 2)
 
-    # Calculate actual R achieved
-    r_achieved = pnl / RISK_PER_TRADE if RISK_PER_TRADE > 0 else 0.0
+    # Calculate actual return on margin
+    margin = pos.get("margin", ACCOUNT_CAPITAL)
+    risk_dollars = margin * RISK_PCT
+    r_achieved = pnl / risk_dollars if risk_dollars > 0 else 0.0
 
     # Calculate hold time
     open_time = datetime.fromisoformat(pos["open_time"])
@@ -1031,8 +1028,9 @@ async def close_position(strategy: str, exit_price: float, reason: str):
 
     strat["position"] = None
 
-    # Check daily loss cap
-    if state.daily_pnl <= -MAX_DAILY_LOSS:
+    # Check daily loss cap (10% of account)
+    max_daily_loss = ACCOUNT_CAPITAL * MAX_DAILY_LOSS_PCT
+    if state.daily_pnl <= -max_daily_loss:
         state.daily_loss_cap_hit = True
         alert = (
             f"\U0001f6d1 <b>Daily loss limit hit (${state.daily_pnl:+,.2f})</b>\n"
@@ -1450,8 +1448,9 @@ async def position_monitor_loop():
                     await close_position(name, price, "Take Profit")
                     continue
 
-                # 3. Break-even move: at +1.5R, move SL to entry
-                be_threshold = RISK_PER_TRADE * BREAK_EVEN_R_MULTIPLE  # $30
+                # 3. Break-even move: at +10% of margin (same as risk), move SL to entry
+                margin = pos.get("margin", ACCOUNT_CAPITAL)
+                be_threshold = margin * RISK_PCT
                 if not pos["be_moved"] and unrealized_pnl >= be_threshold:
                     pos["sl"] = entry
                     pos["be_moved"] = True
@@ -1459,9 +1458,9 @@ async def position_monitor_loop():
                     await tg_send(msg)
                     log.info(msg.replace("<b>", "").replace("</b>", ""))
 
-                # 4. Partial profit at 2R
-                if PARTIAL_PROFIT_ENABLED and not pos.get("partial_closed", False):
-                    partial_threshold = PARTIAL_R * RISK_PER_TRADE  # $40
+                # 4. Partial profit at 20% of margin
+                if not pos.get("partial_closed", False):
+                    partial_threshold = margin * PARTIAL_PROFIT_PCT
                     if unrealized_pnl >= partial_threshold:
                         old_size = pos["size"]
                         new_size = round(old_size * (1 - PARTIAL_CLOSE_PCT), 6)
@@ -1488,7 +1487,7 @@ async def position_monitor_loop():
                         pos["partial_closed"] = True
                         partial_pnl = round(unrealized_pnl * PARTIAL_CLOSE_PCT, 2)
                         msg = (
-                            f"✂️ <b>{name}</b> — Partial close at +{PARTIAL_R:.0f}R\n"
+                            f"✂️ <b>{name}</b> — Partial close at +{PARTIAL_PROFIT_PCT*100:.0f}% margin profit\n"
                             f"Closed {PARTIAL_CLOSE_PCT*100:.0f}% ({old_size:.6f} → {new_size:.6f} BTC)\n"
                             f"Locked ~${partial_pnl:+,.2f}"
                         )
@@ -2109,7 +2108,7 @@ async def ask_claude_market_question(question: str) -> str:
 
     system_prompt = (
         f"You are Vic, an AI crypto trading agent monitoring BTC/USDC perpetual futures on Hyperliquid. "
-        f"You run 4 strategies simultaneously with pure risk-based sizing. $500 account, $100 per strategy, $100 buffer.\n\n"
+        f"You run 4 strategies. $500 account, full capital available per trade, percentage-based risk.\n\n"
         f"=== STRATEGIES ===\n"
         f"1. TradingView Webhook: External alerts filtered by regime + bias + 2 confirmations (RSI/structure/VWAP)\n"
         f"2. RSI Divergence: Price/RSI divergence at support/resistance on 5m (50-candle lookback, 0.25% S/R threshold)\n"
@@ -2136,8 +2135,8 @@ async def ask_claude_market_question(question: str) -> str:
         f"=== PER-STRATEGY METRICS ===\n{metrics_text}\n\n"
         f"=== RECENT TRADES (last 10) ===\n{trades_text}\n\n"
         f"=== RECENT NEWS ===\n{news_text}\n\n"
-        f"$20 risk/trade, TP $60, max 4 trades/day, -$60 daily cap.\n"
-        f"$500 account: $100 per strategy, $100 buffer.\n"
+        f"$500 account, full capital per trade. 10% risk, 20% partial close, 30% full TP.\n"
+        f"Max 4 trades/day, 10% daily loss cap (${ACCOUNT_CAPITAL * MAX_DAILY_LOSS_PCT:.0f}).\n"
         f"Sessions: London 07-11 UTC, NY 13-17 UTC. AI pre-trade analysis enabled.\n\n"
         f"Answer the user's question about the market concisely. "
         f"Be direct, use numbers, and keep it under 300 words.\n\n"
@@ -2218,10 +2217,10 @@ async def startup():
 
     startup_msg = (
         f"\U0001f916 <b>Vic is online \u2014 {state.mode.upper()} MODE</b>\n"
-        f"BTC/USDC perp | {LEVERAGE}x leverage | ATR-based sizing\n\n"
+        f"BTC/USDC perp | {LEVERAGE}x leverage | ${ACCOUNT_CAPITAL:.0f} account\n\n"
         f"1\ufe0f\u20e3 TradingView Webhook | 2\ufe0f\u20e3 RSI Divergence\n"
         f"3\ufe0f\u20e3 BB Squeeze | 4\ufe0f\u20e3 VWAP Bounce\n"
-        f"$100/strategy | $20 risk | 1:3 R:R | Max 4/day | -$60 cap\n\n"
+        f"10% risk | 20% partial | 30% TP | Max 4/day | -${ACCOUNT_CAPITAL * MAX_DAILY_LOSS_PCT:.0f} cap\n\n"
         f"Session: London 07-11 + NY 13-17 UTC\n"
         f"AI Market Brain: enabled"
     )
