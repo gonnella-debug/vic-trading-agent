@@ -203,6 +203,9 @@ class TradingState:
         self.signals_blocked: int = 0
         self.last_block_reasons: list = []  # keep last 20
 
+        # Polling watchdog
+        self.polling_alive: bool = False
+
     def reset_daily(self):
         self.trades_today = 0
         self.daily_pnl = 0.0
@@ -236,7 +239,14 @@ async def tg_send(text: str):
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(url, json=payload)
             if resp.status_code != 200:
-                log.error("Telegram send failed: %s", resp.text)
+                if "can't parse entities" in resp.text:
+                    log.warning("HTML parse failed, retrying as plain text: %s", resp.text)
+                    payload_plain = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+                    resp2 = await client.post(url, json=payload_plain)
+                    if resp2.status_code != 200:
+                        log.error("Telegram plain text send also failed: %s", resp2.text)
+                else:
+                    log.error("Telegram send failed: %s", resp.text)
     except Exception as exc:
         log.error("Telegram error: %s", exc)
 
@@ -251,7 +261,15 @@ async def tg_reply(chat_id: str, text: str):
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(url, json=payload)
             if resp.status_code != 200:
-                log.error("Telegram reply failed: %s", resp.text)
+                # HTML parse error — retry without parse_mode so the message still gets delivered
+                if "can't parse entities" in resp.text:
+                    log.warning("HTML parse failed, retrying as plain text: %s", resp.text)
+                    payload_plain = {"chat_id": chat_id, "text": text}
+                    resp2 = await client.post(url, json=payload_plain)
+                    if resp2.status_code != 200:
+                        log.error("Telegram plain text reply also failed: %s", resp2.text)
+                else:
+                    log.error("Telegram reply failed: %s", resp.text)
     except Exception as exc:
         log.error("Telegram reply error: %s", exc)
 
@@ -1873,11 +1891,16 @@ async def telegram_polling_loop():
     Does NOT conflict with webhook functionality (webhooks use FastAPI routes).
     """
     if not TELEGRAM_BOT_TOKEN:
-        log.warning("TELEGRAM_BOT_TOKEN not set — Telegram polling disabled.")
+        log.error("TELEGRAM_BOT_TOKEN not set — Telegram polling DEAD.")
+        state.polling_alive = False
         return
     if not CLAUDE_API_KEY:
-        log.warning("CLAUDE_API_KEY not set — Telegram chat responses disabled.")
+        log.error("CLAUDE_API_KEY not set — Telegram polling DEAD.")
+        state.polling_alive = False
+        await tg_send("⚠️ <b>Vic polling failed to start</b>\n\nCLAUDE_API_KEY not set. I can't respond to messages.")
         return
+
+    state.polling_alive = True
 
     last_update_id = 0
     log.info("Telegram polling loop started.")
@@ -1984,6 +2007,41 @@ async def telegram_polling_loop():
         except Exception as exc:
             log.error("Telegram polling error: %s", exc)
             await asyncio.sleep(5)
+
+    # If we exit the while True loop somehow, mark as dead
+    state.polling_alive = False
+
+
+async def telegram_polling_watchdog():
+    """Watchdog that monitors the polling loop and restarts it if it dies."""
+    restart_count = 0
+    max_restarts = 5  # prevent infinite restart loop
+
+    while True:
+        task = asyncio.create_task(telegram_polling_loop())
+        try:
+            await task
+        except Exception as exc:
+            log.error("Polling task crashed: %s", exc)
+
+        state.polling_alive = False
+
+        if restart_count >= max_restarts:
+            log.error("Polling loop hit max restarts (%d). Giving up.", max_restarts)
+            await tg_send(
+                "🚨 <b>Vic polling is DEAD</b>\n\n"
+                f"Crashed {max_restarts} times. I cannot respond to messages.\n"
+                "Redeploy me on Railway to fix this."
+            )
+            return
+
+        restart_count += 1
+        log.warning("Polling loop died — restarting (attempt %d/%d)...", restart_count, max_restarts)
+        await tg_send(
+            f"⚠️ <b>Vic polling crashed — restarting</b> (attempt {restart_count}/{max_restarts})\n\n"
+            "If you see this repeatedly, something is broken."
+        )
+        await asyncio.sleep(3)
 
 
 async def ask_claude_market_question(question: str) -> str:
@@ -2179,7 +2237,7 @@ async def startup():
     asyncio.create_task(daily_summary_scheduler())
     asyncio.create_task(daily_reset_scheduler())
     asyncio.create_task(periodic_status_log())
-    asyncio.create_task(telegram_polling_loop())
+    asyncio.create_task(telegram_polling_watchdog())
 
     log.info("All background tasks started.")
 
@@ -2198,7 +2256,8 @@ async def shutdown():
 async def health():
     return {
         "bot": "Vic",
-        "status": "running",
+        "status": "running" if state.polling_alive else "DEGRADED — polling dead",
+        "telegram_polling": "alive" if state.polling_alive else "DEAD",
         "mode": state.mode,
         "paused": state.paused,
         "regime": state.regime.value,
