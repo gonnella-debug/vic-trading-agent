@@ -2066,7 +2066,7 @@ async def telegram_polling_loop():
                             traders = report.get("traders", [])
                             patterns = report.get("patterns", {})
                             lines = [f"🧠 <b>Top Trader Intelligence</b>\nUpdated: {ts}\n"]
-                            lines.append(f"Scanned: {report.get('total_scanned', 0)} | Qualifying: {report.get('total_qualifying', 0)}")
+                            lines.append(f"Scanned: {report.get('total_scanned', 0)} | Analysed: {report.get('total_analysed', 0)}")
                             if patterns:
                                 lines.append(f"\n<b>Patterns:</b>")
                                 if patterns.get("dominant_direction"):
@@ -2490,12 +2490,12 @@ async def run_intelligence_scan():
         log.warning("Intelligence scan: no leaderboard data.")
         return
 
-    # Analyse top leaderboard traders and filter by win rate + trade count
-    # Leaderboard doesn't include WR/trade count, so we compute from fills
-    log.info("Intelligence scan: analysing top %d traders from leaderboard...", min(len(leaderboard), 25))
+    # These are the top performers on Hyperliquid — analyse all of them.
+    # They're on the leaderboard because they're profitable. We want to learn
+    # what they're doing, not filter them out.
+    log.info("Intelligence scan: analysing top %d traders from leaderboard...", min(len(leaderboard), 20))
     trader_analyses = []
-    rank = 0
-    for entry in leaderboard[:25]:  # Analyse top 25, keep qualifying ones
+    for i, entry in enumerate(leaderboard[:20]):
         address = entry.get("ethAddress", "")
         if not address:
             continue
@@ -2505,26 +2505,18 @@ async def run_intelligence_scan():
             await asyncio.sleep(0.3)
             continue
 
-        total_trades = analysis.get("total_trades", 0)
-        win_rate = analysis.get("win_rate", 0)
-
-        # Filter: min 50 trades and >60% WR
-        if total_trades >= 50 and win_rate > 60:
-            rank += 1
-            trader_analyses.append({
-                "rank": rank,
-                "address": address[:10] + "...",
-                "win_rate": win_rate,
-                "total_trades": total_trades,
-                "pnl": entry.get("pnl", 0),
-                **analysis,
-            })
-            if rank >= 15:  # Cap at 15 qualifying traders
-                break
-
+        trader_analyses.append({
+            "rank": i + 1,
+            "address": address[:10] + "...",
+            "display_name": entry.get("displayName", ""),
+            "account_value": entry.get("accountValue", 0),
+            "monthly_pnl": entry.get("pnl", 0),
+            "monthly_roi": entry.get("roi", 0),
+            **analysis,
+        })
         await asyncio.sleep(0.3)  # Rate limit courtesy
 
-    log.info("Intelligence scan: %d traders qualify (50+ trades, >60%% WR)", len(trader_analyses))
+    log.info("Intelligence scan: analysed %d top traders", len(trader_analyses))
 
     if not trader_analyses:
         report = {
@@ -2532,7 +2524,7 @@ async def run_intelligence_scan():
             "traders": [],
             "patterns": {},
             "total_scanned": len(leaderboard),
-            "total_qualifying": 0,
+            "total_analysed": 0,
         }
         _write_intelligence(report)
         _intelligence_cache["report"] = report
@@ -2605,7 +2597,7 @@ async def run_intelligence_scan():
         "traders": trader_analyses,
         "patterns": patterns,
         "total_scanned": len(leaderboard),
-        "total_qualifying": len(qualifying),
+        "total_analysed": len(trader_analyses),
     }
 
     _write_intelligence(report)
