@@ -3003,8 +3003,8 @@ async def test_trade():
         if price <= 0:
             return {"error": "Could not fetch BTC price"}
 
-        # Calculate size for ~$5 notional, floor to 5 dp
-        size = math.floor(5.0 / price * 100000) / 100000
+        # Calculate size for ~$10 notional (HL minimum), floor to 5 dp
+        size = math.floor(10.0 / price * 100000) / 100000
         if size <= 0:
             size = 0.00001  # absolute minimum
 
