@@ -2223,8 +2223,7 @@ async def startup():
         f"3\ufe0f\u20e3 BB Squeeze | 4\ufe0f\u20e3 VWAP Bounce\n"
         f"$100/strategy | $20 risk | 1:3 R:R | Max 4/day | -$60 cap\n\n"
         f"Session: London 07-11 + NY 13-17 UTC\n"
-        f"AI Market Brain: enabled\n"
-        f"Paper test: {PAPER_TEST_MIN_TRADES} trades or {PAPER_TEST_MAX_DAYS} days"
+        f"AI Market Brain: enabled"
     )
     await tg_send(startup_msg)
 
