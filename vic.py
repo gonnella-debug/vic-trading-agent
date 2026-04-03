@@ -2108,12 +2108,15 @@ async def ask_claude_market_question(question: str) -> str:
 
     system_prompt = (
         f"You are Vic, an AI crypto trading agent monitoring BTC/USDT perpetual futures on OKX. "
-        f"You run 4 strategies simultaneously with pure risk-based sizing.\n\n"
+        f"You run 5 strategies simultaneously with pure risk-based sizing.\n\n"
         f"=== STRATEGIES ===\n"
         f"1. TradingView Webhook: External alerts filtered by regime + bias + 2 confirmations (RSI/structure/VWAP)\n"
         f"2. RSI Divergence: Price/RSI divergence at support/resistance on 5m (50-candle lookback, 0.25% S/R threshold)\n"
         f"3. BB Squeeze: Bollinger squeeze breakout on 5m with 60% body filter and 0.1% band penetration\n"
-        f"4. VWAP Bounce: VWAP bounce on 1m with distance, chop filter, volume + body confirmation\n\n"
+        f"4. VWAP Bounce: VWAP bounce on 1m with distance, chop filter, volume + body confirmation\n"
+        f"5. AYN (Snurk): Trend-following flip strategy via TradingView webhook. ALWAYS in a position — "
+        f"buy signal closes short + opens long, sell signal closes long + opens short. "
+        f"NO session/regime/bias filters. NO SL/TP — holds until opposite signal. Separate from other strategies.\n\n"
         f"=== REGIME DEFINITIONS ===\n"
         f"TRENDING: ADX > 25 AND structure aligned (HH/HL or LH/LL)\n"
         f"TRANSITIONAL: ADX > 25 but structure breaking down\n"
