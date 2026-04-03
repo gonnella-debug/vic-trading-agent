@@ -1,6 +1,7 @@
 """
 Vic — BTC/USDT Perpetual Futures Scalping Agent (v2)
 Runs 4 strategies simultaneously on Hyperliquid via ccxt.
+$500 account: $100 per strategy, $100 buffer.
 Paper trading mode by default. Production-ready for Railway.
 
 Strategies:
@@ -74,11 +75,7 @@ MAX_TRADES_PER_DAY = 4
 CORRELATION_COOLDOWN_MIN = 15  # minutes cooldown same direction after close
 BREAK_EVEN_R_MULTIPLE = 1.5   # move SL to entry at +1.5R
 BB_SQUEEZE_THRESHOLD = 0.02   # bandwidth threshold for BB squeeze
-MAX_NOTIONAL = 2000.0         # max position notional to prevent absurdly large positions
-
-# AYN strategy — completely separate budget and limits
-AYN_BUDGET = 1000.0           # $1000 notional for AYN positions
-AYN_MAX_DAILY_LOSS = 100.0    # AYN daily loss cap (separate from strategies 1-4)
+MAX_NOTIONAL = 500.0          # max position notional per strategy ($100 margin × 5x)
 
 # ATR multipliers for SL distance per strategy
 STRATEGY_ATR_SL = {
@@ -86,7 +83,6 @@ STRATEGY_ATR_SL = {
     "rsi_divergence": 1.5,     # 1.5 x ATR(14) on 5m
     "bb_squeeze": 1.0,         # 1.0 x ATR(14) on 5m
     "vwap_bounce": 1.0,        # 1.0 x ATR(14) on 1m
-    "ayn": 1.5,                # 1.5 x ATR(14) on 5m
 }
 
 # Strategy max hold times in minutes
@@ -95,10 +91,9 @@ STRATEGY_MAX_HOLD = {
     "rsi_divergence": 240,
     "bb_squeeze": 90,
     "vwap_bounce": 60,
-    "ayn": 120,
 }
 
-STRATEGY_NAMES = ["tv_webhook", "rsi_divergence", "bb_squeeze", "vwap_bounce", "ayn"]
+STRATEGY_NAMES = ["tv_webhook", "rsi_divergence", "bb_squeeze", "vwap_bounce"]
 
 # Paper test: 50 trades OR 2 weeks
 PAPER_TEST_MIN_TRADES = 50
@@ -110,7 +105,6 @@ STRATEGY_LABELS = {
     "rsi_divergence": "2\ufe0f\u20e3 RSI Divergence",
     "bb_squeeze": "3\ufe0f\u20e3 BB Squeeze",
     "vwap_bounce": "4\ufe0f\u20e3 VWAP Bounce",
-    "ayn": "5\ufe0f\u20e3 AYN (Snurk)",
 }
 
 # Session filter — London + NY open only
@@ -206,10 +200,6 @@ class TradingState:
         self.signals_blocked: int = 0
         self.last_block_reasons: list = []  # keep last 20
 
-        # AYN separate tracking — does NOT affect strategies 1-4
-        self.ayn_daily_pnl: float = 0.0
-        self.ayn_daily_loss_cap_hit: bool = False
-
         # Polling watchdog
         self.polling_alive: bool = False
 
@@ -217,8 +207,6 @@ class TradingState:
         self.trades_today = 0
         self.daily_pnl = 0.0
         self.daily_loss_cap_hit = False
-        self.ayn_daily_pnl = 0.0
-        self.ayn_daily_loss_cap_hit = False
         self.last_trade_direction = None
         self.last_trade_close_time = None
         for name in STRATEGY_NAMES:
@@ -682,50 +670,44 @@ def can_execute_trade(strategy: str, side: str) -> tuple[bool, str]:
     """
     state.signals_checked += 1
 
-    # AYN strategy bypasses session, regime, and bias filters
-    is_ayn = strategy == "ayn"
-
     # 0. Trading session check
-    if not is_ayn:
-        session_ok = is_trading_session()
-        log.info("CHECK %s %s — session_ok: %s (hour=%d UTC)",
-                 strategy, side.upper(), session_ok, datetime.now(timezone.utc).hour)
-        if not session_ok:
-            reason = f"BLOCKED: {strategy} {side.upper()} — Outside trading session"
-            log.info(reason)
-            state.signals_blocked += 1
-            state.last_block_reasons.append(reason)
-            if len(state.last_block_reasons) > 20:
-                state.last_block_reasons.pop(0)
-            return False, "Outside trading session"
+    session_ok = is_trading_session()
+    log.info("CHECK %s %s — session_ok: %s (hour=%d UTC)",
+             strategy, side.upper(), session_ok, datetime.now(timezone.utc).hour)
+    if not session_ok:
+        reason = f"BLOCKED: {strategy} {side.upper()} — Outside trading session"
+        log.info(reason)
+        state.signals_blocked += 1
+        state.last_block_reasons.append(reason)
+        if len(state.last_block_reasons) > 20:
+            state.last_block_reasons.pop(0)
+        return False, "Outside trading session"
 
     # 1. Regime allows this strategy?
-    if not is_ayn:
-        regime_ok = regime_allows_strategy(strategy)
-        log.info("CHECK %s %s — regime_allows: %s (regime=%s, mode=%s)",
-                 strategy, side.upper(), regime_ok, state.regime.value, state.mode)
-        if not regime_ok:
-            reason = f"BLOCKED: {strategy} {side.upper()} — regime {state.regime.value} not allowed"
-            log.info(reason)
-            state.signals_blocked += 1
-            state.last_block_reasons.append(reason)
-            if len(state.last_block_reasons) > 20:
-                state.last_block_reasons.pop(0)
-            return False, f"Regime {state.regime.value} blocks {strategy}"
+    regime_ok = regime_allows_strategy(strategy)
+    log.info("CHECK %s %s — regime_allows: %s (regime=%s, mode=%s)",
+             strategy, side.upper(), regime_ok, state.regime.value, state.mode)
+    if not regime_ok:
+        reason = f"BLOCKED: {strategy} {side.upper()} — regime {state.regime.value} not allowed"
+        log.info(reason)
+        state.signals_blocked += 1
+        state.last_block_reasons.append(reason)
+        if len(state.last_block_reasons) > 20:
+            state.last_block_reasons.pop(0)
+        return False, f"Regime {state.regime.value} blocks {strategy}"
 
     # 2. 1H bias agrees or is neutral?
-    if not is_ayn:
-        bias_ok = bias_allows_direction(side)
-        log.info("CHECK %s %s — bias_allows: %s (bias=%s, strength=%s)",
-                 strategy, side.upper(), bias_ok, state.htf_bias, state.htf_bias_strength)
-        if not bias_ok:
-            reason = f"BLOCKED: {strategy} {side.upper()} — HTF bias {state.htf_bias} (strong) blocks {side}"
-            log.info(reason)
-            state.signals_blocked += 1
-            state.last_block_reasons.append(reason)
-            if len(state.last_block_reasons) > 20:
-                state.last_block_reasons.pop(0)
-            return False, f"1H bias ({state.htf_bias} strong) opposes {side}"
+    bias_ok = bias_allows_direction(side)
+    log.info("CHECK %s %s — bias_allows: %s (bias=%s, strength=%s)",
+             strategy, side.upper(), bias_ok, state.htf_bias, state.htf_bias_strength)
+    if not bias_ok:
+        reason = f"BLOCKED: {strategy} {side.upper()} — HTF bias {state.htf_bias} (strong) blocks {side}"
+        log.info(reason)
+        state.signals_blocked += 1
+        state.last_block_reasons.append(reason)
+        if len(state.last_block_reasons) > 20:
+            state.last_block_reasons.pop(0)
+        return False, f"1H bias ({state.htf_bias} strong) opposes {side}"
 
     # 3. Trade count < 4 today?
     trades_ok = state.trades_today < MAX_TRADES_PER_DAY
@@ -970,12 +952,9 @@ async def close_position(strategy: str, exit_price: float, reason: str):
             )
             return  # Do NOT mark position as closed
 
-    # Book PnL — AYN is tracked separately from strategies 1-4
+    # Book PnL
     strat["daily_pnl"] = round(strat["daily_pnl"] + pnl, 2)
-    if strategy == "ayn":
-        state.ayn_daily_pnl = round(state.ayn_daily_pnl + pnl, 2)
-    else:
-        state.daily_pnl = round(state.daily_pnl + pnl, 2)
+    state.daily_pnl = round(state.daily_pnl + pnl, 2)
 
     # Update metrics
     m = state.metrics[strategy]
@@ -1052,25 +1031,15 @@ async def close_position(strategy: str, exit_price: float, reason: str):
 
     strat["position"] = None
 
-    # Check daily loss caps — AYN has its own separate cap
-    if strategy == "ayn":
-        if state.ayn_daily_pnl <= -AYN_MAX_DAILY_LOSS:
-            state.ayn_daily_loss_cap_hit = True
-            alert = (
-                f"\U0001f6d1 <b>AYN daily loss limit hit (${state.ayn_daily_pnl:+,.2f})</b>\n"
-                f"AYN trading stopped until tomorrow. Strategies 1-4 unaffected."
-            )
-            await tg_send(alert)
-            log.warning(alert.replace("<b>", "").replace("</b>", ""))
-    else:
-        if state.daily_pnl <= -MAX_DAILY_LOSS:
-            state.daily_loss_cap_hit = True
-            alert = (
-                f"\U0001f6d1 <b>Daily loss limit hit (${state.daily_pnl:+,.2f})</b>\n"
-                f"Strategies 1-4 stopped until tomorrow. AYN unaffected."
-            )
-            await tg_send(alert)
-            log.warning(alert.replace("<b>", "").replace("</b>", ""))
+    # Check daily loss cap
+    if state.daily_pnl <= -MAX_DAILY_LOSS:
+        state.daily_loss_cap_hit = True
+        alert = (
+            f"\U0001f6d1 <b>Daily loss limit hit (${state.daily_pnl:+,.2f})</b>\n"
+            f"All trading stopped until tomorrow."
+        )
+        await tg_send(alert)
+        log.warning(alert.replace("<b>", "").replace("</b>", ""))
 
     # Paper test milestone check (Change 16)
     if state.mode == "paper" and state.total_trade_count >= PAPER_TEST_MIN_TRADES:
@@ -1449,10 +1418,6 @@ async def position_monitor_loop():
             state.last_btc_price = price
 
             for name in STRATEGY_NAMES:
-                # AYN holds until opposite signal — no SL/TP/BE/partial/max hold
-                if name == "ayn":
-                    continue
-
                 pos = state.strategies[name]["position"]
                 if pos is None:
                     continue
@@ -2144,16 +2109,12 @@ async def ask_claude_market_question(question: str) -> str:
 
     system_prompt = (
         f"You are Vic, an AI crypto trading agent monitoring BTC/USDC perpetual futures on Hyperliquid. "
-        f"You run 5 strategies simultaneously with pure risk-based sizing.\n\n"
+        f"You run 4 strategies simultaneously with pure risk-based sizing. $500 account, $100 per strategy, $100 buffer.\n\n"
         f"=== STRATEGIES ===\n"
         f"1. TradingView Webhook: External alerts filtered by regime + bias + 2 confirmations (RSI/structure/VWAP)\n"
         f"2. RSI Divergence: Price/RSI divergence at support/resistance on 5m (50-candle lookback, 0.25% S/R threshold)\n"
         f"3. BB Squeeze: Bollinger squeeze breakout on 5m with 60% body filter and 0.1% band penetration\n"
-        f"4. VWAP Bounce: VWAP bounce on 1m with distance, chop filter, volume + body confirmation\n"
-        f"5. AYN (Snurk): COMPLETELY SEPARATE strategy with its own $1,000 budget and -$100 daily loss cap. "
-        f"Trend-following flip via TradingView webhook. Always in a position — buy closes short + opens long, "
-        f"sell closes long + opens short. NO session/regime/bias filters. NO SL/TP — holds until opposite signal. "
-        f"AYN trades do NOT count against the 4/day limit or -$60 cap for strategies 1-4.\n\n"
+        f"4. VWAP Bounce: VWAP bounce on 1m with distance, chop filter, volume + body confirmation\n\n"
         f"=== REGIME DEFINITIONS ===\n"
         f"TRENDING: ADX > 25 AND structure aligned (HH/HL or LH/LL)\n"
         f"TRANSITIONAL: ADX > 25 but structure breaking down\n"
@@ -2175,9 +2136,8 @@ async def ask_claude_market_question(question: str) -> str:
         f"=== PER-STRATEGY METRICS ===\n{metrics_text}\n\n"
         f"=== RECENT TRADES (last 10) ===\n{trades_text}\n\n"
         f"=== RECENT NEWS ===\n{news_text}\n\n"
-        f"Strategies 1-4: $20 risk/trade, TP $60, max 4 trades/day, -$60 daily cap.\n"
-        f"AYN: $1,000 budget, own -$100 daily cap, does NOT affect strategies 1-4.\n"
-        f"AYN daily PnL: ${state.ayn_daily_pnl:+,.2f} | AYN cap hit: {state.ayn_daily_loss_cap_hit}\n"
+        f"$20 risk/trade, TP $60, max 4 trades/day, -$60 daily cap.\n"
+        f"$500 account: $100 per strategy, $100 buffer.\n"
         f"Sessions: London 07-11 UTC, NY 13-17 UTC. AI pre-trade analysis enabled.\n\n"
         f"Answer the user's question about the market concisely. "
         f"Be direct, use numbers, and keep it under 300 words.\n\n"
@@ -2258,13 +2218,10 @@ async def startup():
 
     startup_msg = (
         f"\U0001f916 <b>Vic is online \u2014 {state.mode.upper()} MODE</b>\n"
-        f"BTC/USDT perp | {LEVERAGE}x leverage | ATR-based sizing\n\n"
-        f"<b>Strategies 1-4</b> (filtered):\n"
+        f"BTC/USDC perp | {LEVERAGE}x leverage | ATR-based sizing\n\n"
         f"1\ufe0f\u20e3 TradingView Webhook | 2\ufe0f\u20e3 RSI Divergence\n"
         f"3\ufe0f\u20e3 BB Squeeze | 4\ufe0f\u20e3 VWAP Bounce\n"
-        f"$20 risk | 1:3 R:R | Max 4/day | -$60 daily cap\n\n"
-        f"<b>Strategy 5 — AYN (Snurk)</b> (separate):\n"
-        f"$1,000 budget | Flip mode | Own -$100 daily cap\n\n"
+        f"$100/strategy | $20 risk | 1:3 R:R | Max 4/day | -$60 cap\n\n"
         f"Session: London 07-11 + NY 13-17 UTC\n"
         f"AI Market Brain: enabled\n"
         f"Paper test: {PAPER_TEST_MIN_TRADES} trades or {PAPER_TEST_MAX_DAYS} days"
@@ -2305,17 +2262,9 @@ async def health():
         "htf_bias": f"{state.htf_bias} ({state.htf_bias_strength})",
         "uptime_since": state.startup_time,
         "btc_price": state.last_btc_price,
-        "strategies_1_4": {
-            "trades_today": state.trades_today,
-            "daily_pnl": state.daily_pnl,
-            "loss_cap_hit": state.daily_loss_cap_hit,
-        },
-        "ayn": {
-            "daily_pnl": state.ayn_daily_pnl,
-            "loss_cap_hit": state.ayn_daily_loss_cap_hit,
-            "position": state.strategies["ayn"]["position"],
-            "budget": AYN_BUDGET,
-        },
+        "trades_today": state.trades_today,
+        "daily_pnl": state.daily_pnl,
+        "loss_cap_hit": state.daily_loss_cap_hit,
     }
 
 
@@ -2381,7 +2330,7 @@ async def tradingview_webhook(request: Request, token: str = Query("")):
 
     action = body.get("action", "").lower()
     price = float(body.get("price", 0))
-    strategy_label = body.get("strategy", "ayn_indicator")
+    strategy_label = body.get("strategy", "tv_indicator")
 
     if action not in ("long", "short"):
         return JSONResponse(status_code=400, content={"error": "action must be long or short"})
@@ -2425,105 +2374,6 @@ async def tradingview_webhook(request: Request, token: str = Query("")):
 
     await execute_trade("tv_webhook", action, price, atr_value=atr_val)
     return {"status": "ok", "action": action, "price": price, "confirmation": conf_reason}
-
-
-@app.post("/webhook/ayn")
-async def ayn_webhook(request: Request, token: str = Query("")):
-    """Receive AYN indicator (Snurk) alerts from TradingView.
-    Trend-following flip mode: always in a position.
-    Buy signal → close short + open long. Sell signal → close long + open short.
-    No SL/TP/regime/bias/session filters. No position monitor.
-    """
-    if token != WEBHOOK_SECRET:
-        return JSONResponse(status_code=403, content={"error": "Invalid token"})
-
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"error": "Invalid JSON"})
-
-    action = body.get("action", "").lower()
-    price = float(body.get("price", 0))
-
-    if action not in ("long", "short"):
-        return JSONResponse(status_code=400, content={"error": "action must be long or short"})
-
-    if price <= 0:
-        price = await get_btc_price()
-
-    log.info("AYN webhook: %s @ %.2f", action, price)
-
-    # AYN has its own daily loss cap
-    if state.ayn_daily_loss_cap_hit:
-        log.info("AYN — daily loss cap hit, ignoring signal")
-        return {"status": "blocked", "reason": "AYN daily loss cap hit"}
-
-    strat = state.strategies["ayn"]
-    pos = strat["position"]
-
-    # If already in same direction, ignore
-    if pos is not None and pos["side"] == action:
-        log.info("AYN — already %s, ignoring duplicate signal", action)
-        return {"status": "ignored", "reason": f"already {action}"}
-
-    # Close existing position if in opposite direction
-    if pos is not None:
-        await close_position("ayn", price, f"AYN flip to {action.upper()}")
-
-    # Open new position — AYN uses its own $1000 budget
-    size = round(AYN_BUDGET / price, 6) if price > 0 else 0.0
-    if size <= 0:
-        log.warning("AYN — invalid size, skipping.")
-        return {"status": "error", "reason": "invalid size"}
-
-    # Open order on exchange
-    if state.mode == "live":
-        try:
-            await exchange.set_leverage(LEVERAGE, SYMBOL)
-            order = await exchange.create_order(
-                symbol=SYMBOL,
-                type="market",
-                side="buy" if action == "long" else "sell",
-                amount=size,
-            )
-            log.info("AYN LIVE order placed: %s", order.get("id"))
-        except Exception as exc:
-            log.error("AYN — order error: %s", exc)
-            await tg_send(f"⚠️ <b>AYN</b> order FAILED: {sanitize_html(str(exc))}")
-            return {"status": "error", "reason": str(exc)}
-    else:
-        log.info("AYN PAPER trade: %s %.6f BTC @ %.2f", action.upper(), size, price)
-
-    # Record position — no SL/TP
-    strat["position"] = {
-        "side": action,
-        "entry": price,
-        "sl": 0,
-        "tp": 0,
-        "size": size,
-        "open_time": datetime.now(timezone.utc).isoformat(),
-        "be_moved": False,
-        "partial_closed": False,
-        "regime": state.regime.value,
-        "bias": f"{state.htf_bias} ({state.htf_bias_strength})",
-    }
-    strat["trades_today"] += 1
-    # AYN does NOT increment state.trades_today — it has its own budget
-    state.total_trade_count += 1
-
-    arrow = "\U0001f7e2" if action == "long" else "\U0001f534"
-    label = STRATEGY_LABELS.get("ayn", "AYN")
-    notional = size * price
-    msg = (
-        f"{arrow} <b>{action.upper()}</b> — {label}\n"
-        f"Entry ${price:,.2f} | Size {size:.6f} BTC (${notional:,.0f})\n"
-        f"Mode: FLIP (holds until opposite signal)\n"
-        f"AYN daily PnL: ${state.ayn_daily_pnl:+,.2f} / -${AYN_MAX_DAILY_LOSS:.0f} cap"
-    )
-    await tg_send(msg)
-    log.info(msg.replace("<b>", "").replace("</b>", ""))
-
-    return {"status": "ok", "action": action, "price": price}
 
 
 @app.post("/go_live")
