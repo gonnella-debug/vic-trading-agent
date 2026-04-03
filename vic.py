@@ -4,7 +4,7 @@ Runs 4 strategies simultaneously on Hyperliquid via native SDK.
 $500 account, full capital available per trade. Production-ready for Railway.
 
 Strategies:
-  1. TradingView Webhook (filtered with regime + bias + 2 confirmations)
+  1. TradingView Scanner (polls TV technical analysis, STRONG signals + 1h confirmation)
   2. RSI Divergence — Price/RSI divergence at S/R on 5m
   3. BB Squeeze Breakout — Bollinger squeeze breakout on 5m
   4. VWAP Bounce — VWAP bounce with distance + chop filter on 1m
@@ -42,6 +42,7 @@ import httpx
 import numpy as np
 import pandas as pd
 import ta
+from tradingview_ta import TA_Handler, Interval as TV_Interval
 from fastapi import FastAPI, Query, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 
@@ -104,7 +105,7 @@ PAPER_TEST_MAX_DAYS = 14
 
 # Strategy labels for Telegram messages
 STRATEGY_LABELS = {
-    "tv_webhook": "1\ufe0f\u20e3 TradingView",
+    "tv_webhook": "1\ufe0f\u20e3 TV Scanner",
     "rsi_divergence": "2\ufe0f\u20e3 RSI Divergence",
     "bb_squeeze": "3\ufe0f\u20e3 BB Squeeze",
     "vwap_bounce": "4\ufe0f\u20e3 VWAP Bounce",
@@ -1089,64 +1090,120 @@ async def close_position(strategy: str, exit_price: float, reason: str):
 
 
 # ---------------------------------------------------------------------------
-# Strategy 1 — TradingView Webhook (Change 8)
+# Strategy 1 — TradingView Signal Scanner
 # ---------------------------------------------------------------------------
-# Handled via POST /webhook/tradingview endpoint with regime + bias + confirmations.
+# Actively polls TradingView's technical analysis on each 5m candle close.
+# If TV's aggregated indicators give a STRONG_BUY or STRONG_SELL signal,
+# it runs through the same confirmation + AI Brain pipeline.
+# The webhook endpoint is kept alive for any manual/external signals too.
 
 
-async def evaluate_webhook_signal(action: str, price: float) -> tuple[bool, str]:
+async def get_tv_analysis() -> dict:
+    """Fetch TradingView technical analysis for BTC on 5m and 1h timeframes."""
+    try:
+        loop = asyncio.get_event_loop()
+
+        def _fetch():
+            # 5m for entry timing
+            h_5m = TA_Handler(symbol="BTCUSDT", screener="crypto",
+                              exchange="BINANCE", interval=TV_Interval.INTERVAL_5_MINUTES)
+            a_5m = h_5m.get_analysis()
+
+            # 1h for trend confirmation
+            h_1h = TA_Handler(symbol="BTCUSDT", screener="crypto",
+                              exchange="BINANCE", interval=TV_Interval.INTERVAL_1_HOUR)
+            a_1h = h_1h.get_analysis()
+            return a_5m, a_1h
+
+        a_5m, a_1h = await loop.run_in_executor(None, _fetch)
+        return {
+            "5m_rec": a_5m.summary["RECOMMENDATION"],
+            "5m_buy": a_5m.summary["BUY"],
+            "5m_sell": a_5m.summary["SELL"],
+            "5m_neutral": a_5m.summary["NEUTRAL"],
+            "5m_osc": a_5m.oscillators["RECOMMENDATION"],
+            "5m_ma": a_5m.moving_averages["RECOMMENDATION"],
+            "1h_rec": a_1h.summary["RECOMMENDATION"],
+            "1h_buy": a_1h.summary["BUY"],
+            "1h_sell": a_1h.summary["SELL"],
+            "1h_ma": a_1h.moving_averages["RECOMMENDATION"],
+            "rsi": a_5m.indicators.get("RSI"),
+            "macd": a_5m.indicators.get("MACD.macd"),
+            "macd_signal": a_5m.indicators.get("MACD.signal"),
+        }
+    except Exception as exc:
+        log.error("TradingView analysis error: %s", exc)
+        return {}
+
+
+async def strategy_tv_scanner():
     """
-    Evaluate webhook signal with regime + bias + at least 1 confirmation.
-    Returns (execute, reason).
+    Strategy 1 — Active TradingView signal scanner.
+    Checks TV's aggregated technical analysis on each 5m candle close.
+    Requires STRONG_BUY or STRONG_SELL on 5m with 1h trend agreement.
     """
-    side = action.lower()
+    name = "tv_webhook"  # Uses same strategy slot
 
-    # Regime check
-    if not regime_allows_strategy("tv_webhook"):
-        return False, f"Regime {state.regime.value} blocks webhook"
+    tv = await get_tv_analysis()
+    if not tv:
+        return
 
-    # Bias check
-    if not bias_allows_direction(side):
-        return False, f"1H bias ({state.htf_bias}) opposes {side}"
+    rec_5m = tv.get("5m_rec", "NEUTRAL")
+    rec_1h = tv.get("1h_rec", "NEUTRAL")
+    osc_5m = tv.get("5m_osc", "NEUTRAL")
+    ma_5m = tv.get("5m_ma", "NEUTRAL")
 
-    # Need at least 1 confirmation: RSI agreement, structure alignment, or near VWAP
-    confirmations = 0
-    reasons = []
+    log.info("Checking tv_scanner... 5m=%s (osc=%s, ma=%s), 1h=%s, RSI=%.1f",
+             rec_5m, osc_5m, ma_5m, rec_1h, tv.get("rsi", 0) or 0)
 
-    # RSI agreement
+    # Need STRONG signal on 5m
+    if rec_5m not in ("STRONG_BUY", "STRONG_SELL"):
+        return
+
+    # Determine direction
+    if rec_5m == "STRONG_BUY":
+        side = "long"
+        # 1h must agree — not SELL or STRONG_SELL
+        if rec_1h in ("SELL", "STRONG_SELL"):
+            log.info("tv_scanner — 5m STRONG_BUY but 1h says %s, skipping", rec_1h)
+            return
+    else:  # STRONG_SELL
+        side = "short"
+        # 1h must agree — not BUY or STRONG_BUY
+        if rec_1h in ("BUY", "STRONG_BUY"):
+            log.info("tv_scanner — 5m STRONG_SELL but 1h says %s, skipping", rec_1h)
+            return
+
+    # Both oscillators and MAs should lean the same direction
+    if side == "long" and ma_5m in ("SELL", "STRONG_SELL"):
+        return
+    if side == "short" and ma_5m in ("BUY", "STRONG_BUY"):
+        return
+
+    price = await get_btc_price()
+    if price <= 0:
+        return
+
+    # Pre-trade checklist
+    allowed, reason = can_execute_trade(name, side)
+    if not allowed:
+        return
+
+    # Fetch ATR for SL
     df_5m = await fetch_ohlcv("5m", 30)
+    atr_val = 0.0
     if not df_5m.empty and len(df_5m) >= 14:
-        rsi_series = calc_rsi(df_5m["close"], 14)
-        rsi_val = float(rsi_series.iloc[-1]) if not np.isnan(rsi_series.iloc[-1]) else 50.0
-        if side == "long" and rsi_val < 65:
-            confirmations += 1
-            reasons.append(f"RSI={rsi_val:.0f} agrees")
-        elif side == "short" and rsi_val > 35:
-            confirmations += 1
-            reasons.append(f"RSI={rsi_val:.0f} agrees")
+        atr_s = calc_atr(df_5m, 14)
+        atr_val = float(atr_s.iloc[-1]) if not atr_s.empty and not np.isnan(atr_s.iloc[-1]) else 0.0
 
-    # Structure alignment
-    if not df_5m.empty:
-        structure = detect_structure(df_5m)
-        if (side == "long" and structure == "bullish") or (side == "short" and structure == "bearish"):
-            confirmations += 1
-            reasons.append(f"Structure={structure}")
+    # AI Market Brain gate
+    ai_ok, ai_reason = await ai_market_analysis(name, side, price)
+    if not ai_ok:
+        log.info("tv_scanner %s blocked by AI: %s", side.upper(), ai_reason)
+        return
 
-    # Near VWAP
-    df_1m = await fetch_ohlcv("1m", 100)
-    if not df_1m.empty and len(df_1m) >= 20:
-        vwap_s = calc_vwap(df_1m)
-        vwap_val = float(vwap_s.iloc[-1])
-        if not np.isnan(vwap_val) and price > 0:
-            dist_pct = abs(price - vwap_val) / vwap_val * 100
-            if dist_pct < 0.3:
-                confirmations += 1
-                reasons.append(f"Near VWAP ({dist_pct:.2f}%)")
-
-    if confirmations < 2:
-        return False, f"Need 2 confirmations, got {confirmations} (RSI/structure/VWAP)"
-
-    return True, f"Confirmed: {', '.join(reasons)}"
+    log.info("tv_scanner — EXECUTING %s @ %.2f (5m=%s, 1h=%s)", side.upper(), price, rec_5m, rec_1h)
+    await execute_trade(name, side, price, atr_value=atr_val)
 
 
 # ---------------------------------------------------------------------------
@@ -1430,6 +1487,10 @@ async def strategy_monitor_loop():
             if new_5m_close:
                 state.last_5m_candle_ts = current_5m_boundary
                 # 5m strategies
+                try:
+                    await strategy_tv_scanner()
+                except Exception as exc:
+                    log.error("tv_scanner error: %s", exc)
                 try:
                     await strategy_rsi_divergence()
                 except Exception as exc:
@@ -2199,7 +2260,7 @@ async def ask_claude_market_question(question: str) -> str:
         f"You are Vic, an AI crypto trading agent monitoring BTC/USDC perpetual futures on Hyperliquid. "
         f"You run 4 strategies. $500 account, full capital available per trade, percentage-based risk.\n\n"
         f"=== STRATEGIES ===\n"
-        f"1. TradingView Webhook: External alerts filtered by regime + bias + 2 confirmations (RSI/structure/VWAP)\n"
+        f"1. TV Scanner: Polls TradingView technical analysis on 5m, trades on STRONG_BUY/STRONG_SELL with 1h confirmation\n"
         f"2. RSI Divergence: Price/RSI divergence at support/resistance on 5m (50-candle lookback, 0.25% S/R threshold)\n"
         f"3. BB Squeeze: Bollinger squeeze breakout on 5m with 60% body filter and 0.1% band penetration\n"
         f"4. VWAP Bounce: VWAP bounce on 1m with distance, chop filter, volume + body confirmation\n\n"
@@ -2848,99 +2909,6 @@ async def full_status():
         },
         "recent_trades": state.trade_history[-20:],
     }
-
-
-# =========================================================================
-# TRADINGVIEW WEBHOOK — MCP AUTO-CONFIGURATION REFERENCE
-# =========================================================================
-# Endpoint: POST /webhook/tradingview?token=<WEBHOOK_SECRET>
-#
-# Authentication:
-#   Query parameter "token" must match the WEBHOOK_SECRET env var.
-#   Example: POST https://<RAILWAY_URL>/webhook/tradingview?token=abc123
-#
-# Payload format (JSON body):
-#   {
-#     "action": "long" | "short",     — REQUIRED: trade direction
-#     "price": 84500.00,              — OPTIONAL: entry price (fetched if 0 or missing)
-#     "strategy": "my_indicator"      — OPTIONAL: label for logging (default: tv_indicator)
-#   }
-#
-# TradingView Alert Message (paste into alert body):
-#   {"action": "{{strategy.order.action}}", "price": {{close}}, "strategy": "{{strategy.order.id}}"}
-#
-# TradingView Webhook URL:
-#   https://<RAILWAY_URL>/webhook/tradingview?token=<WEBHOOK_SECRET>
-#
-# Response codes:
-#   200 — Signal processed (check "status" field: ok, blocked, skipped, ai_blocked)
-#   400 — Invalid JSON or action not long/short
-#   403 — Invalid token
-#
-# Processing pipeline:
-#   1. Token validation
-#   2. Pre-trade checklist (session, regime, bias, trade cap, correlation, loss cap, pause)
-#   3. Signal confirmation (needs 2 of: RSI agreement, structure alignment, near VWAP)
-#   4. AI Market Brain gate (Claude evaluates macro + context)
-#   5. Trade execution
-# =========================================================================
-@app.post("/webhook/tradingview")
-async def tradingview_webhook(request: Request, token: str = Query("")):
-    """Receive TradingView webhook alerts for Strategy 1."""
-    if token != WEBHOOK_SECRET:
-        return JSONResponse(status_code=403, content={"error": "Invalid token"})
-
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"error": "Invalid JSON"})
-
-    action = body.get("action", "").lower()
-    price = float(body.get("price", 0))
-    strategy_label = body.get("strategy", "tv_indicator")
-
-    if action not in ("long", "short"):
-        return JSONResponse(status_code=400, content={"error": "action must be long or short"})
-
-    if price <= 0:
-        price = await get_btc_price()
-
-    log.info("TradingView webhook: %s @ %.2f (%s)", action, price, strategy_label)
-
-    # Pre-trade checklist
-    allowed, reason = can_execute_trade("tv_webhook", action)
-    if not allowed:
-        msg = f"\U0001f4e8 Signal received: {action.upper()} @ ${price:,.2f}\n\u23ed\ufe0f Blocked: {reason}"
-        await tg_send(msg)
-        return {"status": "blocked", "reason": reason}
-
-    # Confirmation check (Change 8)
-    confirmed, conf_reason = await evaluate_webhook_signal(action, price)
-    if not confirmed:
-        msg = (
-            f"\U0001f4e8 Signal received: {action.upper()} @ ${price:,.2f}\n"
-            f"\u23ed\ufe0f Signal received but no confirmation \u2014 skipped\n"
-            f"Reason: {conf_reason}"
-        )
-        await tg_send(msg)
-        log.info("Webhook signal skipped — no confirmation: %s", conf_reason)
-        return {"status": "skipped", "reason": conf_reason}
-
-    # Fetch ATR for SL computation
-    df_5m = await fetch_ohlcv("5m", 30)
-    atr_val = 0.0
-    if not df_5m.empty and len(df_5m) >= 14:
-        atr_s = calc_atr(df_5m, 14)
-        atr_val = float(atr_s.iloc[-1]) if not atr_s.empty and not np.isnan(atr_s.iloc[-1]) else 0.0
-
-    # AI Market Brain check
-    ai_ok, ai_reason = await ai_market_analysis("tv_webhook", action, price)
-    if not ai_ok:
-        log.info("Webhook blocked by AI: %s", ai_reason)
-        return {"status": "ai_blocked", "reason": ai_reason}
-
-    await execute_trade("tv_webhook", action, price, atr_value=atr_val)
-    return {"status": "ok", "action": action, "price": price, "confirmation": conf_reason}
 
 
 @app.post("/go_live")
