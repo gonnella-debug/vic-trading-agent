@@ -228,6 +228,13 @@ state = TradingState()
 # Helpers — Telegram
 # ---------------------------------------------------------------------------
 
+def sanitize_html(text: str) -> str:
+    """Escape HTML entities in text so Telegram's HTML parser doesn't choke on Claude's output."""
+    text = text.replace("&", "&amp;")
+    text = text.replace("<", "&lt;")
+    text = text.replace(">", "&gt;")
+    return text
+
 async def tg_send(text: str):
     """Send a message to the configured Telegram chat."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -1990,7 +1997,7 @@ async def telegram_polling_loop():
                         if headlines:
                             lines = ["📰 <b>Recent BTC News</b>\n"]
                             for h in headlines:
-                                lines.append(f"• {h}")
+                                lines.append(f"• {sanitize_html(h)}")
                             await tg_reply(chat_id, "\n".join(lines))
                         else:
                             await tg_reply(chat_id, "No recent news available.")
@@ -1999,10 +2006,10 @@ async def telegram_polling_loop():
                     # Process the question with Claude
                     try:
                         answer = await ask_claude_market_question(text)
-                        await tg_reply(chat_id, answer)
+                        await tg_reply(chat_id, sanitize_html(answer))
                     except Exception as exc:
                         log.error("Claude chat error: %s", exc)
-                        await tg_reply(chat_id, f"Sorry, I hit an error: {exc}")
+                        await tg_reply(chat_id, f"Sorry, I hit an error: {sanitize_html(str(exc))}")
 
         except Exception as exc:
             log.error("Telegram polling error: %s", exc)
