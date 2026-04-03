@@ -816,11 +816,15 @@ def can_execute_trade(strategy: str, side: str) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 def calc_position_size(entry: float, margin: float) -> float:
-    """Calculate BTC position size from margin and leverage."""
+    """Calculate BTC position size from margin and leverage.
+
+    Hyperliquid BTC uses szDecimals=5, so sizes must be rounded to 5 dp.
+    We round DOWN to avoid exceeding available margin.
+    """
     if entry <= 0:
         return 0.0
     notional = margin * LEVERAGE
-    return round(notional / entry, 6)
+    return math.floor(notional / entry * 100000) / 100000  # floor to 5 dp
 
 
 async def execute_trade(strategy: str, side: str, entry: float, atr_value: float = 0.0):
@@ -879,6 +883,14 @@ async def execute_trade(strategy: str, side: str, entry: float, atr_value: float
             )
             if result.get("status") != "ok":
                 raise Exception(f"Order rejected: {result}")
+            # Check inside response for per-order errors (HL returns status:ok even on order errors)
+            statuses = (result.get("response", {}).get("data", {}).get("statuses", []))
+            for s in statuses:
+                if "error" in s:
+                    raise Exception(f"Order error: {s['error']}")
+                if s.get("resting", {}).get("oid") is None and s.get("filled", {}).get("oid") is None:
+                    if "error" not in s:
+                        log.warning("%s — unexpected order status: %s", strategy, s)
             log.info("%s LIVE order placed: %s", strategy, result)
         except Exception as exc:
             log.error("%s — order error: %s", strategy, exc)
@@ -907,12 +919,14 @@ async def execute_trade(strategy: str, side: str, entry: float, atr_value: float
     state.total_trade_count += 1
 
     notional = size * entry
+    dollar_risk = round(abs(entry - sl) * size, 2)
+    dollar_reward = round(abs(tp - entry) * size, 2)
     label = STRATEGY_LABELS.get(strategy, strategy)
     arrow = "\U0001f7e2" if side == "long" else "\U0001f534"
     msg = (
         f"{arrow} <b>{side.upper()}</b> — {label}\n"
         f"Entry ${entry:,.2f} | SL ${sl:,.2f} | TP ${tp:,.2f}\n"
-        f"Margin ${margin:,.0f} | Notional ${notional:,.0f} | Risk ${margin * RISK_PCT:,.0f}\n"
+        f"Size {size:.6f} BTC | Risk ${dollar_risk:.2f} | Reward ${dollar_reward:.2f}\n"
         f"Regime: {state.regime.value} | Bias: {state.htf_bias} ({state.htf_bias_strength})\n"
         f"Trades today: {state.trades_today}/{MAX_TRADES_PER_DAY}"
     )
@@ -983,6 +997,11 @@ async def close_position(strategy: str, exit_price: float, reason: str):
             )
             if result.get("status") != "ok":
                 raise Exception(f"Close rejected: {result}")
+            # Check inside response for per-order errors
+            statuses = (result.get("response", {}).get("data", {}).get("statuses", []))
+            for s in statuses:
+                if "error" in s:
+                    raise Exception(f"Close error: {s['error']}")
         except Exception as exc:
             log.error("%s — close order error: %s", strategy, exc)
             await tg_send(
@@ -1568,16 +1587,20 @@ async def position_monitor_loop():
                     partial_threshold = margin * PARTIAL_PROFIT_PCT
                     if unrealized_pnl >= partial_threshold:
                         old_size = pos["size"]
-                        new_size = round(old_size * (1 - PARTIAL_CLOSE_PCT), 6)
+                        new_size = math.floor(old_size * (1 - PARTIAL_CLOSE_PCT) * 100000) / 100000
                         if state.mode == "live":
                             try:
-                                partial_amount = round(old_size * PARTIAL_CLOSE_PCT, 6)
+                                partial_amount = math.floor(old_size * PARTIAL_CLOSE_PCT * 100000) / 100000
                                 loop = asyncio.get_event_loop()
                                 result = await loop.run_in_executor(
                                     None, lambda: hl_exchange.market_close("BTC", sz=partial_amount)
                                 )
                                 if result.get("status") != "ok":
                                     raise Exception(f"Partial close rejected: {result}")
+                                statuses = (result.get("response", {}).get("data", {}).get("statuses", []))
+                                for s in statuses:
+                                    if "error" in s:
+                                        raise Exception(f"Partial close error: {s['error']}")
                             except Exception as exc:
                                 log.error("%s — partial close error: %s", name, exc)
                                 await tg_send(
@@ -2215,9 +2238,15 @@ async def ask_claude_market_question(question: str) -> str:
                 else:
                     unrealized = (pos["entry"] - state.last_btc_price) * pos["size"]
                 pnl_label = f", unrealized ${unrealized:+.2f}"
+            # Calculate actual dollar risk/reward for this position
+            sl_price_dist = abs(pos["entry"] - pos["sl"])
+            tp_price_dist = abs(pos["tp"] - pos["entry"])
+            dollar_risk = round(sl_price_dist * pos["size"], 2)
+            dollar_reward = round(tp_price_dist * pos["size"], 2)
             open_positions.append(
-                f"{name}: {pos['side'].upper()} @ ${pos['entry']:,.2f} "
-                f"(SL ${pos['sl']:,.2f}, TP ${pos['tp']:,.2f}{pnl_label}, BE={'yes' if pos['be_moved'] else 'no'})"
+                f"{name}: {pos['side'].upper()} {pos['size']:.6f} BTC @ ${pos['entry']:,.2f} "
+                f"(SL ${pos['sl']:,.2f} = ${dollar_risk:.2f} risk, TP ${pos['tp']:,.2f} = ${dollar_reward:.2f} reward"
+                f"{pnl_label}, BE={'yes' if pos['be_moved'] else 'no'})"
             )
     positions_text = "\n".join(open_positions) if open_positions else "No open positions"
 
@@ -2286,7 +2315,14 @@ async def ask_claude_market_question(question: str) -> str:
         f"=== RECENT TRADES (last 10) ===\n{trades_text}\n\n"
         f"=== RECENT NEWS ===\n{news_text}\n\n"
         f"=== TOP TRADER INTELLIGENCE ===\n{_get_intelligence_summary() or 'No report yet'}\n\n"
-        f"$500 account, full capital per trade. 10% risk, 20% partial close, 30% full TP.\n"
+        f"=== RISK MANAGEMENT (CRITICAL — GET THIS RIGHT) ===\n"
+        f"$500 account, {LEVERAGE}x leverage, full capital per trade.\n"
+        f"Position size = ($500 × {LEVERAGE}) / entry_price = small BTC amount.\n"
+        f"SL distance in price may look large, but DOLLAR RISK = position_size_BTC × SL_price_distance = $50 MAX.\n"
+        f"NEVER confuse SL price distance with dollar loss. A $1,000 SL distance on 0.05 BTC = $50 loss, NOT $1,000.\n"
+        f"Same for TP: dollar reward = position_size_BTC × TP_price_distance.\n"
+        f"The position data above already shows calculated dollar risk/reward — USE THOSE NUMBERS.\n"
+        f"10% risk ($50), 20% partial close ($100), 30% full TP ($150).\n"
         f"Max 4 trades/day, 10% daily loss cap (${ACCOUNT_CAPITAL * MAX_DAILY_LOSS_PCT:.0f}).\n"
         f"Sessions: London 07-11 UTC, NY 13-17 UTC. AI pre-trade analysis enabled.\n\n"
         f"Answer the user's question about the market concisely. "
