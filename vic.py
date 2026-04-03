@@ -892,6 +892,35 @@ async def execute_trade(strategy: str, side: str, entry: float, atr_value: float
                     if "error" not in s:
                         log.warning("%s — unexpected order status: %s", strategy, s)
             log.info("%s LIVE order placed: %s", strategy, result)
+
+            # Place exchange-level SL and TP as trigger orders (safety net if Vic goes down)
+            try:
+                sl_side = not is_buy  # SL closes position: sell if long, buy if short
+                sl_result = await loop.run_in_executor(
+                    None, lambda: hl_exchange.order(
+                        "BTC", is_buy=sl_side, sz=size, limit_px=sl,
+                        order_type={"trigger": {"triggerPx": sl, "isMarket": True, "tpsl": "sl"}},
+                        reduce_only=True,
+                    )
+                )
+                log.info("%s SL order placed on exchange @ $%.2f: %s", strategy, sl, sl_result)
+
+                tp_result = await loop.run_in_executor(
+                    None, lambda: hl_exchange.order(
+                        "BTC", is_buy=sl_side, sz=size, limit_px=tp,
+                        order_type={"trigger": {"triggerPx": tp, "isMarket": True, "tpsl": "tp"}},
+                        reduce_only=True,
+                    )
+                )
+                log.info("%s TP order placed on exchange @ $%.2f: %s", strategy, tp, tp_result)
+            except Exception as sl_exc:
+                log.error("%s — SL/TP order error (position still open): %s", strategy, sl_exc)
+                await tg_send(
+                    f"⚠️ <b>{strategy}</b> SL/TP orders FAILED to place on exchange.\n"
+                    f"Error: {sanitize_html(str(sl_exc))}\n"
+                    f"Software monitoring still active, but SET SL/TP MANUALLY as backup."
+                )
+
         except Exception as exc:
             log.error("%s — order error: %s", strategy, exc)
             await tg_send(f"\u26a0\ufe0f <b>{strategy}</b> order FAILED: {exc}")
@@ -3003,8 +3032,8 @@ async def test_trade():
         if price <= 0:
             return {"error": "Could not fetch BTC price"}
 
-        # Calculate size for ~$10 notional (HL minimum), floor to 5 dp
-        size = math.floor(10.0 / price * 100000) / 100000
+        # Calculate size for ~$12 notional (above HL $10 min after rounding), floor to 5 dp
+        size = math.ceil(12.0 / price * 100000) / 100000
         if size <= 0:
             size = 0.00001  # absolute minimum
 
