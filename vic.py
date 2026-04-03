@@ -2157,7 +2157,7 @@ async def ask_claude_market_question(question: str) -> str:
     needs_search = any(kw in q_lower for kw in search_keywords)
 
     payload = {
-        "model": "claude-sonnet-4-6-20250514",
+        "model": "claude-sonnet-4-5-20241022",
         "max_tokens": 2048 if needs_search else 1024,
         "system": system_prompt,
         "messages": [{"role": "user", "content": question}],
