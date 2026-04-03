@@ -1,6 +1,6 @@
 """
 Vic — BTC/USDT Perpetual Futures Scalping Agent (v2)
-Runs 4 strategies simultaneously on OKX via ccxt.
+Runs 4 strategies simultaneously on Hyperliquid via ccxt.
 Paper trading mode by default. Production-ready for Railway.
 
 Strategies:
@@ -17,7 +17,7 @@ AI Market Brain: Claude pre-trade analysis gate
 Trade Journal: /data/vic_journal.json (persistent)
 
 Env vars needed:
-  OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE
+  HL_WALLET_ADDRESS, HL_PRIVATE_KEY
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
   TRADING_MODE (paper|live), WEBHOOK_SECRET, RAILWAY_URL
   CLAUDE_API_KEY (for Telegram chat + AI Market Brain)
@@ -53,9 +53,8 @@ log = logging.getLogger("vic")
 # ---------------------------------------------------------------------------
 # Environment
 # ---------------------------------------------------------------------------
-OKX_API_KEY = os.getenv("OKX_API_KEY", "")
-OKX_SECRET_KEY = os.getenv("OKX_SECRET_KEY", "")
-OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE", "")
+HL_WALLET_ADDRESS = os.getenv("HL_WALLET_ADDRESS", "")
+HL_PRIVATE_KEY = os.getenv("HL_PRIVATE_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 TRADING_MODE = os.getenv("TRADING_MODE", "paper")  # paper | live
@@ -66,7 +65,7 @@ CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-SYMBOL = "BTC/USDT:USDT"
+SYMBOL = "BTC/USDC:USDC"
 LEVERAGE = 5
 RISK_PER_TRADE = 20.0         # stop-loss dollar risk ($1R)
 TP_PER_TRADE = 60.0           # take-profit dollar target (1:3 R:R)
@@ -143,7 +142,7 @@ class Regime(str, Enum):
 # ---------------------------------------------------------------------------
 app = FastAPI(title="Vic Trading Agent", version="2.0.0")
 
-exchange: Optional[ccxt.okx] = None
+exchange: Optional[ccxt.hyperliquid] = None
 
 
 class TradingState:
@@ -296,12 +295,11 @@ async def tg_reply(chat_id: str, text: str):
 # ---------------------------------------------------------------------------
 
 async def init_exchange():
-    """Create and configure the OKX ccxt instance."""
+    """Create and configure the Hyperliquid ccxt instance."""
     global exchange
     config = {
-        "apiKey": OKX_API_KEY,
-        "secret": OKX_SECRET_KEY,
-        "password": OKX_PASSPHRASE,
+        "walletAddress": HL_WALLET_ADDRESS,
+        "privateKey": HL_PRIVATE_KEY,
         "enableRateLimit": True,
         "options": {
             "defaultType": "swap",
@@ -309,10 +307,10 @@ async def init_exchange():
     }
     if state.mode == "paper":
         config["sandbox"] = True
-    exchange = ccxt.okx(config)
+    exchange = ccxt.hyperliquid(config)
     try:
         await exchange.load_markets()
-        log.info(f"OKX exchange connected ({'sandbox' if state.mode == 'paper' else 'live'}). Markets loaded.")
+        log.info(f"Hyperliquid exchange connected ({'testnet' if state.mode == 'paper' else 'live'}). Markets loaded.")
     except Exception as exc:
         log.error("Exchange init error (non-fatal, will retry): %s", exc)
 
@@ -864,7 +862,6 @@ async def execute_trade(strategy: str, side: str, entry: float, atr_value: float
                 type="market",
                 side="buy" if side == "long" else "sell",
                 amount=size,
-                params={"tdMode": "cross"},
             )
             log.info("%s LIVE order placed: %s", strategy, order.get("id"))
         except Exception as exc:
@@ -960,16 +957,16 @@ async def close_position(strategy: str, exit_price: float, reason: str):
                 type="market",
                 side=close_side,
                 amount=pos["size"],
-                params={"tdMode": "cross", "reduceOnly": True},
+                params={"reduceOnly": True},
             )
         except Exception as exc:
             log.error("%s — close order error: %s", strategy, exc)
             await tg_send(
                 f"🚨 <b>CRITICAL: {strategy} close order FAILED</b>\n\n"
-                f"Position is STILL OPEN on OKX but I tried to close it.\n"
+                f"Position is STILL OPEN on Hyperliquid but I tried to close it.\n"
                 f"Error: {sanitize_html(str(exc))}\n"
                 f"Side: {pos['side']} | Size: {pos['size']:.6f} BTC\n\n"
-                f"CHECK OKX MANUALLY."
+                f"CHECK HYPERLIQUID MANUALLY."
             )
             return  # Do NOT mark position as closed
 
@@ -1512,14 +1509,14 @@ async def position_monitor_loop():
                                     type="market",
                                     side=close_side,
                                     amount=partial_amount,
-                                    params={"tdMode": "cross", "reduceOnly": True},
+                                    params={"reduceOnly": True},
                                 )
                             except Exception as exc:
                                 log.error("%s — partial close error: %s", name, exc)
                                 await tg_send(
                                     f"🚨 <b>{name} partial close FAILED</b>\n"
                                     f"Error: {sanitize_html(str(exc))}\n"
-                                    f"Position size unchanged. CHECK OKX."
+                                    f"Position size unchanged. CHECK HYPERLIQUID."
                                 )
                                 continue  # Do NOT update size if order failed
                         pos["size"] = new_size
@@ -2146,7 +2143,7 @@ async def ask_claude_market_question(question: str) -> str:
     news_text = "\n".join(f"  - {h}" for h in headlines) if headlines else "  No recent news"
 
     system_prompt = (
-        f"You are Vic, an AI crypto trading agent monitoring BTC/USDT perpetual futures on OKX. "
+        f"You are Vic, an AI crypto trading agent monitoring BTC/USDC perpetual futures on Hyperliquid. "
         f"You run 5 strategies simultaneously with pure risk-based sizing.\n\n"
         f"=== STRATEGIES ===\n"
         f"1. TradingView Webhook: External alerts filtered by regime + bias + 2 confirmations (RSI/structure/VWAP)\n"
@@ -2239,7 +2236,7 @@ async def ask_claude_market_question(question: str) -> str:
 
 @app.on_event("startup")
 async def startup():
-    _required = ["OKX_API_KEY", "OKX_SECRET_KEY", "OKX_PASSPHRASE", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "CLAUDE_API_KEY"]
+    _required = ["HL_WALLET_ADDRESS", "HL_PRIVATE_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "CLAUDE_API_KEY"]
     _missing = [v for v in _required if not os.getenv(v)]
     if _missing:
         log.error(f"MISSING REQUIRED ENV VARS: {', '.join(_missing)} — Vic cannot start properly")
@@ -2488,7 +2485,6 @@ async def ayn_webhook(request: Request, token: str = Query("")):
                 type="market",
                 side="buy" if action == "long" else "sell",
                 amount=size,
-                params={"tdMode": "cross"},
             )
             log.info("AYN LIVE order placed: %s", order.get("id"))
         except Exception as exc:
