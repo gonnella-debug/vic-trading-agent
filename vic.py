@@ -136,7 +136,7 @@ class Regime(str, Enum):
 # ---------------------------------------------------------------------------
 app = FastAPI(title="Vic Trading Agent", version="2.0.0")
 
-exchange: Optional[ccxt.hyperliquid] = None
+exchange = None
 
 
 class TradingState:
