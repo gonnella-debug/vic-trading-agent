@@ -73,9 +73,9 @@ CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
 SYMBOL = "BTC"  # Hyperliquid native SDK uses coin name directly
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 ACCOUNT_CAPITAL = 500.0       # total wallet balance
-RISK_PCT = 0.10               # 10% of margin = max SL risk
-PARTIAL_PROFIT_PCT = 0.20     # 20% of margin = partial close trigger
-TP_PCT = 0.30                 # 30% of margin = full close trigger
+RISK_PCT = 0.02               # 2% of capital = max SL risk ($10 on $500)
+PARTIAL_PROFIT_PCT = 0.04     # 4% of capital = partial close trigger ($20 on $500)
+TP_PCT = 0.06                 # 6% of capital = full close trigger ($30 on $500)
 MAX_DAILY_LOSS_PCT = 0.10     # 10% of account = daily loss cap ($50)
 MAX_TRADES_PER_DAY = 4
 CORRELATION_COOLDOWN_MIN = 15  # minutes cooldown same direction after close
@@ -860,22 +860,28 @@ async def execute_trade(strategy: str, side: str, entry: float, atr_value: float
         log.warning("%s — invalid size, skipping.", strategy)
         return
 
-    # SL: 10% of margin risk
+    # SL: 2% of capital ($10 max loss on $500)
     risk_dollars = margin * RISK_PCT
     sl_distance = risk_dollars / size
 
     if side == "long":
-        sl = round(entry - sl_distance)  # Whole dollar — Hyperliquid BTC tick size = 1
+        sl = round(entry - sl_distance)
     else:
         sl = round(entry + sl_distance)
 
-    # TP: 30% of margin profit
+    # TP1 (partial): 4% of capital ($20 profit on $500) — 50% close
+    tp1_dollars = margin * PARTIAL_PROFIT_PCT
+    tp1_distance = tp1_dollars / size
+
+    # TP2 (full): 6% of capital ($30 profit on $500) — close remaining
     tp_dollars = margin * TP_PCT
     tp_distance = tp_dollars / size
 
     if side == "long":
-        tp = round(entry + tp_distance)  # Whole dollar — Hyperliquid BTC tick size = 1
+        tp1 = round(entry + tp1_distance)
+        tp = round(entry + tp_distance)
     else:
+        tp1 = round(entry - tp1_distance)
         tp = round(entry - tp_distance)
 
     # Open order
@@ -933,20 +939,38 @@ async def execute_trade(strategy: str, side: str, entry: float, atr_value: float
                         log.info("%s SL order CONFIRMED on exchange @ $%.0f: %s", strategy, sl, sl_result)
                         break
 
-                tp_result = await loop.run_in_executor(
+                # TP1: partial close (50%) at 4% profit
+                tp1_size = math.floor(size * PARTIAL_CLOSE_PCT * 100000) / 100000
+                tp1_result = await loop.run_in_executor(
                     None, lambda: hl_exchange.order(
-                        "BTC", is_buy=sl_side, sz=size, limit_px=tp,
+                        "BTC", is_buy=sl_side, sz=tp1_size, limit_px=tp1,
+                        order_type={"trigger": {"triggerPx": tp1, "isMarket": True, "tpsl": "tp"}},
+                        reduce_only=True,
+                    )
+                )
+                tp1_statuses = tp1_result.get("response", {}).get("data", {}).get("statuses", [])
+                tp1_errors = [s.get("error") for s in tp1_statuses if "error" in s]
+                if tp1_errors:
+                    log.error("%s TP1 order REJECTED @ $%.0f: %s", strategy, tp1, tp1_errors)
+                else:
+                    log.info("%s TP1 (50%%) order CONFIRMED @ $%.0f: %s", strategy, tp1, tp1_result)
+
+                # TP2: full close (remaining 50%) at 6% profit
+                tp2_size = math.floor(size * (1 - PARTIAL_CLOSE_PCT) * 100000) / 100000
+                tp2_result = await loop.run_in_executor(
+                    None, lambda: hl_exchange.order(
+                        "BTC", is_buy=sl_side, sz=tp2_size, limit_px=tp,
                         order_type={"trigger": {"triggerPx": tp, "isMarket": True, "tpsl": "tp"}},
                         reduce_only=True,
                     )
                 )
-                tp_statuses = tp_result.get("response", {}).get("data", {}).get("statuses", [])
-                tp_errors = [s.get("error") for s in tp_statuses if "error" in s]
-                if tp_errors:
-                    log.error("%s TP order REJECTED @ $%.0f: %s", strategy, tp, tp_errors)
+                tp2_statuses = tp2_result.get("response", {}).get("data", {}).get("statuses", [])
+                tp2_errors = [s.get("error") for s in tp2_statuses if "error" in s]
+                if tp2_errors:
+                    log.error("%s TP2 order REJECTED @ $%.0f: %s", strategy, tp, tp2_errors)
                 else:
                     tp_ok = True
-                    log.info("%s TP order CONFIRMED on exchange @ $%.0f: %s", strategy, tp, tp_result)
+                    log.info("%s TP2 (full close) order CONFIRMED @ $%.0f: %s", strategy, tp, tp2_result)
             except Exception as sl_exc:
                 log.error("%s — SL/TP order exception (position still open): %s", strategy, sl_exc)
 
@@ -979,12 +1003,13 @@ async def execute_trade(strategy: str, side: str, entry: float, atr_value: float
         "side": side,
         "entry": entry,
         "sl": sl,
+        "tp1": tp1,
         "tp": tp,
         "size": size,
         "margin": margin,
         "open_time": datetime.now(timezone.utc).isoformat(),
-        "be_moved": False,  # break-even not yet moved
-        "partial_closed": False,  # partial profit not yet taken
+        "be_moved": False,
+        "partial_closed": False,
         "regime": state.regime.value,
         "bias": f"{state.htf_bias} ({state.htf_bias_strength})",
     }
@@ -994,13 +1019,15 @@ async def execute_trade(strategy: str, side: str, entry: float, atr_value: float
 
     notional = size * entry
     dollar_risk = round(abs(entry - sl) * size, 2)
-    dollar_reward = round(abs(tp - entry) * size, 2)
+    dollar_tp1 = round(abs(tp1 - entry) * size, 2)
+    dollar_tp2 = round(abs(tp - entry) * size, 2)
     label = STRATEGY_LABELS.get(strategy, strategy)
     arrow = "\U0001f7e2" if side == "long" else "\U0001f534"
     msg = (
         f"{arrow} <b>{side.upper()}</b> — {label}\n"
-        f"Entry ${entry:,.2f} | SL ${sl:,.2f} | TP ${tp:,.2f}\n"
-        f"Size {size:.6f} BTC | Risk ${dollar_risk:.2f} | Reward ${dollar_reward:.2f}\n"
+        f"Entry ${entry:,.2f} | SL ${sl:,.2f}\n"
+        f"TP1 ${tp1:,.2f} (50% close, +${dollar_tp1:.2f}) | TP2 ${tp:,.2f} (full, +${dollar_tp2:.2f})\n"
+        f"Size {size:.6f} BTC | Max loss ${dollar_risk:.2f}\n"
         f"Regime: {state.regime.value} | Bias: {state.htf_bias} ({state.htf_bias_strength})\n"
         f"Trades today: {state.trades_today}/{MAX_TRADES_PER_DAY}"
     )
@@ -1671,9 +1698,9 @@ async def position_monitor_loop():
                     await close_position(name, price, "Take Profit")
                     continue
 
-                # 3. Break-even move: at +10% of margin (same as risk), move SL to entry
+                # 3. Break-even move: at 2% profit (same as risk), move SL to entry
                 margin = pos.get("margin", ACCOUNT_CAPITAL)
-                be_threshold = margin * RISK_PCT
+                be_threshold = margin * RISK_PCT  # 2% = $10
                 if not pos["be_moved"] and unrealized_pnl >= be_threshold:
                     pos["sl"] = entry
                     pos["be_moved"] = True
@@ -2957,7 +2984,7 @@ async def startup():
         f"BTC/USDC perp | {LEVERAGE}x leverage | ${ACCOUNT_CAPITAL:.0f} account\n\n"
         f"1\ufe0f\u20e3 TradingView Webhook | 2\ufe0f\u20e3 RSI Divergence\n"
         f"3\ufe0f\u20e3 BB Squeeze | 4\ufe0f\u20e3 VWAP Bounce\n"
-        f"10% risk | 20% partial | 30% TP | Max 4/day | -${ACCOUNT_CAPITAL * MAX_DAILY_LOSS_PCT:.0f} cap\n\n"
+        f"2% SL ($10) | 4% TP1 50% ($20) | 6% TP2 full ($30) | Max 4/day | -${ACCOUNT_CAPITAL * MAX_DAILY_LOSS_PCT:.0f} cap\n\n"
         f"Session: London 07-11 + NY 13-17 UTC\n"
         f"AI Market Brain: enabled"
     )
