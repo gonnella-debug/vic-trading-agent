@@ -1051,29 +1051,54 @@ async def close_position(strategy: str, exit_price: float, reason: str):
             log.error("%s — exchange not initialized, cannot close.", strategy)
             await tg_send(f"🚨 <b>{strategy}</b> close FAILED: Exchange not initialized. CHECK MANUALLY.")
             return
+        # Check if position actually exists on Hyperliquid before attempting close
+        has_btc = True  # Default to attempting close if check fails
         try:
             loop = asyncio.get_event_loop()
-            close_size = pos["size"]
-            result = await loop.run_in_executor(
-                None, lambda: hl_exchange.market_close("BTC", sz=close_size)
-            )
-            if result.get("status") != "ok":
-                raise Exception(f"Close rejected: {result}")
-            # Check inside response for per-order errors
-            statuses = (result.get("response", {}).get("data", {}).get("statuses", []))
-            for s in statuses:
-                if "error" in s:
-                    raise Exception(f"Close error: {s['error']}")
+            user_st = await loop.run_in_executor(None, lambda: hl_info.user_state(HL_WALLET_ADDRESS))
+            hl_positions = user_st.get("assetPositions", [])
+            has_btc = False
+            for p in hl_positions:
+                pd = p.get("position", {})
+                if pd.get("coin") == "BTC" and float(pd.get("szi", 0)) != 0:
+                    has_btc = True
+                    break
+            if not has_btc:
+                log.warning("%s — no BTC position found on Hyperliquid, clearing internal state.", strategy)
+                await tg_send(
+                    f"⚠️ <b>{strategy}</b> — Position already closed on Hyperliquid.\n"
+                    f"Clearing internal state. No action needed."
+                )
+                # Fall through to book PnL and clear position below
         except Exception as exc:
-            log.error("%s — close order error: %s", strategy, exc)
-            await tg_send(
-                f"🚨 <b>CRITICAL: {strategy} close order FAILED</b>\n\n"
-                f"Position is STILL OPEN on Hyperliquid but I tried to close it.\n"
-                f"Error: {sanitize_html(str(exc))}\n"
-                f"Side: {pos['side']} | Size: {pos['size']:.6f} BTC\n\n"
-                f"CHECK HYPERLIQUID MANUALLY."
-            )
-            return  # Do NOT mark position as closed
+            log.error("%s — failed to check Hyperliquid position state: %s", strategy, exc)
+            # Continue with close attempt anyway
+
+        if has_btc:
+            try:
+                close_size = pos["size"]
+                result = await loop.run_in_executor(
+                    None, lambda: hl_exchange.market_close("BTC", sz=close_size)
+                )
+                if result is None:
+                    raise Exception("market_close returned None")
+                if result.get("status") != "ok":
+                    raise Exception(f"Close rejected: {result}")
+                # Check inside response for per-order errors
+                statuses = (result.get("response", {}).get("data", {}).get("statuses", []))
+                for s in statuses:
+                    if "error" in s:
+                        raise Exception(f"Close error: {s['error']}")
+            except Exception as exc:
+                log.error("%s — close order error: %s", strategy, exc)
+                await tg_send(
+                    f"🚨 <b>CRITICAL: {strategy} close order FAILED</b>\n\n"
+                    f"Position is STILL OPEN on Hyperliquid but I tried to close it.\n"
+                    f"Error: {sanitize_html(str(exc))}\n"
+                    f"Side: {pos['side']} | Size: {pos['size']:.6f} BTC\n\n"
+                    f"CHECK HYPERLIQUID MANUALLY."
+                )
+                return  # Do NOT mark position as closed
 
     # Book PnL
     strat["daily_pnl"] = round(strat["daily_pnl"] + pnl, 2)
@@ -1657,6 +1682,8 @@ async def position_monitor_loop():
                                 result = await loop.run_in_executor(
                                     None, lambda: hl_exchange.market_close("BTC", sz=partial_amount)
                                 )
+                                if result is None:
+                                    raise Exception("market_close returned None")
                                 if result.get("status") != "ok":
                                     raise Exception(f"Partial close rejected: {result}")
                                 statuses = (result.get("response", {}).get("data", {}).get("statuses", []))
