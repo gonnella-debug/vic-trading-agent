@@ -71,7 +71,7 @@ CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
 # Constants
 # ---------------------------------------------------------------------------
 SYMBOL = "BTC"  # Hyperliquid native SDK uses coin name directly
-LEVERAGE = 5
+LEVERAGE = 10
 ACCOUNT_CAPITAL = 500.0       # total wallet balance
 RISK_PCT = 0.10               # 10% of margin = max SL risk
 PARTIAL_PROFIT_PCT = 0.20     # 20% of margin = partial close trigger
@@ -806,6 +806,18 @@ def can_execute_trade(strategy: str, side: str) -> tuple[bool, str]:
         if len(state.last_block_reasons) > 20:
             state.last_block_reasons.pop(0)
         return False, f"{strategy} already has an open position"
+
+    # 8. No opposite-side position open on ANY strategy?
+    opposite = "short" if side == "long" else "long"
+    for sname, sdata in state.strategies.items():
+        if sdata["position"] is not None and sdata["position"]["side"] == opposite:
+            reason = f"BLOCKED: {strategy} {side.upper()} — {sname} has open {opposite} position"
+            log.info(reason)
+            state.signals_blocked += 1
+            state.last_block_reasons.append(reason)
+            if len(state.last_block_reasons) > 20:
+                state.last_block_reasons.pop(0)
+            return False, f"Cannot open {side} while {sname} has {opposite} open"
 
     log.info("PASSED: %s %s — all checks OK", strategy, side.upper())
     return True, "OK"
@@ -2168,7 +2180,7 @@ async def telegram_polling_loop():
 
                     # Skip bot commands that aren't questions
                     if text.startswith("/start"):
-                        await tg_reply(chat_id, "Hey! I'm Vic, your BTC trading agent. Ask me anything about the market.\n\nCommands: /journal /metrics /regime /news /intelligence")
+                        await tg_reply(chat_id, "Hey! I'm Vic, your BTC trading agent. Ask me anything about the market.\n\nCommands: /journal /metrics /regime /news /intelligence /closeall")
                         continue
 
                     # Handle special commands before sending to Claude
@@ -2263,6 +2275,11 @@ async def telegram_polling_loop():
                                         f"Best:{t.get('best_session','?')}"
                                     )
                             await tg_reply(chat_id, "\n".join(lines))
+                        continue
+
+                    if text.strip().lower() == "/closeall":
+                        result = await close_all_positions()
+                        await tg_reply(chat_id, result)
                         continue
 
                     # Process the question with Claude
@@ -2966,6 +2983,61 @@ async def shutdown():
 
 
 # ---------------------------------------------------------------------------
+# Manual close all positions
+# ---------------------------------------------------------------------------
+
+async def close_all_positions() -> str:
+    """Close all open positions on Hyperliquid and clear internal state."""
+    closed = []
+    errors = []
+
+    # First close on exchange
+    if hl_exchange and hl_info:
+        try:
+            loop = asyncio.get_event_loop()
+            user_st = await loop.run_in_executor(None, lambda: hl_info.user_state(HL_WALLET_ADDRESS))
+            for p in user_st.get("assetPositions", []):
+                pd = p.get("position", {})
+                coin = pd.get("coin", "")
+                szi = float(pd.get("szi", 0))
+                if szi != 0:
+                    try:
+                        result = await loop.run_in_executor(
+                            None, lambda c=coin, s=abs(szi): hl_exchange.market_close(c, sz=s)
+                        )
+                        if result and result.get("status") == "ok":
+                            closed.append(f"{coin} {'long' if szi > 0 else 'short'} {abs(szi)}")
+                        else:
+                            errors.append(f"{coin}: {result}")
+                    except Exception as exc:
+                        errors.append(f"{coin}: {exc}")
+        except Exception as exc:
+            errors.append(f"Exchange query failed: {exc}")
+
+    # Clear all internal state positions
+    cleared_strategies = []
+    for name in STRATEGY_NAMES:
+        if state.strategies[name]["position"] is not None:
+            state.strategies[name]["position"] = None
+            cleared_strategies.append(name)
+
+    parts = ["🛑 <b>CLOSE ALL — Manual Override</b>\n"]
+    if closed:
+        parts.append(f"Closed on exchange: {', '.join(closed)}")
+    if cleared_strategies:
+        parts.append(f"Cleared internal state: {', '.join(cleared_strategies)}")
+    if errors:
+        parts.append(f"Errors: {', '.join(errors)}")
+    if not closed and not cleared_strategies:
+        parts.append("No positions to close.")
+
+    msg = "\n".join(parts)
+    await tg_send(msg)
+    log.info("CLOSE ALL executed — closed: %s, cleared: %s, errors: %s", closed, cleared_strategies, errors)
+    return msg
+
+
+# ---------------------------------------------------------------------------
 # API Endpoints
 # ---------------------------------------------------------------------------
 
@@ -3071,6 +3143,15 @@ async def resume_trading(token: str = Query("")):
     state.paused = False
     await tg_send("\u25b6\ufe0f Trading RESUMED by manual command.")
     return {"status": "resumed"}
+
+
+@app.post("/close_all")
+async def close_all_endpoint(token: str = Query("")):
+    """Close all open positions via HTTP."""
+    if token != WEBHOOK_SECRET:
+        return JSONResponse(status_code=403, content={"error": "Invalid token"})
+    result = await close_all_positions()
+    return {"status": "ok", "message": result}
 
 
 @app.get("/journal")
