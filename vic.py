@@ -3087,6 +3087,8 @@ async def full_status():
     return {
         "bot": "Vic",
         "mode": state.mode,
+        "leverage": LEVERAGE,
+        "account_capital": ACCOUNT_CAPITAL,
         "global_paused": state.paused,
         "regime": state.regime.value,
         "htf_bias": f"{state.htf_bias} ({state.htf_bias_strength})",
