@@ -71,7 +71,7 @@ CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
 # Constants
 # ---------------------------------------------------------------------------
 SYMBOL = "BTC"  # Hyperliquid native SDK uses coin name directly
-LEVERAGE = 10
+LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 ACCOUNT_CAPITAL = 500.0       # total wallet balance
 RISK_PCT = 0.10               # 10% of margin = max SL risk
 PARTIAL_PROFIT_PCT = 0.20     # 20% of margin = partial close trigger
