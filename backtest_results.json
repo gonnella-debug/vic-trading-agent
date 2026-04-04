@@ -1,0 +1,79 @@
+{
+  "run_date": "2026-04-01T11:19:27.783849+00:00",
+  "config": {
+    "symbol": "BTC-USDT-SWAP",
+    "months": 6,
+    "leverage": 5,
+    "capital_per_strategy": 200.0,
+    "risk_per_trade": 20.0,
+    "tp_per_trade": 60.0,
+    "max_daily_loss": 40.0
+  },
+  "data": {
+    "1m_candles": 259195,
+    "5m_candles": 51840,
+    "start_date": "2025-10-03 11:20:00+00:00",
+    "end_date": "2026-04-01 11:14:00+00:00"
+  },
+  "strategies": [
+    {
+      "strategy": "ema_crossover",
+      "total_trades": 93,
+      "win_rate": 22.6,
+      "avg_win": 58.9,
+      "avg_loss": -20.0,
+      "profit_factor": 0.86,
+      "max_drawdown": 540.0,
+      "total_pnl": -203.04,
+      "best_day": 120.0,
+      "worst_day": -40.0,
+      "sharpe_ratio": -0.77,
+      "final_capital": -3.04
+    },
+    {
+      "strategy": "rsi_divergence",
+      "total_trades": 83,
+      "win_rate": 31.3,
+      "avg_win": 60.0,
+      "avg_loss": -20.0,
+      "profit_factor": 1.37,
+      "max_drawdown": 160.0,
+      "total_pnl": 420.0,
+      "best_day": 120.0,
+      "worst_day": -40.0,
+      "sharpe_ratio": 1.46,
+      "final_capital": 620.0
+    },
+    {
+      "strategy": "vwap_bounce",
+      "total_trades": 73,
+      "win_rate": 28.8,
+      "avg_win": 57.22,
+      "avg_loss": -20.0,
+      "profit_factor": 1.16,
+      "max_drawdown": 220.0,
+      "total_pnl": 161.62,
+      "best_day": 60.0,
+      "worst_day": -40.0,
+      "sharpe_ratio": 0.63,
+      "final_capital": 361.62
+    },
+    {
+      "strategy": "bb_squeeze",
+      "total_trades": 98,
+      "win_rate": 29.6,
+      "avg_win": 58.63,
+      "avg_loss": -20.0,
+      "profit_factor": 1.23,
+      "max_drawdown": 180.0,
+      "total_pnl": 320.2,
+      "best_day": 100.0,
+      "worst_day": -40.0,
+      "sharpe_ratio": 1.16,
+      "final_capital": 520.2
+    }
+  ],
+  "total_pnl": 698.78,
+  "total_trades": 347,
+  "telegram_message": "<b>VIC BACKTEST RESULTS</b>\nBTC/USDT Perp | 5x | 6mo\n$200/strategy | $20 risk | 1:3 R/R\n\n2\ufe0f\u20e3 <b>ema_crossover</b>\n   93 trades | 22.6% win | PF 0.86x\n   \ud83d\udcb8 PnL: <b>$-203.04</b> | DD: $540.00\n3\ufe0f\u20e3 <b>rsi_divergence</b>\n   83 trades | 31.3% win | PF 1.37x\n   \ud83d\udcb0 PnL: <b>$+420.00</b> | DD: $160.00\n4\ufe0f\u20e3 <b>vwap_bounce</b>\n   73 trades | 28.8% win | PF 1.16x\n   \ud83d\udcb0 PnL: <b>$+161.62</b> | DD: $220.00\n5\ufe0f\u20e3 <b>bb_squeeze</b>\n   98 trades | 29.6% win | PF 1.23x\n   \ud83d\udcb0 PnL: <b>$+320.20</b> | DD: $180.00\n\n<b>TOTAL:</b> 347 trades | \ud83d\udcb0 <b>$+698.78</b>\n\n<b>Best:</b> rsi_divergence ($+420.00)\n<b>Worst:</b> ema_crossover ($-203.04)"
+}
