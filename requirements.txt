@@ -6,4 +6,3 @@ pandas>=2.2.3
 numpy>=1.26.4
 ta==0.11.0
 eth-account>=0.11.0
-tradingview-ta>=3.3.0
