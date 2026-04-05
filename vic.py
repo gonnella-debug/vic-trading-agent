@@ -621,7 +621,10 @@ def vwap_chop_filter(df: pd.DataFrame, vwap_series: pd.Series) -> bool:
 
 def is_trading_session() -> bool:
     """Check if current UTC hour is within London or NY open sessions."""
-    hour = datetime.now(timezone.utc).hour
+    now = datetime.now(timezone.utc)
+    if now.weekday() >= 5:
+        return False
+    hour = now.hour
     for start, end in TRADING_SESSIONS:
         if start <= hour < end:
             return True
@@ -677,7 +680,7 @@ def regime_allows_strategy(strategy: str) -> bool:
     if state.regime == Regime.TRENDING:
         return strategy in ("vwap_bounce", "bb_squeeze", "tv_webhook")
     if state.regime == Regime.RANGING:
-        return strategy in ("rsi_divergence", "vwap_bounce", "tv_webhook")
+        return strategy in ("rsi_divergence", "vwap_bounce")
     if state.regime == Regime.TRANSITIONAL:
         return strategy in ("rsi_divergence", "tv_webhook")
     return False
@@ -1229,6 +1232,17 @@ async def close_position(strategy: str, exit_price: float, reason: str):
         await tg_send(alert)
         log.warning(alert.replace("<b>", "").replace("</b>", ""))
 
+    # Check aggregate losing streak across all strategies
+    total_losing_streak = sum(state.metrics[n]["current_losing_streak"] for n in STRATEGY_NAMES)
+    if total_losing_streak >= 3 and not state.daily_loss_cap_hit:
+        state.daily_loss_cap_hit = True
+        alert = (
+            f"\U0001f6d1 <b>3 consecutive losses — trading paused for today</b>\n"
+            f"Aggregate losing streak: {total_losing_streak} | Daily PnL: ${state.daily_pnl:+,.2f}"
+        )
+        await tg_send(alert)
+        log.warning(alert.replace("<b>", "").replace("</b>", ""))
+
     # Paper test milestone check (Change 16)
     if state.mode == "paper" and state.total_trade_count >= PAPER_TEST_MIN_TRADES:
         await send_paper_test_report()
@@ -1308,14 +1322,14 @@ async def strategy_tv_scanner():
     # Determine direction
     if rec_5m == "STRONG_BUY":
         side = "long"
-        # 1h must agree — not SELL or STRONG_SELL
-        if rec_1h in ("SELL", "STRONG_SELL"):
+        # 1h must confirm — BUY or STRONG_BUY only
+        if rec_1h not in ("BUY", "STRONG_BUY"):
             log.info("tv_scanner — 5m STRONG_BUY but 1h says %s, skipping", rec_1h)
             return
     else:  # STRONG_SELL
         side = "short"
-        # 1h must agree — not BUY or STRONG_BUY
-        if rec_1h in ("BUY", "STRONG_BUY"):
+        # 1h must confirm — SELL or STRONG_SELL only
+        if rec_1h not in ("SELL", "STRONG_SELL"):
             log.info("tv_scanner — 5m STRONG_SELL but 1h says %s, skipping", rec_1h)
             return
 
