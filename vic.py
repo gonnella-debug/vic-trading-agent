@@ -74,7 +74,7 @@ CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
 # Constants
 # ---------------------------------------------------------------------------
 SYMBOL = "BTC"
-LEVERAGE = 5  # Dropped from 10x to 5x
+LEVERAGE = 10
 ACCOUNT_CAPITAL = 500.0
 RISK_DOLLARS = 10.0           # $10 max loss per trade (2% of $500)
 MAX_DAILY_LOSS_PCT = 0.10     # 10% of account = $50 daily loss cap
@@ -2120,14 +2120,37 @@ async def position_monitor_loop():
                         old_size = pos["size"]
                         new_size = math.floor(old_size * (1 - PARTIAL_CLOSE_SIZE) * 100000) / 100000
                         if state.mode == "live":
+                            # Verify position actually exists on Hyperliquid before partial close
+                            try:
+                                loop = asyncio.get_event_loop()
+                                user_st = await loop.run_in_executor(
+                                    None, lambda: hl_info.user_state(HL_WALLET_ADDRESS)
+                                )
+                                hl_positions = user_st.get("assetPositions", [])
+                                hl_has_btc = False
+                                for p in hl_positions:
+                                    pd_pos = p.get("position", {})
+                                    if pd_pos.get("coin") == "BTC" and float(pd_pos.get("szi", 0)) != 0:
+                                        hl_has_btc = True
+                                        break
+                                if not hl_has_btc:
+                                    log.warning("%s -- position gone from Hyperliquid (exchange TP/SL fired). Clearing internal state.", name)
+                                    await tg_send(
+                                        f"ℹ️ <b>{name}</b> -- Position already closed on Hyperliquid "
+                                        f"(exchange-level TP/SL triggered). Clearing internal state."
+                                    )
+                                    state.strategies[name]["position"] = None
+                                    continue
+                            except Exception as exc:
+                                log.error("%s -- failed to verify position on Hyperliquid: %s", name, exc)
+
                             try:
                                 partial_amount = math.floor(old_size * PARTIAL_CLOSE_SIZE * 100000) / 100000
-                                loop = asyncio.get_event_loop()
                                 result = await loop.run_in_executor(
                                     None, lambda: hl_exchange.market_close("BTC", sz=partial_amount)
                                 )
                                 if result is None:
-                                    raise Exception("market_close returned None")
+                                    raise Exception("market_close returned None -- position may not exist on exchange")
                                 if result.get("status") != "ok":
                                     raise Exception(f"Partial close rejected: {result}")
                                 statuses = (result.get("response", {}).get("data", {}).get("statuses", []))
@@ -2139,8 +2162,9 @@ async def position_monitor_loop():
                                 await tg_send(
                                     f"\U0001f6a8 <b>{name} partial close FAILED</b>\n"
                                     f"Error: {sanitize_html(str(exc))}\n"
-                                    f"Position size unchanged. CHECK HYPERLIQUID."
+                                    f"Clearing internal state to stop retries."
                                 )
+                                state.strategies[name]["position"] = None
                                 continue
                         pos["size"] = new_size
                         pos["partial_closed"] = True
