@@ -2747,13 +2747,8 @@ async def backtest_scheduler():
             bt_results = await run_backtest()
             state.backtest_results = bt_results
 
-            # Update active strategies
-            new_active = []
-            for name in STRATEGY_NAMES:
-                bt = bt_results.get(name, {})
-                if bt.get("win_rate", 0) >= BACKTEST_MIN_WIN_RATE or bt.get("note"):
-                    new_active.append(name)
-            state.active_strategies = new_active
+            # All 5 always active — backtest is for reporting, not gating
+            state.active_strategies = list(STRATEGY_NAMES)
             save_state()
 
             bt_msg = ["\U0001f4ca <b>NIGHTLY BACKTEST (30 days)</b>\n"]
@@ -2761,7 +2756,7 @@ async def backtest_scheduler():
                 bt = bt_results.get(name, {})
                 wr = bt.get("win_rate", 0) * 100
                 total = bt.get("total_trades", 0)
-                passed = "\u2705" if name in new_active else "\u274c"
+                passed = "\u2705" if bt.get("win_rate", 0) >= BACKTEST_MIN_WIN_RATE or bt.get("note") else "\u26a0\ufe0f"
                 bt_msg.append(f"  {passed} <b>{name}</b>: {total} trades | WR {wr:.1f}%")
             bt_msg.append(f"\n<b>Active:</b> {', '.join(new_active)}")
             await tg_send("\n".join(bt_msg))
@@ -2807,12 +2802,7 @@ async def send_sunday_report():
             passed = "PASS" if bt.get("win_rate", 0) >= BACKTEST_MIN_WIN_RATE or bt.get("note") else "FAIL"
             lines.append(f"  <b>{name}</b>: {total} trades | WR {wr:.1f}% [{passed}]")
 
-        new_active = []
-        for name in STRATEGY_NAMES:
-            bt = bt_results.get(name, {})
-            if bt.get("win_rate", 0) >= BACKTEST_MIN_WIN_RATE or bt.get("note"):
-                new_active.append(name)
-        state.active_strategies = new_active
+        state.active_strategies = list(STRATEGY_NAMES)
         state.backtest_results = bt_results
         save_state()
     except Exception as exc:
@@ -3798,16 +3788,15 @@ async def startup():
         bt_results = await run_backtest()
         state.backtest_results = bt_results
 
-        active = []
+        # ALL 5 strategies active from day 1 — backtest is for reporting only, not gating
+        active = list(STRATEGY_NAMES)
         bt_lines = ["\U0001f4ca <b>BACKTEST RESULTS (30 days)</b>\n"]
         for name in STRATEGY_NAMES:
             bt = bt_results.get(name, {})
             wr = bt.get("win_rate", 0)
             total = bt.get("total_trades", 0)
             passed = wr >= BACKTEST_MIN_WIN_RATE or bt.get("note")
-            if passed:
-                active.append(name)
-            status = "\u2705 PASS" if passed else "\u274c FAIL"
+            status = "\u2705 PASS" if passed else "\u26a0\ufe0f WATCH"
             bt_lines.append(
                 f"  <b>{name}</b>: {total} trades | WR {wr*100:.1f}% [{status}]"
             )
