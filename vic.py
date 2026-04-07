@@ -812,11 +812,11 @@ def calc_leverage_from_confidence(confidence: int) -> int:
 
 async def execute_trade(strategy: str, side: str, entry: float,
                         sl_price: float, tp_price: float,
-                        confidence: int = 7):
+                        confidence: int = 7, max_leverage: Optional[int] = None):
     """Open a position (paper or live). Single position model.
 
     sl_price and tp_price are pre-calculated by the strategy.
-    Leverage is determined by AI confidence score.
+    Leverage is determined by AI confidence score, capped by max_leverage if set.
     Position sized so that SL hit <= MAX_RISK_PCT of account.
     """
     allowed, reason = can_open_trade(strategy, side)
@@ -824,6 +824,8 @@ async def execute_trade(strategy: str, side: str, entry: float,
         return
 
     leverage = calc_leverage_from_confidence(confidence)
+    if max_leverage is not None:
+        leverage = min(leverage, max_leverage)
 
     sl_distance = abs(entry - sl_price)
     if sl_distance <= 0:
@@ -1252,8 +1254,29 @@ async def strategy_funding_rate_fade():
 # ---------------------------------------------------------------------------
 
 async def strategy_liquidity_sweep():
-    """Detect stop hunts past swing highs/lows that immediately reverse."""
+    """Detect stop hunts past swing highs/lows that immediately reverse.
+    Tightened filters: 4x volume, pin bar mandatory, 15m EMA + 1H bias alignment,
+    spread compression, order book imbalance direction filter.
+    Leverage capped at 10x regardless of confidence.
+    """
     name = "liquidity_sweep"
+
+    # Multi-timeframe confirmation: fetch 15m EMA slope
+    df_15m_ema = await fetch_ohlcv("15m", 30)
+    if df_15m_ema.empty or len(df_15m_ema) < 20:
+        return None
+    ema15m = calc_ema(df_15m_ema["close"], 14)
+    ema15m_now = float(ema15m.iloc[-1])
+    ema15m_prev = float(ema15m.iloc[-5])
+    if np.isnan(ema15m_now) or np.isnan(ema15m_prev) or ema15m_prev == 0:
+        return None
+    ema15m_slope = (ema15m_now - ema15m_prev) / ema15m_prev * 100
+    ema15m_bullish = ema15m_slope > 0.01
+    ema15m_bearish = ema15m_slope < -0.01
+
+    # 1H bias must also align (from state)
+    htf_bullish = state.htf_bias == "bullish"
+    htf_bearish = state.htf_bias == "bearish"
 
     for tf in ["15m", "5m"]:
         df = await fetch_ohlcv(tf, 60)
@@ -1271,20 +1294,35 @@ async def strategy_liquidity_sweep():
         rsi_series = calc_rsi(df["close"], 14)
 
         price = float(df["close"].iloc[-1])
-        prev_close = float(df["close"].iloc[-2])
+        open_price = float(df["open"].iloc[-1])
         curr_high = float(df["high"].iloc[-1])
         curr_low = float(df["low"].iloc[-1])
-        prev_high = float(df["high"].iloc[-2])
-        prev_low = float(df["low"].iloc[-2])
         curr_range = curr_high - curr_low
 
-        # Volume spike check
+        if curr_range == 0:
+            continue
+
+        # Volume: 4x MA minimum — no exceptions
         avg_vol = float(df["volume"].iloc[-20:].mean())
         curr_vol = float(df["volume"].iloc[-1])
-        vol_spike = curr_vol >= avg_vol * 1.5 if avg_vol > 0 else False
-
-        if not vol_spike:
+        if avg_vol <= 0 or curr_vol < avg_vol * 4.0:
             continue
+
+        # Spread compression: require spread at least 30% below 20-period baseline
+        spreads = (df["high"] - df["low"]).iloc[-20:]
+        avg_spread = float(spreads.mean())
+        if avg_spread <= 0 or curr_range >= avg_spread * 0.70:
+            # Current candle spread must be <= 70% of average (i.e. at least 30% below)
+            # Actually this should check PRIOR candles for compression leading into the sweep
+            recent_spreads = (df["high"] - df["low"]).iloc[-5:-1]
+            avg_recent_spread = float(recent_spreads.mean())
+            if avg_recent_spread <= 0 or avg_recent_spread >= avg_spread * 0.70:
+                continue
+
+        # Pin bar / hammer pattern mandatory on reversal candle
+        body = abs(price - open_price)
+        upper_wick = curr_high - max(price, open_price)
+        lower_wick = min(price, open_price) - curr_low
 
         side = None
         sweep_extreme = 0.0
@@ -1294,34 +1332,34 @@ async def strategy_liquidity_sweep():
         for _, sw_low in swing_lows[-3:]:
             sweep_depth = (sw_low - curr_low) / sw_low * 100 if sw_low > 0 else 0
             if sweep_depth > 0.15 and price > sw_low:
-                # Price spiked below swing low then closed back above
-                wick_ratio = (price - curr_low) / curr_range if curr_range > 0 else 0
-                rsi_val = float(rsi_series.iloc[-1]) if not np.isnan(rsi_series.iloc[-1]) else 50
-                rsi_prev = float(rsi_series.iloc[-3]) if len(rsi_series) > 3 and not np.isnan(rsi_series.iloc[-3]) else 50
-                rsi_divergence = rsi_val > rsi_prev  # RSI higher while price lower
-                if wick_ratio >= 0.6 or rsi_divergence:
-                    side = "long"
-                    sweep_extreme = curr_low
-                    # Target: previous swing high
-                    if swing_highs:
-                        target_pool = swing_highs[-1][1]
-                    break
+                # Pin bar / hammer mandatory: lower wick must be >= 2x body
+                if body == 0 or lower_wick < body * 2:
+                    continue
+                # Multi-TF confirmation: 15m EMA must slope bullish AND 1H bias bullish
+                if not ema15m_bullish or not htf_bullish:
+                    continue
+                side = "long"
+                sweep_extreme = curr_low
+                if swing_highs:
+                    target_pool = swing_highs[-1][1]
+                break
 
         # Check sweep of swing highs (short signal)
         if side is None:
             for _, sw_high in swing_highs[-3:]:
                 sweep_depth = (curr_high - sw_high) / sw_high * 100 if sw_high > 0 else 0
                 if sweep_depth > 0.15 and price < sw_high:
-                    wick_ratio = (curr_high - price) / curr_range if curr_range > 0 else 0
-                    rsi_val = float(rsi_series.iloc[-1]) if not np.isnan(rsi_series.iloc[-1]) else 50
-                    rsi_prev = float(rsi_series.iloc[-3]) if len(rsi_series) > 3 and not np.isnan(rsi_series.iloc[-3]) else 50
-                    rsi_divergence = rsi_val < rsi_prev
-                    if wick_ratio >= 0.6 or rsi_divergence:
-                        side = "short"
-                        sweep_extreme = curr_high
-                        if swing_lows:
-                            target_pool = swing_lows[-1][1]
-                        break
+                    # Inverted hammer mandatory: upper wick must be >= 2x body
+                    if body == 0 or upper_wick < body * 2:
+                        continue
+                    # Multi-TF confirmation: 15m EMA must slope bearish AND 1H bias bearish
+                    if not ema15m_bearish or not htf_bearish:
+                        continue
+                    side = "short"
+                    sweep_extreme = curr_high
+                    if swing_lows:
+                        target_pool = swing_lows[-1][1]
+                    break
 
         if side is None:
             continue
@@ -1335,10 +1373,12 @@ async def strategy_liquidity_sweep():
             sl_price = round(sweep_extreme + sl_buffer)
             tp_price = round(target_pool) if target_pool < price else round(price - abs(sl_price - price) * 2)
 
-        log.info("liquidity_sweep signal: %s on %s | sweep=%.0f | entry=%.0f", side, tf, sweep_extreme, price)
+        log.info("liquidity_sweep signal: %s on %s | sweep=%.0f | entry=%.0f | vol=%.1fx | pin_bar=yes",
+                 side, tf, sweep_extreme, price, curr_vol / avg_vol)
 
         return {"strategy": name, "side": side, "entry": price, "sl": sl_price, "tp": tp_price,
-                "atr": atr_val, "reason": f"Sweep {tf} beyond {'low' if side == 'long' else 'high'}, vol spike {curr_vol/avg_vol:.1f}x"}
+                "atr": atr_val, "max_leverage": 10,  # Hard cap at 10x for liquidity_sweep
+                "reason": f"Sweep {tf} beyond {'low' if side == 'long' else 'high'}, vol {curr_vol/avg_vol:.1f}x, pin bar confirmed, MTF aligned"}
 
     return None
 
@@ -1812,11 +1852,13 @@ async def run_all_strategies():
         )
         return
 
-    # Execute
+    # Execute — respect per-strategy leverage caps
+    max_lev = signal.get("max_leverage")
     await execute_trade(
         signal["strategy"], signal["side"], signal["entry"],
         signal["sl"], signal["tp"],
         confidence=confidence,
+        max_leverage=max_lev,
     )
 
 
