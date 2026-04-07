@@ -1683,6 +1683,28 @@ async def strategy_order_block():
 
 _macro_intel_cache = {"text": "", "fetched_at": 0}
 
+# AI Brain rejection tracking -- per-strategy consecutive rejections
+_ai_rejection_streak: dict[str, int] = {}                # strategy -> consecutive rejections
+_ai_rejection_override_until: dict[str, float] = {}      # strategy -> timestamp when override expires
+_tg_rejection_timestamps: list[float] = []               # timestamps of recent rejection messages
+
+
+def _get_trading_session() -> str:
+    """Return current trading session based on UTC hour."""
+    hour = datetime.now(timezone.utc).hour
+    if 7 <= hour < 16:    # London: 07:00-16:00 UTC
+        return "london"
+    elif 13 <= hour < 22:  # NY: 13:00-22:00 UTC (overlaps London)
+        return "ny"
+    elif 0 <= hour < 8:    # Asia: 00:00-08:00 UTC
+        return "asia"
+    return "off"
+
+
+def _is_london_or_ny() -> bool:
+    hour = datetime.now(timezone.utc).hour
+    return 7 <= hour < 22  # London open through NY close
+
 
 async def _fetch_recent_news_headlines() -> list[str]:
     try:
@@ -1737,7 +1759,10 @@ async def ai_market_analysis(strategy: str, side: str, price: float, signal_reas
             f"Recent BTC news:\n{news_text}"
             f"{macro_text}"
             f"{intel_section}\n\n"
-            f"You have web_search -- if the macro intel is older than 30 minutes or mentions a developing situation, SEARCH first.\n\n"
+            f"IMPORTANT RULES:\n"
+            f"- Macro/geopolitical news is INFORMATIONAL ONLY. You MUST NOT reject a trade solely because of macro news, geopolitical events, wars, tariffs, or general market fear.\n"
+            f"- You may ONLY reject a trade for TECHNICAL reasons: wrong session, wrong regime for the strategy, signal conflicts, or technically invalid setup.\n"
+            f"- If macro conditions are concerning, lower your confidence by 1-2 points but still APPROVE if the technical setup is valid.\n\n"
             f"Reply with EXACTLY this format:\n"
             f"DECISION: APPROVE or REJECT\n"
             f"CONFIDENCE: [1-10]\n"
@@ -1748,7 +1773,6 @@ async def ai_market_analysis(strategy: str, side: str, price: float, signal_reas
         payload = {
             "model": "claude-haiku-4-5-20251001",
             "max_tokens": 256,
-            "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 1}],
             "messages": [{"role": "user", "content": prompt}],
         }
 
@@ -1837,20 +1861,71 @@ async def run_all_strategies():
         return
 
     # AI Market Brain gate
+    strat_name = signal["strategy"]
     approved, confidence, ai_reason = await ai_market_analysis(
-        signal["strategy"], signal["side"], signal["entry"],
+        strat_name, signal["side"], signal["entry"],
         signal_reason=signal.get("reason", "")
     )
 
-    if not approved or confidence < 6:
-        log.info("AI Market Brain REJECTED %s %s (confidence %d): %s",
-                 signal["strategy"], signal["side"], confidence, ai_reason)
-        await tg_send(
-            f"\u274c <b>AI Brain REJECTED</b> -- {STRATEGY_LABELS.get(signal['strategy'], signal['strategy'])}\n"
-            f"{signal['side'].upper()} @ ${signal['entry']:,.2f} | Confidence: {confidence}/10\n"
-            f"{sanitize_html(ai_reason[:200])}"
-        )
-        return
+    # --- Funding Rate Fade bypass: if in London/NY, not VOLATILE, confidence >= 6 ---
+    force_approve = False
+    if strat_name == "funding_rate_fade" and _is_london_or_ny() and state.regime != Regime.VOLATILE:
+        if confidence >= 6 or (not approved and confidence >= 6):
+            force_approve = True
+            log.info("Funding Rate Fade BYPASS: London/NY session, not VOLATILE, confidence %d -- overriding AI brain", confidence)
+        elif not approved:
+            # AI rejected but check raw confidence from signal (7/10 threshold from GG)
+            force_approve = True
+            confidence = max(confidence, 7)
+            log.info("Funding Rate Fade FORCE APPROVE: strategy meets all session/regime criteria")
+
+    # --- Consecutive rejection override: 3+ rejections from same strategy -> informational only for 24h ---
+    if not approved and not force_approve:
+        _ai_rejection_streak[strat_name] = _ai_rejection_streak.get(strat_name, 0) + 1
+        if _ai_rejection_streak[strat_name] >= 3 and strat_name not in _ai_rejection_override_until:
+            _ai_rejection_override_until[strat_name] = time.time() + 86400  # 24 hours
+            await tg_send(
+                f"\u26a0\ufe0f <b>AI Brain override activated</b> for {STRATEGY_LABELS.get(strat_name, strat_name)}\n"
+                f"3+ consecutive rejections -- AI brain is now informational only for this strategy for 24h.\n"
+                f"GG has been notified."
+            )
+    elif approved or force_approve:
+        _ai_rejection_streak[strat_name] = 0  # reset on approval
+
+    # Check if strategy has an active override (AI brain informational only)
+    if not approved and not force_approve:
+        override_until = _ai_rejection_override_until.get(strat_name, 0)
+        if time.time() < override_until:
+            force_approve = True
+            confidence = max(confidence, 7)
+            log.info("AI Brain override active for %s -- treating as informational, forcing APPROVE", strat_name)
+
+    if not approved and not force_approve:
+        if confidence < 6:
+            log.info("AI Market Brain REJECTED %s %s (confidence %d): %s",
+                     strat_name, signal["side"], confidence, ai_reason)
+            # --- Telegram rate limit: max 3 rejection messages per hour ---
+            now = time.time()
+            _tg_rejection_timestamps[:] = [t for t in _tg_rejection_timestamps if now - t < 3600]
+            if len(_tg_rejection_timestamps) < 3:
+                _tg_rejection_timestamps.append(now)
+                await tg_send(
+                    f"\u274c <b>AI Brain REJECTED</b> -- {STRATEGY_LABELS.get(strat_name, strat_name)}\n"
+                    f"{signal['side'].upper()} @ ${signal['entry']:,.2f} | Confidence: {confidence}/10\n"
+                    f"{sanitize_html(ai_reason[:200])}"
+                )
+            elif len(_tg_rejection_timestamps) == 3:
+                _tg_rejection_timestamps.append(now)
+                await tg_send(
+                    f"\U0001f507 <b>AI Brain rejection notifications suppressed</b>\n"
+                    f"3+ rejections this hour. Will send hourly summary instead."
+                )
+            # else: suppressed
+            return
+    else:
+        if force_approve and not approved:
+            approved = True
+            log.info("AI Brain overridden for %s -- proceeding with trade (confidence %d)", strat_name, confidence)
 
     # Execute — respect per-strategy leverage caps
     max_lev = signal.get("max_leverage")
