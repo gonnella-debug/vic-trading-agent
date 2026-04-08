@@ -1,22 +1,23 @@
 """
-Vic -- BTC/USDT Perpetual Futures Trading Agent (v5)
-Runs 5 strategies on Hyperliquid via native SDK.
-$500 account, dynamic leverage (10x minimum). Production-ready for Railway.
+Vic -- BTC/USDT Perpetual Futures Trading Agent (v6)
+Runs 50 strategies on Hyperliquid via native SDK.
+$370 account, dynamic leverage (10x minimum). Production-ready for Railway.
 
-Strategies (all active from day 1, backtested daily):
-  1. Funding Rate Fade -- Extreme funding rate reversal on 1H
-  2. Liquidity Sweep Reversal -- Stop hunt reversal on 5m/15m
-  3. EMA Trend Pullback -- Trend pullback to 21/50 EMA on 1H
-  4. VWAP Reclaim -- VWAP reclaim with conviction on 5m/15m
-  5. Order Block Entry -- OB + FVG reversal on 15m/1H
+Research-first approach:
+  - Starts PAUSED in research phase
+  - Downloads 90 days of data (1m, 5m, 15m, 1h)
+  - Backtests all 50 strategies with strict PASS criteria
+  - Only activates passing strategies
+  - Re-evaluates nightly
 
 Core rules:
   - ONE position at a time across all strategies
   - Every trade has a stop loss (ATR-based, intelligent early exit)
-  - Max 10% account risk per trade (hard ceiling, target 3-5%)
-  - 3 losing trades per day = all trading stops
-  - No trading in VOLATILE regime
-  - AI Market Brain confidence gate (score 1-10, below 6 = reject)
+  - Max 4 trades per day
+  - 2% account risk per trade
+  - Sessions only: London (07:00-11:00 UTC) and NY (13:00-17:00 UTC)
+  - No weekends (Saturday/Sunday)
+  - AI Market Brain confidence gate (score 1-10, 6+ = informational only)
   - Dynamic leverage: 10x base, scales with confidence
 
 Regime filter: TRENDING / RANGING / TRANSITIONAL / VOLATILE
@@ -24,7 +25,7 @@ Regime filter: TRENDING / RANGING / TRANSITIONAL / VOLATILE
 AI Market Brain: Claude pre-trade analysis with confidence scoring
 Trade Journal: /data/vic_journal.json (persistent)
 State Persistence: /data/vic_state.json (survives restarts)
-Backtest Engine: 30-day rolling backtest daily at midnight UTC
+Backtest Engine: 90-day rolling backtest daily at midnight UTC
 Intelligence: Top trader scan every 6h -> /data/hl_intelligence.json
 Daily Self-Review: 17:00 UTC, proposes parameter changes, requires GG approval
 
@@ -42,6 +43,7 @@ import logging
 import time
 import math
 import random
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from enum import Enum
@@ -84,75 +86,26 @@ CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
 # ---------------------------------------------------------------------------
 SYMBOL = "BTC"
 BASE_LEVERAGE = 10
-ACCOUNT_CAPITAL = 500.0
+ACCOUNT_CAPITAL = 370.0
 MAX_RISK_PCT = 0.10               # 10% hard ceiling per trade
-TARGET_RISK_PCT = 0.04            # 3-5% target risk per trade
+TARGET_RISK_PCT = 0.02            # 2% target risk per trade
+MAX_TRADES_PER_DAY = 4            # Max 4 trades per day
 MAX_LOSSES_PER_DAY = 3            # 3 losing trades = stop for the day
-
-# Strategy definitions
-# Active strategies only -- deactivated strategies kept in ALL_STRATEGY_NAMES for reference/backtest
-STRATEGY_NAMES = [
-    "funding_rate_fade",
-    "vwap_reclaim",
-]
-
-# All strategies including deactivated (for metrics display, backtest re-evaluation)
-ALL_STRATEGY_NAMES = [
-    "funding_rate_fade",
-    "liquidity_sweep",
-    "ema_trend_pullback",
-    "vwap_reclaim",
-    "order_block",
-]
-
-STRATEGY_LABELS = {
-    "funding_rate_fade": "1\ufe0f\u20e3 Funding Rate Fade",
-    "liquidity_sweep": "2\ufe0f\u20e3 Liquidity Sweep",
-    "ema_trend_pullback": "3\ufe0f\u20e3 EMA Trend Pullback",
-    "vwap_reclaim": "4\ufe0f\u20e3 VWAP Reclaim",
-    "order_block": "5\ufe0f\u20e3 Order Block",
-}
-
-# ATR multiplier for initial SL per strategy
-STRATEGY_ATR_SL = {
-    "funding_rate_fade": 1.5,
-    "liquidity_sweep": 0.0,       # SL set by sweep extreme, not ATR
-    "ema_trend_pullback": 1.5,
-    "vwap_reclaim": 1.0,
-    "order_block": 0.0,           # SL set by OB edge, not ATR
-}
-
-# Minimum R:R per strategy
-STRATEGY_MIN_RR = {
-    "funding_rate_fade": 2.5,
-    "liquidity_sweep": 1.5,       # TP is opposing pool, RR varies
-    "ema_trend_pullback": 1.5,
-    "vwap_reclaim": 2.0,
-    "order_block": 1.5,
-}
-
-# Max hold time in minutes
-STRATEGY_MAX_HOLD = {
-    "funding_rate_fade": 480,     # 8 hours
-    "liquidity_sweep": 240,       # 4 hours
-    "ema_trend_pullback": 720,    # 12 hours
-    "vwap_reclaim": 180,          # 3 hours
-    "order_block": 480,           # 8 hours
-}
 
 # Persistence files
 JOURNAL_FILE = os.getenv("JOURNAL_FILE", "/data/vic_journal.json")
 STATE_FILE = os.getenv("STATE_FILE", "/data/vic_state.json")
 BACKTEST_FILE = os.getenv("BACKTEST_FILE", "/data/vic_backtest.json")
+FAILED_STRATEGIES_FILE = os.getenv("FAILED_STRATEGIES_FILE", "/data/failed_strategies.json")
 INTELLIGENCE_FILE = os.getenv("INTELLIGENCE_FILE", "/data/hl_intelligence.json")
 REVIEW_FILE = os.getenv("REVIEW_FILE", "/data/vic_review.json")
 
 # Underperformance auto-pause thresholds
-UNDERPERFORMANCE_MIN_TRADES = 15
+UNDERPERFORMANCE_MIN_TRADES = 20
 UNDERPERFORMANCE_WR_THRESHOLD = 0.40
 
 # Backtest minimum win rate
-BACKTEST_MIN_WIN_RATE = 0.50
+BACKTEST_MIN_WIN_RATE = 0.55
 
 # Funding rate extremes (percentile thresholds)
 FUNDING_EXTREME_PCT = 10  # top/bottom 10%
@@ -170,7 +123,7 @@ class Regime(str, Enum):
 # ---------------------------------------------------------------------------
 # App & state
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Vic Trading Agent", version="5.1.0")
+app = FastAPI(title="Vic Trading Agent", version="6.0.0")
 
 hl_info: Optional[Info] = None
 hl_exchange: Optional[HLExchange] = None
@@ -181,7 +134,8 @@ class TradingState:
 
     def __init__(self):
         self.mode: str = TRADING_MODE
-        self.paused: bool = False
+        self.paused: bool = True  # Start paused for research phase
+        self.research_complete: bool = False
         self.last_btc_price: float = 0.0
         self.regime: Regime = Regime.RANGING
         self.htf_bias: str = "neutral"
@@ -202,20 +156,8 @@ class TradingState:
         self.daily_pnl: float = 0.0
         self.daily_loss_cap_hit: bool = False
 
-        # Metrics tracking per strategy
+        # Metrics tracking per strategy (dynamic -- populated after backtest)
         self.metrics: dict = {}
-        for name in ALL_STRATEGY_NAMES:
-            self.metrics[name] = {
-                "wins": 0,
-                "losses": 0,
-                "total_r_achieved": 0.0,
-                "trade_count": 0,
-                "max_drawdown": 0.0,
-                "peak_pnl": 0.0,
-                "current_pnl": 0.0,
-                "current_losing_streak": 0,
-                "max_losing_streak": 0,
-            }
 
         self.trade_history: list = []
         self.startup_time: str = ""
@@ -234,7 +176,7 @@ class TradingState:
 
         # Backtest
         self.backtest_complete: bool = False
-        self.active_strategies: list = list(STRATEGY_NAMES)  # All active from day 1
+        self.active_strategies: list = []
         self.backtest_results: dict = {}
 
         # Funding rate history (30-day rolling)
@@ -244,8 +186,17 @@ class TradingState:
         # Pending parameter changes from self-review (awaiting GG approval)
         self.pending_review: Optional[dict] = None
 
-        # Strategy paused states
-        self.strategy_paused: dict = {name: False for name in ALL_STRATEGY_NAMES}
+        # Strategy paused states (dynamic)
+        self.strategy_paused: dict = {}
+
+    def _ensure_strategy_metrics(self, name: str):
+        """Ensure metrics exist for a strategy name."""
+        if name not in self.metrics:
+            self.metrics[name] = {
+                "wins": 0, "losses": 0, "total_r_achieved": 0.0,
+                "trade_count": 0, "max_drawdown": 0.0, "peak_pnl": 0.0,
+                "current_pnl": 0.0, "current_losing_streak": 0, "max_losing_streak": 0,
+            }
 
     def reset_daily(self):
         self.trades_today = 0
@@ -255,10 +206,8 @@ class TradingState:
         self.signals_checked = 0
         self.signals_blocked = 0
         self.last_block_reasons = []
-        # Reset per-strategy losing streaks for daily count
-        for name in ALL_STRATEGY_NAMES:
-            if name in self.metrics:
-                self.metrics[name]["current_losing_streak"] = 0
+        for name in list(self.metrics.keys()):
+            self.metrics[name]["current_losing_streak"] = 0
         log.info("Daily PnL and trade counts reset.")
 
 
@@ -290,6 +239,7 @@ def save_state():
             "strategy_paused": state.strategy_paused,
             "funding_history": state.funding_history[-720:],  # ~30 days of hourly samples
             "pending_review": state.pending_review,
+            "research_complete": state.research_complete,
             "saved_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -312,21 +262,20 @@ def load_state():
 
         state.total_trade_count = data.get("total_trade_count", 0)
         state.trade_history = data.get("trade_history", [])
-        state.active_strategies = data.get("active_strategies", list(STRATEGY_NAMES))
+        state.active_strategies = data.get("active_strategies", [])
         state.backtest_complete = data.get("backtest_complete", False)
         state.backtest_results = data.get("backtest_results", {})
         state.funding_history = data.get("funding_history", [])
         state.pending_review = data.get("pending_review")
+        state.research_complete = data.get("research_complete", False)
 
         saved_metrics = data.get("metrics", {})
-        for name in ALL_STRATEGY_NAMES:
-            if name in saved_metrics:
-                state.metrics[name] = saved_metrics[name]
+        for name, m in saved_metrics.items():
+            state.metrics[name] = m
 
         saved_paused = data.get("strategy_paused", {})
-        for name in ALL_STRATEGY_NAMES:
-            if name in saved_paused:
-                state.strategy_paused[name] = saved_paused[name]
+        for name, p in saved_paused.items():
+            state.strategy_paused[name] = p
 
         # Don't restore current_position -- orphaned recovery handles that
         log.info("State loaded from %s -- %d lifetime trades, active: %s",
@@ -551,7 +500,7 @@ def get_funding_percentile(rate: float) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Indicators
+# Indicators -- Base
 # ---------------------------------------------------------------------------
 
 def calc_ema(series: pd.Series, period: int) -> pd.Series:
@@ -618,6 +567,172 @@ def find_swing_lows(df: pd.DataFrame, lookback: int = 50) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Extended Indicators
+# ---------------------------------------------------------------------------
+
+def calc_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    """Returns (macd_line, signal_line, histogram)."""
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
+def calc_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> pd.Series:
+    """Calculate Supertrend indicator."""
+    hl2 = (df["high"] + df["low"]) / 2
+    atr = calc_atr(df, period)
+    upper_band = hl2 + multiplier * atr
+    lower_band = hl2 - multiplier * atr
+    supertrend = pd.Series(np.nan, index=df.index)
+    direction = pd.Series(1, index=df.index)
+    for i in range(period, len(df)):
+        if i == period:
+            supertrend.iloc[i] = upper_band.iloc[i]
+            direction.iloc[i] = -1 if df["close"].iloc[i] > upper_band.iloc[i] else 1
+            continue
+        prev_st = supertrend.iloc[i - 1]
+        if np.isnan(prev_st):
+            supertrend.iloc[i] = upper_band.iloc[i]
+            direction.iloc[i] = 1
+            continue
+        if direction.iloc[i - 1] == -1:  # Was bullish
+            new_lower = max(lower_band.iloc[i], prev_st) if not np.isnan(lower_band.iloc[i]) else prev_st
+            if df["close"].iloc[i] < new_lower:
+                supertrend.iloc[i] = upper_band.iloc[i]
+                direction.iloc[i] = 1
+            else:
+                supertrend.iloc[i] = new_lower
+                direction.iloc[i] = -1
+        else:  # Was bearish
+            new_upper = min(upper_band.iloc[i], prev_st) if not np.isnan(upper_band.iloc[i]) else prev_st
+            if df["close"].iloc[i] > new_upper:
+                supertrend.iloc[i] = lower_band.iloc[i]
+                direction.iloc[i] = -1
+            else:
+                supertrend.iloc[i] = new_upper
+                direction.iloc[i] = 1
+    return supertrend
+
+
+def calc_parabolic_sar(df: pd.DataFrame) -> pd.Series:
+    """Calculate Parabolic SAR using ta library."""
+    indicator = ta.trend.PSARIndicator(df["high"], df["low"], df["close"])
+    return indicator.psar()
+
+
+def calc_ichimoku(df: pd.DataFrame) -> dict:
+    """Returns dict with tenkan, kijun, senkou_a, senkou_b, chikou."""
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    tenkan = (high.rolling(9).max() + low.rolling(9).min()) / 2
+    kijun = (high.rolling(26).max() + low.rolling(26).min()) / 2
+    senkou_a = ((tenkan + kijun) / 2).shift(26)
+    senkou_b = ((high.rolling(52).max() + low.rolling(52).min()) / 2).shift(26)
+    chikou = close.shift(-26)
+    return {"tenkan": tenkan, "kijun": kijun, "senkou_a": senkou_a, "senkou_b": senkou_b, "chikou": chikou}
+
+
+def calc_hull_ma(series: pd.Series, period: int = 9) -> pd.Series:
+    """Calculate Hull Moving Average."""
+    half_period = max(period // 2, 1)
+    sqrt_period = max(int(math.sqrt(period)), 1)
+    wma_half = series.rolling(half_period).mean()
+    wma_full = series.rolling(period).mean()
+    hull_input = 2 * wma_half - wma_full
+    return hull_input.rolling(sqrt_period).mean()
+
+
+def calc_stoch_rsi(series: pd.Series, period: int = 14):
+    """Returns (k, d) Series."""
+    rsi = calc_rsi(series, period)
+    min_rsi = rsi.rolling(period).min()
+    max_rsi = rsi.rolling(period).max()
+    stoch_rsi = (rsi - min_rsi) / (max_rsi - min_rsi + 1e-10) * 100
+    k = stoch_rsi.rolling(3).mean()
+    d = k.rolling(3).mean()
+    return k, d
+
+
+def calc_cci(df: pd.DataFrame, period: int = 20) -> pd.Series:
+    """Commodity Channel Index."""
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+    sma = tp.rolling(period).mean()
+    mad = tp.rolling(period).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
+    return (tp - sma) / (0.015 * mad + 1e-10)
+
+
+def calc_williams_r(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Williams %R."""
+    highest = df["high"].rolling(period).max()
+    lowest = df["low"].rolling(period).min()
+    return -100 * (highest - df["close"]) / (highest - lowest + 1e-10)
+
+
+def calc_obv(df: pd.DataFrame) -> pd.Series:
+    """On Balance Volume."""
+    obv = pd.Series(0.0, index=df.index)
+    for i in range(1, len(df)):
+        if df["close"].iloc[i] > df["close"].iloc[i - 1]:
+            obv.iloc[i] = obv.iloc[i - 1] + df["volume"].iloc[i]
+        elif df["close"].iloc[i] < df["close"].iloc[i - 1]:
+            obv.iloc[i] = obv.iloc[i - 1] - df["volume"].iloc[i]
+        else:
+            obv.iloc[i] = obv.iloc[i - 1]
+    return obv
+
+
+# ---------------------------------------------------------------------------
+# Precompute all indicators for backtesting efficiency
+# ---------------------------------------------------------------------------
+
+def precompute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Add ALL indicator columns to a DataFrame for backtesting."""
+    if len(df) < 55:
+        return df
+    df = df.copy()
+    c = df["close"]
+    # EMAs
+    for p in [9, 14, 20, 21, 50, 55, 200]:
+        df[f"ema_{p}"] = calc_ema(c, p)
+    # RSI
+    df["rsi"] = calc_rsi(c, 14)
+    # Bollinger Bands
+    df["bb_mid"], df["bb_upper"], df["bb_lower"], df["bb_bw"] = calc_bollinger_bands(c, 20, 2.0)
+    # VWAP
+    df["vwap"] = calc_vwap(df)
+    # ADX
+    df["adx"] = calc_adx(df, 14)
+    # ATR
+    df["atr"] = calc_atr(df, 14)
+    # MACD
+    df["macd"], df["macd_signal"], df["macd_hist"] = calc_macd(c)
+    # Supertrend
+    df["supertrend"] = calc_supertrend(df, 10, 3.0)
+    # Parabolic SAR
+    try:
+        df["psar"] = calc_parabolic_sar(df)
+    except Exception:
+        df["psar"] = np.nan
+    # Hull MA
+    df["hull_9"] = calc_hull_ma(c, 9)
+    # Stoch RSI
+    df["stoch_k"], df["stoch_d"] = calc_stoch_rsi(c, 14)
+    # CCI
+    df["cci"] = calc_cci(df, 20)
+    # Williams %R
+    df["williams_r"] = calc_williams_r(df, 14)
+    # OBV
+    df["obv"] = calc_obv(df)
+    # Volume MA
+    df["vol_ma"] = df["volume"].rolling(20).mean()
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Structure Analysis
 # ---------------------------------------------------------------------------
 
@@ -652,6 +767,1198 @@ def detect_structure(df: pd.DataFrame) -> str:
         return "bearish"
     else:
         return "mixed"
+
+
+# ---------------------------------------------------------------------------
+# Signal Helper
+# ---------------------------------------------------------------------------
+
+def _make_signal(side: str, price: float, atr: float, sl_mult: float = 1.5, tp_mult: float = 3.0) -> Optional[dict]:
+    """Build a signal dict with correct SL/TP directions.
+    LONG:  SL = price - sl_mult*atr,  TP = price + tp_mult*sl_mult*atr  (TP ABOVE entry)
+    SHORT: SL = price + sl_mult*atr,  TP = price - tp_mult*sl_mult*atr  (TP BELOW entry)
+    """
+    if atr <= 0 or price <= 0:
+        return None
+    sl_dist = sl_mult * atr
+    tp_dist = tp_mult * sl_dist
+    if side == "long":
+        sl = round(price - sl_dist)
+        tp = round(price + tp_dist)
+        if tp <= price:
+            return None
+    else:
+        sl = round(price + sl_dist)
+        tp = round(price - tp_dist)
+        if tp >= price:
+            return None
+    return {"side": side, "entry": price, "sl": sl, "tp": tp}
+
+
+def _safe_val(series, idx):
+    """Safely get a float value from a pandas Series at index idx."""
+    if idx < 0 or idx >= len(series):
+        return np.nan
+    v = series.iloc[idx]
+    return float(v) if not (isinstance(v, float) and np.isnan(v)) else np.nan
+
+
+def _nan(v):
+    """Check if value is nan."""
+    try:
+        return np.isnan(v)
+    except (TypeError, ValueError):
+        return True
+
+
+# ---------------------------------------------------------------------------
+# 50 Strategy Signal Functions
+# Each takes (df, i, extras=None) where df has precomputed indicators.
+# Returns dict with {side, entry, sl, tp} or None.
+# ---------------------------------------------------------------------------
+
+# --- MOMENTUM ---
+
+def sig_ema_cross_9_21(df, i, extras=None):
+    """EMA 9/21 crossover on 5m."""
+    if i < 2:
+        return None
+    e9 = _safe_val(df["ema_9"], i)
+    e21 = _safe_val(df["ema_21"], i)
+    e9p = _safe_val(df["ema_9"], i - 1)
+    e21p = _safe_val(df["ema_21"], i - 1)
+    atr = _safe_val(df["atr"], i)
+    if _nan(e9) or _nan(e21) or _nan(e9p) or _nan(e21p) or _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    if e9p <= e21p and e9 > e21:
+        return _make_signal("long", price, atr)
+    if e9p >= e21p and e9 < e21:
+        return _make_signal("short", price, atr)
+    return None
+
+
+def sig_ema_cross_21_55(df, i, extras=None):
+    """EMA 21/55 crossover on 15m."""
+    if i < 2:
+        return None
+    e21 = _safe_val(df["ema_21"], i)
+    e55 = _safe_val(df["ema_55"], i)
+    e21p = _safe_val(df["ema_21"], i - 1)
+    e55p = _safe_val(df["ema_55"], i - 1)
+    atr = _safe_val(df["atr"], i)
+    if _nan(e21) or _nan(e55) or _nan(e21p) or _nan(e55p) or _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    if e21p <= e55p and e21 > e55:
+        return _make_signal("long", price, atr, 1.5, 2.5)
+    if e21p >= e55p and e21 < e55:
+        return _make_signal("short", price, atr, 1.5, 2.5)
+    return None
+
+
+def sig_macd_cross_5m(df, i, extras=None):
+    """MACD crossover on 5m."""
+    if i < 2:
+        return None
+    m = _safe_val(df["macd"], i)
+    s = _safe_val(df["macd_signal"], i)
+    mp = _safe_val(df["macd"], i - 1)
+    sp = _safe_val(df["macd_signal"], i - 1)
+    atr = _safe_val(df["atr"], i)
+    if _nan(m) or _nan(s) or _nan(mp) or _nan(sp) or _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    if mp <= sp and m > s:
+        return _make_signal("long", price, atr)
+    if mp >= sp and m < s:
+        return _make_signal("short", price, atr)
+    return None
+
+
+def sig_macd_cross_15m(df, i, extras=None):
+    """MACD crossover on 15m."""
+    return sig_macd_cross_5m(df, i, extras)  # Same logic, different timeframe data
+
+
+def sig_adx_ema(df, i, extras=None):
+    """ADX > 25 with EMA direction on 5m."""
+    adx = _safe_val(df["adx"], i)
+    e9 = _safe_val(df["ema_9"], i)
+    e21 = _safe_val(df["ema_21"], i)
+    atr = _safe_val(df["atr"], i)
+    if _nan(adx) or _nan(e9) or _nan(e21) or _nan(atr) or atr <= 0:
+        return None
+    if adx < 25:
+        return None
+    price = float(df["close"].iloc[i])
+    if e9 > e21 and price > e9:
+        return _make_signal("long", price, atr, 1.5, 2.5)
+    if e9 < e21 and price < e9:
+        return _make_signal("short", price, atr, 1.5, 2.5)
+    return None
+
+
+def sig_supertrend_5m(df, i, extras=None):
+    """Supertrend crossover on 5m."""
+    if i < 2:
+        return None
+    st = _safe_val(df["supertrend"], i)
+    stp = _safe_val(df["supertrend"], i - 1)
+    atr = _safe_val(df["atr"], i)
+    if _nan(st) or _nan(stp) or _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    prev_price = float(df["close"].iloc[i - 1])
+    if prev_price <= stp and price > st:
+        return _make_signal("long", price, atr)
+    if prev_price >= stp and price < st:
+        return _make_signal("short", price, atr)
+    return None
+
+
+def sig_supertrend_15m(df, i, extras=None):
+    """Supertrend crossover on 15m."""
+    return sig_supertrend_5m(df, i, extras)
+
+
+def sig_parabolic_sar(df, i, extras=None):
+    """SAR direction change on 5m."""
+    if i < 2 or "psar" not in df.columns:
+        return None
+    sar = _safe_val(df["psar"], i)
+    sarp = _safe_val(df["psar"], i - 1)
+    atr = _safe_val(df["atr"], i)
+    if _nan(sar) or _nan(sarp) or _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    prev_price = float(df["close"].iloc[i - 1])
+    if prev_price < sarp and price > sar:
+        return _make_signal("long", price, atr)
+    if prev_price > sarp and price < sar:
+        return _make_signal("short", price, atr)
+    return None
+
+
+def sig_ichimoku_breakout(df, i, extras=None):
+    """Cloud breakout on 1h."""
+    if i < 2:
+        return None
+    atr = _safe_val(df["atr"], i)
+    if _nan(atr) or atr <= 0:
+        return None
+    # Compute ichimoku inline since we can't store dict in precompute
+    high = df["high"]
+    low = df["low"]
+    tenkan = (high.rolling(9).max() + low.rolling(9).min()) / 2
+    kijun = (high.rolling(26).max() + low.rolling(26).min()) / 2
+    senkou_a = (tenkan + kijun) / 2
+    senkou_b = (high.rolling(52).max() + low.rolling(52).min()) / 2
+    sa = _safe_val(senkou_a, i)
+    sb = _safe_val(senkou_b, i)
+    sap = _safe_val(senkou_a, i - 1)
+    sbp = _safe_val(senkou_b, i - 1)
+    if _nan(sa) or _nan(sb) or _nan(sap) or _nan(sbp):
+        return None
+    price = float(df["close"].iloc[i])
+    prev_price = float(df["close"].iloc[i - 1])
+    cloud_top = max(sa, sb)
+    cloud_bottom = min(sa, sb)
+    prev_cloud_top = max(sap, sbp)
+    if prev_price <= prev_cloud_top and price > cloud_top:
+        return _make_signal("long", price, atr, 2.0, 3.0)
+    prev_cloud_bottom = min(sap, sbp)
+    if prev_price >= prev_cloud_bottom and price < cloud_bottom:
+        return _make_signal("short", price, atr, 2.0, 3.0)
+    return None
+
+
+def sig_hull_ma_cross(df, i, extras=None):
+    """Hull MA crossover on 5m."""
+    if i < 2 or "hull_9" not in df.columns:
+        return None
+    hull = _safe_val(df["hull_9"], i)
+    hullp = _safe_val(df["hull_9"], i - 1)
+    e21 = _safe_val(df["ema_21"], i)
+    e21p = _safe_val(df["ema_21"], i - 1)
+    atr = _safe_val(df["atr"], i)
+    if _nan(hull) or _nan(hullp) or _nan(e21) or _nan(e21p) or _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    if hullp <= e21p and hull > e21:
+        return _make_signal("long", price, atr)
+    if hullp >= e21p and hull < e21:
+        return _make_signal("short", price, atr)
+    return None
+
+
+# --- MEAN REVERSION ---
+
+def sig_rsi_extreme(df, i, extras=None):
+    """RSI < 30 long, > 70 short on 5m."""
+    rsi = _safe_val(df["rsi"], i)
+    atr = _safe_val(df["atr"], i)
+    if _nan(rsi) or _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    if rsi < 30:
+        return _make_signal("long", price, atr, 1.0, 2.0)
+    if rsi > 70:
+        return _make_signal("short", price, atr, 1.0, 2.0)
+    return None
+
+
+def sig_rsi_divergence(df, i, extras=None):
+    """Price/RSI divergence on 5m."""
+    if i < 15:
+        return None
+    rsi = _safe_val(df["rsi"], i)
+    atr = _safe_val(df["atr"], i)
+    if _nan(rsi) or _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    # Bullish divergence: price makes lower low, RSI makes higher low
+    price_low = float(df["low"].iloc[i])
+    price_prev_low = float(df["low"].iloc[i - 10:i].min())
+    rsi_now = rsi
+    rsi_prev_low = float(df["rsi"].iloc[i - 10:i].min())
+    if price_low <= price_prev_low and rsi_now > rsi_prev_low and rsi < 40:
+        return _make_signal("long", price, atr, 1.5, 2.5)
+    # Bearish divergence: price makes higher high, RSI makes lower high
+    price_high = float(df["high"].iloc[i])
+    price_prev_high = float(df["high"].iloc[i - 10:i].max())
+    rsi_prev_high = float(df["rsi"].iloc[i - 10:i].max())
+    if price_high >= price_prev_high and rsi_now < rsi_prev_high and rsi > 60:
+        return _make_signal("short", price, atr, 1.5, 2.5)
+    return None
+
+
+def sig_bb_touch_reversal(df, i, extras=None):
+    """BB band touch + reversal candle on 5m."""
+    if i < 2:
+        return None
+    bb_upper = _safe_val(df["bb_upper"], i)
+    bb_lower = _safe_val(df["bb_lower"], i)
+    atr = _safe_val(df["atr"], i)
+    if _nan(bb_upper) or _nan(bb_lower) or _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    open_p = float(df["open"].iloc[i])
+    low = float(df["low"].iloc[i])
+    high = float(df["high"].iloc[i])
+    if low <= bb_lower and price > open_p:  # Touched lower band, bullish reversal
+        return _make_signal("long", price, atr, 1.0, 2.0)
+    if high >= bb_upper and price < open_p:  # Touched upper band, bearish reversal
+        return _make_signal("short", price, atr, 1.0, 2.0)
+    return None
+
+
+def sig_bb_squeeze_breakout(df, i, extras=None):
+    """BB squeeze then breakout on 5m."""
+    if i < 5:
+        return None
+    bw = _safe_val(df["bb_bw"], i)
+    atr = _safe_val(df["atr"], i)
+    if _nan(bw) or _nan(atr) or atr <= 0:
+        return None
+    # Check for squeeze: bandwidth was below 0.02 in last 5 candles
+    squeeze = False
+    for j in range(i - 5, i):
+        v = _safe_val(df["bb_bw"], j)
+        if not _nan(v) and v < 0.02:
+            squeeze = True
+            break
+    if not squeeze or bw < 0.02:
+        return None
+    price = float(df["close"].iloc[i])
+    bb_upper = _safe_val(df["bb_upper"], i)
+    bb_lower = _safe_val(df["bb_lower"], i)
+    if _nan(bb_upper) or _nan(bb_lower):
+        return None
+    if price > bb_upper:
+        return _make_signal("long", price, atr, 1.5, 3.0)
+    if price < bb_lower:
+        return _make_signal("short", price, atr, 1.5, 3.0)
+    return None
+
+
+def sig_stoch_rsi_cross(df, i, extras=None):
+    """Stoch RSI crossover in extreme zones on 5m."""
+    if i < 2:
+        return None
+    k = _safe_val(df["stoch_k"], i)
+    d = _safe_val(df["stoch_d"], i)
+    kp = _safe_val(df["stoch_k"], i - 1)
+    dp = _safe_val(df["stoch_d"], i - 1)
+    atr = _safe_val(df["atr"], i)
+    if _nan(k) or _nan(d) or _nan(kp) or _nan(dp) or _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    if kp <= dp and k > d and k < 20:
+        return _make_signal("long", price, atr, 1.0, 2.5)
+    if kp >= dp and k < d and k > 80:
+        return _make_signal("short", price, atr, 1.0, 2.5)
+    return None
+
+
+def sig_cci_extreme(df, i, extras=None):
+    """CCI < -100 long, > 100 short on 5m."""
+    cci = _safe_val(df["cci"], i)
+    atr = _safe_val(df["atr"], i)
+    if _nan(cci) or _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    if cci < -100:
+        return _make_signal("long", price, atr, 1.0, 2.0)
+    if cci > 100:
+        return _make_signal("short", price, atr, 1.0, 2.0)
+    return None
+
+
+def sig_williams_r_extreme(df, i, extras=None):
+    """Williams %R extremes on 5m."""
+    wr = _safe_val(df["williams_r"], i)
+    atr = _safe_val(df["atr"], i)
+    if _nan(wr) or _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    if wr < -80:
+        return _make_signal("long", price, atr, 1.0, 2.0)
+    if wr > -20:
+        return _make_signal("short", price, atr, 1.0, 2.0)
+    return None
+
+
+def sig_mean_reversion_ema(df, i, extras=None):
+    """Deviation from 20 EMA on 5m."""
+    e20 = _safe_val(df["ema_20"], i)
+    atr = _safe_val(df["atr"], i)
+    if _nan(e20) or _nan(atr) or atr <= 0 or e20 <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    dev = (price - e20) / e20 * 100
+    if dev < -0.3:  # >0.3% below EMA
+        return _make_signal("long", price, atr, 1.0, 2.0)
+    if dev > 0.3:  # >0.3% above EMA
+        return _make_signal("short", price, atr, 1.0, 2.0)
+    return None
+
+
+# --- VOLUME ---
+
+def sig_vwap_bounce(df, i, extras=None):
+    """VWAP bounce with volume on 1m."""
+    if i < 2:
+        return None
+    vwap = _safe_val(df["vwap"], i)
+    atr = _safe_val(df["atr"], i)
+    vol_ma = _safe_val(df["vol_ma"], i)
+    if _nan(vwap) or _nan(atr) or _nan(vol_ma) or atr <= 0 or vol_ma <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    vol = float(df["volume"].iloc[i])
+    low = float(df["low"].iloc[i])
+    high = float(df["high"].iloc[i])
+    open_p = float(df["open"].iloc[i])
+    if vol < vol_ma * 1.5:
+        return None
+    if low <= vwap and price > vwap and price > open_p:
+        return _make_signal("long", price, atr, 1.0, 2.0)
+    if high >= vwap and price < vwap and price < open_p:
+        return _make_signal("short", price, atr, 1.0, 2.0)
+    return None
+
+
+def sig_vwap_reclaim(df, i, extras=None):
+    """VWAP reclaim after breakdown on 5m."""
+    if i < 2:
+        return None
+    vwap = _safe_val(df["vwap"], i)
+    vwap_p = _safe_val(df["vwap"], i - 1)
+    atr = _safe_val(df["atr"], i)
+    vol_ma = _safe_val(df["vol_ma"], i)
+    if _nan(vwap) or _nan(vwap_p) or _nan(atr) or _nan(vol_ma) or atr <= 0 or vol_ma <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    prev_close = float(df["close"].iloc[i - 1])
+    open_p = float(df["open"].iloc[i])
+    vol = float(df["volume"].iloc[i])
+    body = abs(price - open_p)
+    full_range = float(df["high"].iloc[i]) - float(df["low"].iloc[i])
+    if full_range == 0 or body / full_range < 0.6 or vol < vol_ma * 1.5:
+        return None
+    rsi = _safe_val(df["rsi"], i)
+    if _nan(rsi):
+        rsi = 50.0
+    if prev_close < vwap_p and price > vwap and price > open_p and rsi > 50:
+        return _make_signal("long", price, atr, 1.0, 2.0)
+    if prev_close > vwap_p and price < vwap and price < open_p and rsi < 50:
+        return _make_signal("short", price, atr, 1.0, 2.0)
+    return None
+
+
+def sig_volume_spike_reversal(df, i, extras=None):
+    """3x volume with opposing candle on 5m."""
+    vol_ma = _safe_val(df["vol_ma"], i)
+    atr = _safe_val(df["atr"], i)
+    if _nan(vol_ma) or _nan(atr) or atr <= 0 or vol_ma <= 0:
+        return None
+    vol = float(df["volume"].iloc[i])
+    if vol < vol_ma * 3.0:
+        return None
+    price = float(df["close"].iloc[i])
+    open_p = float(df["open"].iloc[i])
+    # After a down move, bullish reversal candle
+    if i >= 3:
+        prev_trend = float(df["close"].iloc[i - 3]) - float(df["close"].iloc[i - 1])
+        if prev_trend < 0 and price > open_p:  # Was going down, now bullish
+            return _make_signal("long", price, atr, 1.0, 2.5)
+        if prev_trend > 0 and price < open_p:  # Was going up, now bearish
+            return _make_signal("short", price, atr, 1.0, 2.5)
+    return None
+
+
+def sig_obv_divergence(df, i, extras=None):
+    """OBV divergence from price on 15m."""
+    if i < 15:
+        return None
+    atr = _safe_val(df["atr"], i)
+    if _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    obv_now = _safe_val(df["obv"], i)
+    obv_prev = _safe_val(df["obv"], i - 10)
+    price_prev = float(df["close"].iloc[i - 10])
+    if _nan(obv_now) or _nan(obv_prev):
+        return None
+    # Bullish: price lower, OBV higher
+    if price < price_prev and obv_now > obv_prev:
+        return _make_signal("long", price, atr, 1.5, 2.5)
+    # Bearish: price higher, OBV lower
+    if price > price_prev and obv_now < obv_prev:
+        return _make_signal("short", price, atr, 1.5, 2.5)
+    return None
+
+
+def sig_funding_rate_fade(df, i, extras=None):
+    """Extreme funding rate fade (needs extras={funding_rate, funding_pctl})."""
+    if not extras:
+        return None
+    rate = extras.get("funding_rate", 0)
+    pctl = extras.get("funding_pctl", 50)
+    rsi = _safe_val(df["rsi"], i)
+    atr = _safe_val(df["atr"], i)
+    if _nan(rsi) or _nan(atr) or atr <= 0 or rate == 0:
+        return None
+    price = float(df["close"].iloc[i])
+    if pctl >= 90 and rsi > 65:
+        return _make_signal("short", price, atr, 1.5, 2.5)
+    if pctl <= 10 and rsi < 35:
+        return _make_signal("long", price, atr, 1.5, 2.5)
+    return None
+
+
+def sig_liquidation_fade(df, i, extras=None):
+    """After large ATR candle + reversal, fade the move."""
+    if i < 2:
+        return None
+    atr = _safe_val(df["atr"], i)
+    if _nan(atr) or atr <= 0:
+        return None
+    prev_range = float(df["high"].iloc[i - 1]) - float(df["low"].iloc[i - 1])
+    if prev_range < atr * 3:  # Previous candle was huge
+        return None
+    price = float(df["close"].iloc[i])
+    open_p = float(df["open"].iloc[i])
+    prev_close = float(df["close"].iloc[i - 1])
+    prev_open = float(df["open"].iloc[i - 1])
+    # Previous candle was bearish, current is bullish (reversal)
+    if prev_close < prev_open and price > open_p:
+        return _make_signal("long", price, atr, 1.5, 2.0)
+    if prev_close > prev_open and price < open_p:
+        return _make_signal("short", price, atr, 1.5, 2.0)
+    return None
+
+
+def sig_delta_divergence(df, i, extras=None):
+    """Volume vs price divergence on 5m."""
+    if i < 10:
+        return None
+    atr = _safe_val(df["atr"], i)
+    if _nan(atr) or atr <= 0:
+        return None
+    # Approximate delta as: bullish candle vol = positive, bearish = negative
+    delta_sum = 0.0
+    for j in range(i - 5, i + 1):
+        if j < 0 or j >= len(df):
+            continue
+        c = float(df["close"].iloc[j])
+        o = float(df["open"].iloc[j])
+        v = float(df["volume"].iloc[j])
+        delta_sum += v if c > o else -v
+    price = float(df["close"].iloc[i])
+    price_5ago = float(df["close"].iloc[i - 5])
+    # Price up but delta negative -> bearish divergence
+    if price > price_5ago and delta_sum < 0:
+        return _make_signal("short", price, atr, 1.5, 2.0)
+    if price < price_5ago and delta_sum > 0:
+        return _make_signal("long", price, atr, 1.5, 2.0)
+    return None
+
+
+# --- PRICE ACTION ---
+
+def sig_order_block(df, i, extras=None):
+    """OB retest on 5m."""
+    if i < 20:
+        return None
+    atr = _safe_val(df["atr"], i)
+    if _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    # Look for bullish impulse (3 consecutive bullish candles) in lookback
+    for k in range(max(3, i - 20), i - 3):
+        impulse_ok = all(float(df["close"].iloc[k + j]) > float(df["open"].iloc[k + j]) for j in range(3))
+        if impulse_ok:
+            start_p = float(df["open"].iloc[k])
+            end_p = float(df["close"].iloc[k + 2])
+            if start_p > 0 and (end_p - start_p) / start_p * 100 >= 0.5:
+                ob_idx = k - 1
+                if ob_idx >= 0 and float(df["close"].iloc[ob_idx]) < float(df["open"].iloc[ob_idx]):
+                    ob_high = float(df["high"].iloc[ob_idx])
+                    ob_low = float(df["low"].iloc[ob_idx])
+                    if ob_low <= price <= ob_high and float(df["close"].iloc[i]) > float(df["open"].iloc[i]):
+                        sl = round(ob_low - atr * 0.2)
+                        tp = round(max(end_p, price + abs(price - sl) * 2))
+                        if tp > price:
+                            return {"side": "long", "entry": price, "sl": sl, "tp": tp}
+    # Bearish
+    for k in range(max(3, i - 20), i - 3):
+        impulse_ok = all(float(df["close"].iloc[k + j]) < float(df["open"].iloc[k + j]) for j in range(3))
+        if impulse_ok:
+            start_p = float(df["open"].iloc[k])
+            end_p = float(df["close"].iloc[k + 2])
+            if start_p > 0 and (start_p - end_p) / start_p * 100 >= 0.5:
+                ob_idx = k - 1
+                if ob_idx >= 0 and float(df["close"].iloc[ob_idx]) > float(df["open"].iloc[ob_idx]):
+                    ob_high = float(df["high"].iloc[ob_idx])
+                    ob_low = float(df["low"].iloc[ob_idx])
+                    if ob_low <= price <= ob_high and float(df["close"].iloc[i]) < float(df["open"].iloc[i]):
+                        sl = round(ob_high + atr * 0.2)
+                        tp = round(min(end_p, price - abs(sl - price) * 2))
+                        if tp < price:
+                            return {"side": "short", "entry": price, "sl": sl, "tp": tp}
+    return None
+
+
+def sig_liquidity_sweep(df, i, extras=None):
+    """Sweep of swing high/low on 5m."""
+    if i < 20:
+        return None
+    atr = _safe_val(df["atr"], i)
+    if _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    open_p = float(df["open"].iloc[i])
+    high = float(df["high"].iloc[i])
+    low = float(df["low"].iloc[i])
+    vol_ma = _safe_val(df["vol_ma"], i)
+    vol = float(df["volume"].iloc[i])
+    if _nan(vol_ma) or vol_ma <= 0 or vol < vol_ma * 2:
+        return None
+    # Find recent swing lows
+    lows = df["low"].values[max(0, i - 30):i]
+    for j in range(2, len(lows) - 2):
+        if lows[j] < lows[j - 1] and lows[j] < lows[j + 1]:
+            sw_low = lows[j]
+            if low < sw_low and price > sw_low and price > open_p:
+                return _make_signal("long", price, atr, 1.5, 2.5)
+    # Find recent swing highs
+    highs = df["high"].values[max(0, i - 30):i]
+    for j in range(2, len(highs) - 2):
+        if highs[j] > highs[j - 1] and highs[j] > highs[j + 1]:
+            sw_high = highs[j]
+            if high > sw_high and price < sw_high and price < open_p:
+                return _make_signal("short", price, atr, 1.5, 2.5)
+    return None
+
+
+def sig_fvg_fill(df, i, extras=None):
+    """Fair value gap fill on 5m."""
+    if i < 10:
+        return None
+    atr = _safe_val(df["atr"], i)
+    if _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    # Look for bullish FVG (gap up)
+    for k in range(max(0, i - 10), i - 2):
+        gap_low = float(df["low"].iloc[k + 2])
+        gap_high = float(df["high"].iloc[k])
+        if gap_low > gap_high:  # Bullish FVG
+            if float(df["low"].iloc[i]) <= gap_low and price > gap_high:
+                return _make_signal("long", price, atr, 1.0, 2.5)
+    # Bearish FVG
+    for k in range(max(0, i - 10), i - 2):
+        gap_high = float(df["high"].iloc[k + 2])
+        gap_low = float(df["low"].iloc[k])
+        if gap_high < gap_low:  # Bearish FVG
+            if float(df["high"].iloc[i]) >= gap_high and price < gap_low:
+                return _make_signal("short", price, atr, 1.0, 2.5)
+    return None
+
+
+def sig_bos_pullback(df, i, extras=None):
+    """Break of structure + pullback on 15m."""
+    if i < 20:
+        return None
+    atr = _safe_val(df["atr"], i)
+    if _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    # Detect bullish BOS: new high above recent swing high, then pullback
+    highs = df["high"].values[max(0, i - 20):i]
+    lows = df["low"].values[max(0, i - 20):i]
+    if len(highs) < 10:
+        return None
+    recent_high = float(np.max(highs[:-3]))
+    recent_low = float(np.min(lows[:-3]))
+    e21 = _safe_val(df["ema_21"], i)
+    if _nan(e21):
+        return None
+    # Bullish BOS + pullback to EMA
+    if float(np.max(highs[-5:])) > recent_high:
+        if abs(price - e21) / e21 * 100 < 0.1 and price > e21:
+            return _make_signal("long", price, atr, 1.5, 3.0)
+    # Bearish BOS + pullback
+    if float(np.min(lows[-5:])) < recent_low:
+        if abs(price - e21) / e21 * 100 < 0.1 and price < e21:
+            return _make_signal("short", price, atr, 1.5, 3.0)
+    return None
+
+
+def sig_inside_bar(df, i, extras=None):
+    """Inside bar breakout on 5m."""
+    if i < 2:
+        return None
+    atr = _safe_val(df["atr"], i)
+    if _nan(atr) or atr <= 0:
+        return None
+    # Check if previous candle was inside bar (contained within candle before it)
+    prev_high = float(df["high"].iloc[i - 1])
+    prev_low = float(df["low"].iloc[i - 1])
+    mother_high = float(df["high"].iloc[i - 2])
+    mother_low = float(df["low"].iloc[i - 2])
+    if prev_high > mother_high or prev_low < mother_low:
+        return None  # Not an inside bar
+    price = float(df["close"].iloc[i])
+    if price > mother_high:
+        return _make_signal("long", price, atr, 1.0, 2.5)
+    if price < mother_low:
+        return _make_signal("short", price, atr, 1.0, 2.5)
+    return None
+
+
+def sig_engulfing(df, i, extras=None):
+    """Engulfing candle at key level on 5m."""
+    if i < 2:
+        return None
+    atr = _safe_val(df["atr"], i)
+    if _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    open_p = float(df["open"].iloc[i])
+    prev_close = float(df["close"].iloc[i - 1])
+    prev_open = float(df["open"].iloc[i - 1])
+    # Bullish engulfing
+    if prev_close < prev_open and price > open_p:
+        if price > prev_open and open_p < prev_close:
+            return _make_signal("long", price, atr, 1.0, 2.5)
+    # Bearish engulfing
+    if prev_close > prev_open and price < open_p:
+        if price < prev_open and open_p > prev_close:
+            return _make_signal("short", price, atr, 1.0, 2.5)
+    return None
+
+
+def sig_pin_bar(df, i, extras=None):
+    """Pin bar reversal on 5m."""
+    atr = _safe_val(df["atr"], i)
+    if _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    open_p = float(df["open"].iloc[i])
+    high = float(df["high"].iloc[i])
+    low = float(df["low"].iloc[i])
+    body = abs(price - open_p)
+    full_range = high - low
+    if full_range == 0 or body == 0:
+        return None
+    upper_wick = high - max(price, open_p)
+    lower_wick = min(price, open_p) - low
+    # Bullish pin bar: long lower wick, small body
+    if lower_wick >= body * 2 and upper_wick < body:
+        return _make_signal("long", price, atr, 1.0, 2.5)
+    # Bearish pin bar: long upper wick
+    if upper_wick >= body * 2 and lower_wick < body:
+        return _make_signal("short", price, atr, 1.0, 2.5)
+    return None
+
+
+def sig_three_candle_reversal(df, i, extras=None):
+    """Three candle reversal pattern on 5m."""
+    if i < 3:
+        return None
+    atr = _safe_val(df["atr"], i)
+    if _nan(atr) or atr <= 0:
+        return None
+    # Three consecutive bearish then one bullish = bullish reversal
+    all_bear = all(float(df["close"].iloc[i - j]) < float(df["open"].iloc[i - j]) for j in range(1, 4))
+    all_bull = all(float(df["close"].iloc[i - j]) > float(df["open"].iloc[i - j]) for j in range(1, 4))
+    price = float(df["close"].iloc[i])
+    open_p = float(df["open"].iloc[i])
+    if all_bear and price > open_p:
+        return _make_signal("long", price, atr, 1.0, 2.5)
+    if all_bull and price < open_p:
+        return _make_signal("short", price, atr, 1.0, 2.5)
+    return None
+
+
+def sig_hh_hl_entry(df, i, extras=None):
+    """HH/HL or LH/LL confirmation on 15m."""
+    if i < 20:
+        return None
+    atr = _safe_val(df["atr"], i)
+    if _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    structure = detect_structure(df.iloc[max(0, i - 20):i + 1])
+    if structure == "bullish" and price > float(df["open"].iloc[i]):
+        return _make_signal("long", price, atr, 1.5, 3.0)
+    if structure == "bearish" and price < float(df["open"].iloc[i]):
+        return _make_signal("short", price, atr, 1.5, 3.0)
+    return None
+
+
+# --- SESSION ---
+
+def sig_london_breakout(df, i, extras=None):
+    """First 30 min of London (07:00-07:30 UTC)."""
+    if i < 10 or "timestamp" not in df.columns:
+        return None
+    ts = df["timestamp"].iloc[i]
+    if hasattr(ts, "hour"):
+        h, m = ts.hour, ts.minute
+    else:
+        return None
+    if not (h == 7 and m < 30):
+        return None
+    atr = _safe_val(df["atr"], i)
+    if _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    # Get Asia range (00:00-07:00)
+    asia_high = float(df["high"].iloc[max(0, i - 84):i].max())  # ~7h of 5m candles
+    asia_low = float(df["low"].iloc[max(0, i - 84):i].min())
+    if price > asia_high:
+        return _make_signal("long", price, atr, 1.5, 3.0)
+    if price < asia_low:
+        return _make_signal("short", price, atr, 1.5, 3.0)
+    return None
+
+
+def sig_ny_breakout(df, i, extras=None):
+    """First 30 min of NY (13:00-13:30 UTC)."""
+    if i < 10 or "timestamp" not in df.columns:
+        return None
+    ts = df["timestamp"].iloc[i]
+    if hasattr(ts, "hour"):
+        h, m = ts.hour, ts.minute
+    else:
+        return None
+    if not (h == 13 and m < 30):
+        return None
+    atr = _safe_val(df["atr"], i)
+    if _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    # Get London range
+    london_high = float(df["high"].iloc[max(0, i - 72):i].max())  # ~6h of 5m candles
+    london_low = float(df["low"].iloc[max(0, i - 72):i].min())
+    if price > london_high:
+        return _make_signal("long", price, atr, 1.5, 3.0)
+    if price < london_low:
+        return _make_signal("short", price, atr, 1.5, 3.0)
+    return None
+
+
+def sig_asia_range_fade(df, i, extras=None):
+    """Fade Asia range exceeded by 20%."""
+    if i < 84 or "timestamp" not in df.columns:
+        return None
+    ts = df["timestamp"].iloc[i]
+    if hasattr(ts, "hour"):
+        h = ts.hour
+    else:
+        return None
+    if not (7 <= h < 11):
+        return None
+    atr = _safe_val(df["atr"], i)
+    if _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    asia_high = float(df["high"].iloc[max(0, i - 84):i].max())
+    asia_low = float(df["low"].iloc[max(0, i - 84):i].min())
+    asia_range = asia_high - asia_low
+    if asia_range <= 0:
+        return None
+    if price > asia_high + asia_range * 0.2:
+        return _make_signal("short", price, atr, 1.5, 2.0)  # Fade the overextension
+    if price < asia_low - asia_range * 0.2:
+        return _make_signal("long", price, atr, 1.5, 2.0)
+    return None
+
+
+def sig_session_end_mr(df, i, extras=None):
+    """Mean reversion last 30 min of session."""
+    if i < 5 or "timestamp" not in df.columns:
+        return None
+    ts = df["timestamp"].iloc[i]
+    if hasattr(ts, "hour"):
+        h, m = ts.hour, ts.minute
+    else:
+        return None
+    # End of London: 10:30-11:00 or end of NY: 16:30-17:00
+    is_end = (h == 10 and m >= 30) or (h == 16 and m >= 30)
+    if not is_end:
+        return None
+    rsi = _safe_val(df["rsi"], i)
+    atr = _safe_val(df["atr"], i)
+    if _nan(rsi) or _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    if rsi < 35:
+        return _make_signal("long", price, atr, 1.0, 1.5)
+    if rsi > 65:
+        return _make_signal("short", price, atr, 1.0, 1.5)
+    return None
+
+
+def sig_monday_range(df, i, extras=None):
+    """Monday range breakout."""
+    if i < 2 or "timestamp" not in df.columns:
+        return None
+    ts = df["timestamp"].iloc[i]
+    if hasattr(ts, "weekday"):
+        if ts.weekday() != 1:  # Only trade on Tuesday
+            return None
+    else:
+        return None
+    atr = _safe_val(df["atr"], i)
+    if _nan(atr) or atr <= 0:
+        return None
+    # Look back to find Monday candles
+    monday_high = -np.inf
+    monday_low = np.inf
+    for j in range(max(0, i - 288), i):  # 288 = 24h of 5m candles
+        t = df["timestamp"].iloc[j]
+        if hasattr(t, "weekday") and t.weekday() == 0:
+            monday_high = max(monday_high, float(df["high"].iloc[j]))
+            monday_low = min(monday_low, float(df["low"].iloc[j]))
+    if monday_high == -np.inf:
+        return None
+    price = float(df["close"].iloc[i])
+    if price > monday_high:
+        return _make_signal("long", price, atr, 1.5, 3.0)
+    if price < monday_low:
+        return _make_signal("short", price, atr, 1.5, 3.0)
+    return None
+
+
+# --- HL SPECIFIC ---
+
+def sig_top_trader_bias(df, i, extras=None):
+    """Only trade in top trader direction (needs extras)."""
+    if not extras or "top_trader_bias" not in extras:
+        return None
+    bias = extras["top_trader_bias"]
+    atr = _safe_val(df["atr"], i)
+    rsi = _safe_val(df["rsi"], i)
+    if _nan(atr) or _nan(rsi) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    e21 = _safe_val(df["ema_21"], i)
+    if _nan(e21):
+        return None
+    if bias == "LONG" and price > e21 and rsi > 50:
+        return _make_signal("long", price, atr, 1.5, 3.0)
+    if bias == "SHORT" and price < e21 and rsi < 50:
+        return _make_signal("short", price, atr, 1.5, 3.0)
+    return None
+
+
+def sig_oi_spike(df, i, extras=None):
+    """OI spike approximation (using volume as proxy)."""
+    if i < 10:
+        return None
+    atr = _safe_val(df["atr"], i)
+    vol_ma = _safe_val(df["vol_ma"], i)
+    if _nan(atr) or _nan(vol_ma) or atr <= 0 or vol_ma <= 0:
+        return None
+    vol = float(df["volume"].iloc[i])
+    if vol < vol_ma * 4:
+        return None
+    price = float(df["close"].iloc[i])
+    open_p = float(df["open"].iloc[i])
+    if price > open_p:
+        return _make_signal("long", price, atr, 1.5, 2.5)
+    if price < open_p:
+        return _make_signal("short", price, atr, 1.5, 2.5)
+    return None
+
+
+def sig_funding_extreme(df, i, extras=None):
+    """More aggressive funding rate fade."""
+    if not extras:
+        return None
+    rate = extras.get("funding_rate", 0)
+    pctl = extras.get("funding_pctl", 50)
+    atr = _safe_val(df["atr"], i)
+    if _nan(atr) or atr <= 0 or rate == 0:
+        return None
+    price = float(df["close"].iloc[i])
+    if pctl >= 95:
+        return _make_signal("short", price, atr, 1.0, 2.0)
+    if pctl <= 5:
+        return _make_signal("long", price, atr, 1.0, 2.0)
+    return None
+
+
+def sig_perp_premium(df, i, extras=None):
+    """Perp premium/discount convergence."""
+    if not extras or "perp_premium" not in extras:
+        return None
+    premium = extras["perp_premium"]
+    atr = _safe_val(df["atr"], i)
+    if _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    if premium > 0.5:  # Perp trading at premium -> short
+        return _make_signal("short", price, atr, 1.0, 2.0)
+    if premium < -0.5:  # Perp at discount -> long
+        return _make_signal("long", price, atr, 1.0, 2.0)
+    return None
+
+
+# --- COMBINED ---
+
+def sig_rsi_vwap_confluence(df, i, extras=None):
+    """RSI extreme + VWAP position."""
+    rsi = _safe_val(df["rsi"], i)
+    vwap = _safe_val(df["vwap"], i)
+    atr = _safe_val(df["atr"], i)
+    if _nan(rsi) or _nan(vwap) or _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    if rsi < 35 and price < vwap:
+        return _make_signal("long", price, atr, 1.0, 2.5)
+    if rsi > 65 and price > vwap:
+        return _make_signal("short", price, atr, 1.0, 2.5)
+    return None
+
+
+def sig_ema_volume_confluence(df, i, extras=None):
+    """EMA cross + volume confirmation."""
+    if i < 2:
+        return None
+    e9 = _safe_val(df["ema_9"], i)
+    e21 = _safe_val(df["ema_21"], i)
+    e9p = _safe_val(df["ema_9"], i - 1)
+    e21p = _safe_val(df["ema_21"], i - 1)
+    atr = _safe_val(df["atr"], i)
+    vol_ma = _safe_val(df["vol_ma"], i)
+    if _nan(e9) or _nan(e21) or _nan(e9p) or _nan(e21p) or _nan(atr) or _nan(vol_ma):
+        return None
+    if atr <= 0 or vol_ma <= 0:
+        return None
+    vol = float(df["volume"].iloc[i])
+    if vol < vol_ma * 1.5:
+        return None
+    price = float(df["close"].iloc[i])
+    if e9p <= e21p and e9 > e21:
+        return _make_signal("long", price, atr, 1.5, 3.0)
+    if e9p >= e21p and e9 < e21:
+        return _make_signal("short", price, atr, 1.5, 3.0)
+    return None
+
+
+def sig_trend_momentum(df, i, extras=None):
+    """ADX + MACD + EMA aligned."""
+    adx = _safe_val(df["adx"], i)
+    macd_h = _safe_val(df["macd_hist"], i)
+    e9 = _safe_val(df["ema_9"], i)
+    e21 = _safe_val(df["ema_21"], i)
+    atr = _safe_val(df["atr"], i)
+    if _nan(adx) or _nan(macd_h) or _nan(e9) or _nan(e21) or _nan(atr) or atr <= 0:
+        return None
+    if adx < 25:
+        return None
+    price = float(df["close"].iloc[i])
+    if e9 > e21 and macd_h > 0 and price > e9:
+        return _make_signal("long", price, atr, 1.5, 3.0)
+    if e9 < e21 and macd_h < 0 and price < e9:
+        return _make_signal("short", price, atr, 1.5, 3.0)
+    return None
+
+
+def sig_mtf_confluence(df, i, extras=None):
+    """1h trend + 5m entry -- uses EMA200 for trend, EMA9/21 for entry."""
+    if i < 2:
+        return None
+    e200 = _safe_val(df["ema_200"], i)
+    e9 = _safe_val(df["ema_9"], i)
+    e21 = _safe_val(df["ema_21"], i)
+    e9p = _safe_val(df["ema_9"], i - 1)
+    e21p = _safe_val(df["ema_21"], i - 1)
+    atr = _safe_val(df["atr"], i)
+    if _nan(e200) or _nan(e9) or _nan(e21) or _nan(e9p) or _nan(e21p) or _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    if price > e200 and e9p <= e21p and e9 > e21:
+        return _make_signal("long", price, atr, 1.5, 3.0)
+    if price < e200 and e9p >= e21p and e9 < e21:
+        return _make_signal("short", price, atr, 1.5, 3.0)
+    return None
+
+
+def sig_session_pattern(df, i, extras=None):
+    """Pattern only during London/NY."""
+    if "timestamp" not in df.columns:
+        return None
+    ts = df["timestamp"].iloc[i]
+    if hasattr(ts, "hour"):
+        h = ts.hour
+    else:
+        return None
+    if not (7 <= h < 11 or 13 <= h < 17):
+        return None
+    # Use engulfing as the pattern
+    return sig_engulfing(df, i, extras)
+
+
+def sig_regime_rsi(df, i, extras=None):
+    """RSI in RANGING, momentum in TRENDING."""
+    adx = _safe_val(df["adx"], i)
+    rsi = _safe_val(df["rsi"], i)
+    atr = _safe_val(df["atr"], i)
+    if _nan(adx) or _nan(rsi) or _nan(atr) or atr <= 0:
+        return None
+    price = float(df["close"].iloc[i])
+    if adx < 20:  # Ranging
+        if rsi < 30:
+            return _make_signal("long", price, atr, 1.0, 2.0)
+        if rsi > 70:
+            return _make_signal("short", price, atr, 1.0, 2.0)
+    elif adx > 30:  # Trending
+        e9 = _safe_val(df["ema_9"], i)
+        e21 = _safe_val(df["ema_21"], i)
+        if not _nan(e9) and not _nan(e21):
+            if e9 > e21 and rsi > 50:
+                return _make_signal("long", price, atr, 1.5, 3.0)
+            if e9 < e21 and rsi < 50:
+                return _make_signal("short", price, atr, 1.5, 3.0)
+    return None
+
+
+def sig_volatility_breakout(df, i, extras=None):
+    """ATR expansion + directional candle."""
+    if i < 5:
+        return None
+    atr = _safe_val(df["atr"], i)
+    if _nan(atr) or atr <= 0:
+        return None
+    # Check ATR expansion: current ATR > 1.5x ATR from 5 candles ago
+    atr_prev = _safe_val(df["atr"], i - 5)
+    if _nan(atr_prev) or atr_prev <= 0:
+        return None
+    if atr < atr_prev * 1.5:
+        return None
+    price = float(df["close"].iloc[i])
+    open_p = float(df["open"].iloc[i])
+    body = abs(price - open_p)
+    full_range = float(df["high"].iloc[i]) - float(df["low"].iloc[i])
+    if full_range == 0 or body / full_range < 0.6:
+        return None
+    if price > open_p:
+        return _make_signal("long", price, atr, 1.5, 3.0)
+    if price < open_p:
+        return _make_signal("short", price, atr, 1.5, 3.0)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# ALL_STRATEGY_DEFS -- maps strategy name to config
+# ---------------------------------------------------------------------------
+
+ALL_STRATEGY_DEFS = {
+    # MOMENTUM
+    "ema_cross_9_21_5m":    {"label": "EMA 9/21 5m",        "emoji": "1",  "tf": "5m",  "signal_func": sig_ema_cross_9_21,    "max_hold": 240},
+    "ema_cross_21_55_15m":  {"label": "EMA 21/55 15m",      "emoji": "2",  "tf": "15m", "signal_func": sig_ema_cross_21_55,   "max_hold": 480},
+    "macd_cross_5m":        {"label": "MACD Cross 5m",      "emoji": "3",  "tf": "5m",  "signal_func": sig_macd_cross_5m,     "max_hold": 240},
+    "macd_cross_15m":       {"label": "MACD Cross 15m",     "emoji": "4",  "tf": "15m", "signal_func": sig_macd_cross_15m,    "max_hold": 480},
+    "adx_ema_5m":           {"label": "ADX+EMA 5m",         "emoji": "5",  "tf": "5m",  "signal_func": sig_adx_ema,           "max_hold": 240},
+    "supertrend_5m":        {"label": "Supertrend 5m",      "emoji": "6",  "tf": "5m",  "signal_func": sig_supertrend_5m,     "max_hold": 240},
+    "supertrend_15m":       {"label": "Supertrend 15m",     "emoji": "7",  "tf": "15m", "signal_func": sig_supertrend_15m,    "max_hold": 480},
+    "parabolic_sar_5m":     {"label": "Parabolic SAR 5m",   "emoji": "8",  "tf": "5m",  "signal_func": sig_parabolic_sar,     "max_hold": 240},
+    "ichimoku_breakout_1h": {"label": "Ichimoku Break 1h",  "emoji": "9",  "tf": "1h",  "signal_func": sig_ichimoku_breakout, "max_hold": 720},
+    "hull_ma_cross_5m":     {"label": "Hull MA Cross 5m",   "emoji": "10", "tf": "5m",  "signal_func": sig_hull_ma_cross,     "max_hold": 240},
+    # MEAN REVERSION
+    "rsi_extreme_5m":       {"label": "RSI Extreme 5m",     "emoji": "11", "tf": "5m",  "signal_func": sig_rsi_extreme,       "max_hold": 120},
+    "rsi_divergence_5m":    {"label": "RSI Divergence 5m",  "emoji": "12", "tf": "5m",  "signal_func": sig_rsi_divergence,    "max_hold": 180},
+    "bb_touch_5m":          {"label": "BB Touch 5m",        "emoji": "13", "tf": "5m",  "signal_func": sig_bb_touch_reversal, "max_hold": 120},
+    "bb_squeeze_5m":        {"label": "BB Squeeze 5m",      "emoji": "14", "tf": "5m",  "signal_func": sig_bb_squeeze_breakout,"max_hold": 240},
+    "stoch_rsi_cross_5m":   {"label": "Stoch RSI Cross 5m", "emoji": "15", "tf": "5m",  "signal_func": sig_stoch_rsi_cross,   "max_hold": 120},
+    "cci_extreme_5m":       {"label": "CCI Extreme 5m",     "emoji": "16", "tf": "5m",  "signal_func": sig_cci_extreme,       "max_hold": 120},
+    "williams_r_5m":        {"label": "Williams %R 5m",     "emoji": "17", "tf": "5m",  "signal_func": sig_williams_r_extreme, "max_hold": 120},
+    "mean_rev_ema_5m":      {"label": "Mean Rev EMA 5m",    "emoji": "18", "tf": "5m",  "signal_func": sig_mean_reversion_ema, "max_hold": 120},
+    # VOLUME
+    "vwap_bounce_1m":       {"label": "VWAP Bounce 1m",     "emoji": "19", "tf": "1m",  "signal_func": sig_vwap_bounce,       "max_hold": 60},
+    "vwap_reclaim_5m":      {"label": "VWAP Reclaim 5m",    "emoji": "20", "tf": "5m",  "signal_func": sig_vwap_reclaim,      "max_hold": 180},
+    "vol_spike_rev_5m":     {"label": "Vol Spike Rev 5m",   "emoji": "21", "tf": "5m",  "signal_func": sig_volume_spike_reversal,"max_hold": 120},
+    "obv_divergence_15m":   {"label": "OBV Divergence 15m", "emoji": "22", "tf": "15m", "signal_func": sig_obv_divergence,    "max_hold": 240},
+    "funding_fade_1h":      {"label": "Funding Fade 1h",    "emoji": "23", "tf": "1h",  "signal_func": sig_funding_rate_fade, "max_hold": 480},
+    "liquidation_fade_5m":  {"label": "Liquidation Fade 5m","emoji": "24", "tf": "5m",  "signal_func": sig_liquidation_fade,  "max_hold": 120},
+    "delta_div_5m":         {"label": "Delta Divergence 5m","emoji": "25", "tf": "5m",  "signal_func": sig_delta_divergence,  "max_hold": 120},
+    # PRICE ACTION
+    "order_block_5m":       {"label": "Order Block 5m",     "emoji": "26", "tf": "5m",  "signal_func": sig_order_block,       "max_hold": 240},
+    "liq_sweep_5m":         {"label": "Liq Sweep 5m",       "emoji": "27", "tf": "5m",  "signal_func": sig_liquidity_sweep,   "max_hold": 240},
+    "fvg_fill_5m":          {"label": "FVG Fill 5m",        "emoji": "28", "tf": "5m",  "signal_func": sig_fvg_fill,          "max_hold": 180},
+    "bos_pullback_15m":     {"label": "BOS Pullback 15m",   "emoji": "29", "tf": "15m", "signal_func": sig_bos_pullback,      "max_hold": 480},
+    "inside_bar_5m":        {"label": "Inside Bar 5m",      "emoji": "30", "tf": "5m",  "signal_func": sig_inside_bar,        "max_hold": 120},
+    "engulfing_5m":         {"label": "Engulfing 5m",       "emoji": "31", "tf": "5m",  "signal_func": sig_engulfing,         "max_hold": 120},
+    "pin_bar_5m":           {"label": "Pin Bar 5m",         "emoji": "32", "tf": "5m",  "signal_func": sig_pin_bar,           "max_hold": 120},
+    "three_candle_rev_5m":  {"label": "3-Candle Rev 5m",    "emoji": "33", "tf": "5m",  "signal_func": sig_three_candle_reversal,"max_hold": 120},
+    "hh_hl_entry_15m":      {"label": "HH/HL Entry 15m",   "emoji": "34", "tf": "15m", "signal_func": sig_hh_hl_entry,       "max_hold": 480},
+    # SESSION
+    "london_breakout_5m":   {"label": "London Break 5m",    "emoji": "35", "tf": "5m",  "signal_func": sig_london_breakout,   "max_hold": 240},
+    "ny_breakout_5m":       {"label": "NY Break 5m",        "emoji": "36", "tf": "5m",  "signal_func": sig_ny_breakout,       "max_hold": 240},
+    "asia_range_fade_5m":   {"label": "Asia Fade 5m",       "emoji": "37", "tf": "5m",  "signal_func": sig_asia_range_fade,   "max_hold": 180},
+    "session_end_mr_5m":    {"label": "Session End MR 5m",  "emoji": "38", "tf": "5m",  "signal_func": sig_session_end_mr,    "max_hold": 60},
+    "monday_range_5m":      {"label": "Monday Range 5m",    "emoji": "39", "tf": "5m",  "signal_func": sig_monday_range,      "max_hold": 480},
+    # HL SPECIFIC
+    "top_trader_bias_5m":   {"label": "Top Trader Bias 5m", "emoji": "40", "tf": "5m",  "signal_func": sig_top_trader_bias,   "max_hold": 240},
+    "oi_spike_5m":          {"label": "OI Spike 5m",        "emoji": "41", "tf": "5m",  "signal_func": sig_oi_spike,          "max_hold": 120},
+    "funding_extreme_1h":   {"label": "Funding Extreme 1h", "emoji": "42", "tf": "1h",  "signal_func": sig_funding_extreme,   "max_hold": 480},
+    "perp_premium_5m":      {"label": "Perp Premium 5m",    "emoji": "43", "tf": "5m",  "signal_func": sig_perp_premium,      "max_hold": 240},
+    # COMBINED
+    "rsi_vwap_conf_5m":     {"label": "RSI+VWAP Conf 5m",   "emoji": "44", "tf": "5m",  "signal_func": sig_rsi_vwap_confluence,"max_hold": 120},
+    "ema_vol_conf_5m":      {"label": "EMA+Vol Conf 5m",    "emoji": "45", "tf": "5m",  "signal_func": sig_ema_volume_confluence,"max_hold": 240},
+    "trend_momentum_5m":    {"label": "Trend Momentum 5m",  "emoji": "46", "tf": "5m",  "signal_func": sig_trend_momentum,    "max_hold": 240},
+    "mtf_confluence_5m":    {"label": "MTF Confluence 5m",   "emoji": "47", "tf": "5m",  "signal_func": sig_mtf_confluence,    "max_hold": 240},
+    "session_pattern_5m":   {"label": "Session Pattern 5m",  "emoji": "48", "tf": "5m",  "signal_func": sig_session_pattern,   "max_hold": 120},
+    "regime_rsi_5m":        {"label": "Regime RSI 5m",       "emoji": "49", "tf": "5m",  "signal_func": sig_regime_rsi,        "max_hold": 180},
+    "volatility_break_5m":  {"label": "Vol Breakout 5m",     "emoji": "50", "tf": "5m",  "signal_func": sig_volatility_breakout,"max_hold": 240},
+}
 
 
 # ---------------------------------------------------------------------------
@@ -762,13 +2069,12 @@ def can_open_trade(strategy: str, side: str) -> tuple[bool, str]:
     """Master pre-trade checklist. Returns (allowed, reason)."""
     state.signals_checked += 1
 
-    # 1. No opposing position open -- if same direction, skip. If opposite, caller handles close-first.
+    # 1. No opposing position open
     if state.current_position is not None:
         pos_side = state.current_position["side"]
         if pos_side == side:
             return _block(strategy, side, f"Already have {side} position open (same direction)")
         else:
-            # Opposite direction -- caller must close first, then re-check
             return _block(strategy, side, f"Opposing {pos_side} position open -- close first")
 
     # 2. Regime check -- NO trading in VOLATILE
@@ -782,21 +2088,36 @@ def can_open_trade(strategy: str, side: str) -> tuple[bool, str]:
     if state.daily_loss_cap_hit:
         return _block(strategy, side, "Daily loss cap hit")
 
-    # 4. Macro check -- CRITICAL = no new trades
+    # 4. Max trades per day
+    if state.trades_today >= MAX_TRADES_PER_DAY:
+        return _block(strategy, side, f"Max trades per day ({state.trades_today}/{MAX_TRADES_PER_DAY})")
+
+    # 5. Macro check -- CRITICAL = no new trades
     if _macro_intel_cache.get("text", ""):
         if "RISK_LEVEL: CRITICAL" in _macro_intel_cache["text"].upper():
             return _block(strategy, side, "CRITICAL macro event active")
 
-    # 5. Global or strategy paused
+    # 6. Global or strategy paused
     if state.paused:
         return _block(strategy, side, "Global trading paused")
 
     if state.strategy_paused.get(strategy, False):
         return _block(strategy, side, f"{strategy} paused (underperformance)")
 
-    # 6. Strategy must be active
+    # 7. Strategy must be active
     if strategy not in state.active_strategies:
         return _block(strategy, side, f"{strategy} not in active strategies")
+
+    # 8. Session filter: only London (07:00-11:00) and NY (13:00-17:00)
+    hour = datetime.now(timezone.utc).hour
+    in_session = (7 <= hour < 11) or (13 <= hour < 17)
+    if not in_session:
+        return _block(strategy, side, f"Outside trading sessions (hour={hour})")
+
+    # 9. No weekends
+    weekday = datetime.now(timezone.utc).weekday()
+    if weekday >= 5:  # Saturday=5, Sunday=6
+        return _block(strategy, side, "Weekend -- no trading")
 
     log.info("PASSED: %s %s -- all checks OK", strategy, side.upper())
     return True, "OK"
@@ -825,7 +2146,7 @@ async def execute_trade(strategy: str, side: str, entry: float,
 
     sl_price and tp_price are pre-calculated by the strategy.
     Leverage is determined by AI confidence score, capped by max_leverage if set.
-    Position sized so that SL hit <= MAX_RISK_PCT of account.
+    Position sized so that SL hit <= TARGET_RISK_PCT of account.
     """
     allowed, reason = can_open_trade(strategy, side)
     if not allowed:
@@ -835,12 +2156,12 @@ async def execute_trade(strategy: str, side: str, entry: float,
     if side == "long" and tp_price <= entry:
         error_msg = f"TP calculation error [{strategy}] — trade cancelled. TP ${tp_price:,.2f} is below entry ${entry:,.2f}"
         log.error(error_msg)
-        await tg_send(f"🚨 <b>{error_msg}</b>")
+        await tg_send(f"\U0001f6a8 <b>{error_msg}</b>")
         return
     if side == "short" and tp_price >= entry:
         error_msg = f"TP calculation error [{strategy}] — trade cancelled. TP ${tp_price:,.2f} is above entry ${entry:,.2f}"
         log.error(error_msg)
-        await tg_send(f"🚨 <b>{error_msg}</b>")
+        await tg_send(f"\U0001f6a8 <b>{error_msg}</b>")
         return
 
     leverage = calc_leverage_from_confidence(confidence)
@@ -852,8 +2173,8 @@ async def execute_trade(strategy: str, side: str, entry: float,
         log.warning("%s -- zero SL distance, cannot size position.", strategy)
         return
 
-    # Size: max risk per trade. Target 3-5% but hard cap at 10%
-    risk_pct = min(TARGET_RISK_PCT + (confidence - 7) * 0.01, MAX_RISK_PCT)
+    # Size: 2% risk per trade, hard cap at 10%
+    risk_pct = min(TARGET_RISK_PCT + (confidence - 7) * 0.005, MAX_RISK_PCT)
     risk_dollars = ACCOUNT_CAPITAL * risk_pct
     size = math.floor(risk_dollars / sl_distance * 100000) / 100000
 
@@ -976,7 +2297,8 @@ async def execute_trade(strategy: str, side: str, entry: float,
     dollar_risk = round(sl_distance * size, 2)
     dollar_tp = round(tp_distance * size, 2)
     rr_ratio = round(tp_distance / sl_distance, 1) if sl_distance > 0 else 0
-    label = STRATEGY_LABELS.get(strategy, strategy)
+    strat_def = ALL_STRATEGY_DEFS.get(strategy, {})
+    label = strat_def.get("label", strategy)
     arrow = "\U0001f7e2" if side == "long" else "\U0001f534"
     msg = (
         f"{arrow} <b>{side.upper()}</b> -- {label}\n"
@@ -1111,6 +2433,7 @@ async def close_position(exit_price: float, reason: str, force: bool = False):
     state.daily_pnl = round(state.daily_pnl + pnl, 2)
 
     # Update metrics
+    state._ensure_strategy_metrics(strategy)
     m = state.metrics[strategy]
     m["trade_count"] += 1
     m["total_r_achieved"] += r_achieved
@@ -1146,7 +2469,8 @@ async def close_position(exit_price: float, reason: str, force: bool = False):
         "hold_time_min": round(elapsed_min, 1),
     })
 
-    label = STRATEGY_LABELS.get(strategy, strategy)
+    strat_def = ALL_STRATEGY_DEFS.get(strategy, {})
+    label = strat_def.get("label", strategy)
     emoji = "\U0001f4b0" if pnl >= 0 else "\U0001f4b8"
     msg = (
         f"{emoji} <b>CLOSED</b> -- {label}\n"
@@ -1206,11 +2530,11 @@ async def close_position(exit_price: float, reason: str, force: bool = False):
 
 
 async def check_underperformance(strategy: str):
-    """If a strategy drops below 40% win rate after 15+ trades, pause it."""
-    m = state.metrics[strategy]
-    if m["trade_count"] < UNDERPERFORMANCE_MIN_TRADES:
+    """If a strategy drops below 40% win rate after 20+ trades, pause it."""
+    m = state.metrics.get(strategy, {})
+    if m.get("trade_count", 0) < UNDERPERFORMANCE_MIN_TRADES:
         return
-    win_rate = m["wins"] / m["trade_count"]
+    win_rate = m.get("wins", 0) / m["trade_count"]
     if win_rate < UNDERPERFORMANCE_WR_THRESHOLD:
         if not state.strategy_paused.get(strategy, False):
             state.strategy_paused[strategy] = True
@@ -1222,505 +2546,6 @@ async def check_underperformance(strategy: str):
                 f"Strategy will remain paused until next backtest re-evaluation."
             )
             await tg_send(msg)
-
-
-# ---------------------------------------------------------------------------
-# Strategy 1 -- Funding Rate Fade (1H)
-# ---------------------------------------------------------------------------
-
-async def strategy_funding_rate_fade():
-    """Monitor funding rate extremes. Short when excessively positive, long when negative."""
-    name = "funding_rate_fade"
-
-    rate = state.current_funding_rate
-    if rate == 0:
-        return
-
-    percentile = get_funding_percentile(rate)
-
-    df_1h = await fetch_ohlcv("1h", 30)
-    if df_1h.empty or len(df_1h) < 20:
-        return
-
-    rsi_series = calc_rsi(df_1h["close"], 14)
-    rsi_val = float(rsi_series.iloc[-1]) if not rsi_series.empty and not np.isnan(rsi_series.iloc[-1]) else 50.0
-    atr_series = calc_atr(df_1h, 14)
-    atr_val = float(atr_series.iloc[-1]) if not atr_series.empty and not np.isnan(atr_series.iloc[-1]) else 0.0
-    price = float(df_1h["close"].iloc[-1])
-
-    if atr_val <= 0 or price <= 0:
-        return
-
-    side = None
-    # Top 10% extreme (longs paying heavily) -> short
-    if percentile >= (100 - FUNDING_EXTREME_PCT) and rsi_val > 65:
-        side = "short"
-    # Bottom 10% extreme (shorts paying heavily) -> long
-    elif percentile <= FUNDING_EXTREME_PCT and rsi_val < 35:
-        side = "long"
-
-    if side is None:
-        return
-
-    log.info("funding_rate_fade signal: %s | rate=%.6f | percentile=%.1f | RSI=%.1f",
-             side, rate, percentile, rsi_val)
-
-    sl_distance = 1.5 * atr_val
-    tp_distance = 2.5 * sl_distance
-
-    if side == "long":
-        sl_price = round(price - sl_distance)
-        tp_price = round(price + tp_distance)
-    else:
-        sl_price = round(price + sl_distance)
-        tp_price = round(price - tp_distance)
-
-    return {"strategy": name, "side": side, "entry": price, "sl": sl_price, "tp": tp_price,
-            "atr": atr_val, "reason": f"Funding {rate:.6f} ({percentile:.0f}th pctl), RSI {rsi_val:.1f}"}
-
-
-# ---------------------------------------------------------------------------
-# Strategy 2 -- Liquidity Sweep Reversal (5m/15m)
-# ---------------------------------------------------------------------------
-
-async def strategy_liquidity_sweep():
-    """Detect stop hunts past swing highs/lows that immediately reverse.
-    Tightened filters: 4x volume, pin bar mandatory, 15m EMA + 1H bias alignment,
-    spread compression, order book imbalance direction filter.
-    Leverage capped at 10x regardless of confidence.
-    """
-    name = "liquidity_sweep"
-
-    # Multi-timeframe confirmation: fetch 15m EMA slope
-    df_15m_ema = await fetch_ohlcv("15m", 30)
-    if df_15m_ema.empty or len(df_15m_ema) < 20:
-        return None
-    ema15m = calc_ema(df_15m_ema["close"], 14)
-    ema15m_now = float(ema15m.iloc[-1])
-    ema15m_prev = float(ema15m.iloc[-5])
-    if np.isnan(ema15m_now) or np.isnan(ema15m_prev) or ema15m_prev == 0:
-        return None
-    ema15m_slope = (ema15m_now - ema15m_prev) / ema15m_prev * 100
-    ema15m_bullish = ema15m_slope > 0.01
-    ema15m_bearish = ema15m_slope < -0.01
-
-    # 1H bias must also align (from state)
-    htf_bullish = state.htf_bias == "bullish"
-    htf_bearish = state.htf_bias == "bearish"
-
-    for tf in ["15m", "5m"]:
-        df = await fetch_ohlcv(tf, 60)
-        if df.empty or len(df) < 52:
-            continue
-
-        swing_highs = find_swing_highs(df, 50)
-        swing_lows = find_swing_lows(df, 50)
-
-        if not swing_highs or not swing_lows:
-            continue
-
-        atr_series = calc_atr(df, 14)
-        atr_val = float(atr_series.iloc[-1]) if not atr_series.empty and not np.isnan(atr_series.iloc[-1]) else 0.0
-        rsi_series = calc_rsi(df["close"], 14)
-
-        price = float(df["close"].iloc[-1])
-        open_price = float(df["open"].iloc[-1])
-        curr_high = float(df["high"].iloc[-1])
-        curr_low = float(df["low"].iloc[-1])
-        curr_range = curr_high - curr_low
-
-        if curr_range == 0:
-            continue
-
-        # Volume: 4x MA minimum — no exceptions
-        avg_vol = float(df["volume"].iloc[-20:].mean())
-        curr_vol = float(df["volume"].iloc[-1])
-        if avg_vol <= 0 or curr_vol < avg_vol * 4.0:
-            continue
-
-        # Spread compression: require spread at least 30% below 20-period baseline
-        spreads = (df["high"] - df["low"]).iloc[-20:]
-        avg_spread = float(spreads.mean())
-        if avg_spread <= 0 or curr_range >= avg_spread * 0.70:
-            # Current candle spread must be <= 70% of average (i.e. at least 30% below)
-            # Actually this should check PRIOR candles for compression leading into the sweep
-            recent_spreads = (df["high"] - df["low"]).iloc[-5:-1]
-            avg_recent_spread = float(recent_spreads.mean())
-            if avg_recent_spread <= 0 or avg_recent_spread >= avg_spread * 0.70:
-                continue
-
-        # Pin bar / hammer pattern mandatory on reversal candle
-        body = abs(price - open_price)
-        upper_wick = curr_high - max(price, open_price)
-        lower_wick = min(price, open_price) - curr_low
-
-        side = None
-        sweep_extreme = 0.0
-        target_pool = 0.0
-
-        # Check sweep of swing lows (long signal)
-        for _, sw_low in swing_lows[-3:]:
-            sweep_depth = (sw_low - curr_low) / sw_low * 100 if sw_low > 0 else 0
-            if sweep_depth > 0.15 and price > sw_low:
-                # Pin bar / hammer mandatory: lower wick must be >= 2x body
-                if body == 0 or lower_wick < body * 2:
-                    continue
-                # Multi-TF confirmation: 15m EMA must slope bullish AND 1H bias bullish
-                if not ema15m_bullish or not htf_bullish:
-                    continue
-                side = "long"
-                sweep_extreme = curr_low
-                if swing_highs:
-                    target_pool = swing_highs[-1][1]
-                break
-
-        # Check sweep of swing highs (short signal)
-        if side is None:
-            for _, sw_high in swing_highs[-3:]:
-                sweep_depth = (curr_high - sw_high) / sw_high * 100 if sw_high > 0 else 0
-                if sweep_depth > 0.15 and price < sw_high:
-                    # Inverted hammer mandatory: upper wick must be >= 2x body
-                    if body == 0 or upper_wick < body * 2:
-                        continue
-                    # Multi-TF confirmation: 15m EMA must slope bearish AND 1H bias bearish
-                    if not ema15m_bearish or not htf_bearish:
-                        continue
-                    side = "short"
-                    sweep_extreme = curr_high
-                    if swing_lows:
-                        target_pool = swing_lows[-1][1]
-                    break
-
-        if side is None:
-            continue
-
-        # SL: just beyond the sweep extreme
-        sl_buffer = atr_val * 0.2 if atr_val > 0 else price * 0.001
-        if side == "long":
-            sl_price = round(sweep_extreme - sl_buffer)
-            tp_price = round(target_pool) if target_pool > price else round(price + abs(price - sl_price) * 2)
-            # CRITICAL: final TP sanity -- must be ABOVE entry for longs
-            if tp_price <= price:
-                tp_price = round(price + abs(price - sl_price) * 2)
-        else:
-            sl_price = round(sweep_extreme + sl_buffer)
-            tp_price = round(target_pool) if target_pool < price else round(price - abs(sl_price - price) * 2)
-            # CRITICAL: final TP sanity -- must be BELOW entry for shorts
-            if tp_price >= price:
-                tp_price = round(price - abs(sl_price - price) * 2)
-
-        log.info("liquidity_sweep signal: %s on %s | sweep=%.0f | entry=%.0f | vol=%.1fx | pin_bar=yes",
-                 side, tf, sweep_extreme, price, curr_vol / avg_vol)
-
-        return {"strategy": name, "side": side, "entry": price, "sl": sl_price, "tp": tp_price,
-                "atr": atr_val, "max_leverage": 10,  # Hard cap at 10x for liquidity_sweep
-                "reason": f"Sweep {tf} beyond {'low' if side == 'long' else 'high'}, vol {curr_vol/avg_vol:.1f}x, pin bar confirmed, MTF aligned"}
-
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Strategy 3 -- EMA Trend Pullback (1H)
-# ---------------------------------------------------------------------------
-
-async def strategy_ema_trend_pullback():
-    """Trend pullback to 21/50 EMA on 1H with rejection candle confirmation."""
-    name = "ema_trend_pullback"
-
-    df = await fetch_ohlcv("1h", 210)
-    if df.empty or len(df) < 205:
-        return None
-
-    ema21 = calc_ema(df["close"], 21)
-    ema50 = calc_ema(df["close"], 50)
-    ema200 = calc_ema(df["close"], 200)
-    atr_series = calc_atr(df, 14)
-    atr_val = float(atr_series.iloc[-1]) if not atr_series.empty and not np.isnan(atr_series.iloc[-1]) else 0.0
-
-    ema200_now = float(ema200.iloc[-1])
-    ema200_prev = float(ema200.iloc[-5])
-
-    if np.isnan(ema200_now) or np.isnan(ema200_prev) or atr_val <= 0:
-        return None
-
-    # 200 EMA slope determines trend
-    ema200_slope = (ema200_now - ema200_prev) / ema200_prev * 100
-    trend = "bullish" if ema200_slope > 0.01 else "bearish" if ema200_slope < -0.01 else None
-
-    if trend is None:
-        return None
-
-    curr = df.iloc[-1]
-    price = float(curr["close"])
-    open_price = float(curr["open"])
-    high = float(curr["high"])
-    low = float(curr["low"])
-    ema21_val = float(ema21.iloc[-1])
-    ema50_val = float(ema50.iloc[-1])
-    body = abs(price - open_price)
-    full_range = high - low
-
-    if full_range == 0:
-        return None
-
-    # Volume confirmation
-    avg_vol = float(df["volume"].iloc[-20:].mean())
-    curr_vol = float(curr["volume"])
-    if np.isnan(avg_vol) or curr_vol < avg_vol:
-        return None
-
-    # Check for chop (3+ consecutive candles around EMA)
-    chop_count = 0
-    for i in range(-4, -1):
-        c = float(df["close"].iloc[i])
-        e21 = float(ema21.iloc[i])
-        e50 = float(ema50.iloc[i])
-        if abs(c - e21) / e21 * 100 < 0.1 or abs(c - e50) / e50 * 100 < 0.1:
-            chop_count += 1
-    if chop_count >= 3:
-        return None
-
-    side = None
-    # Bullish: pullback to 21 or 50 EMA, bullish rejection candle
-    if trend == "bullish":
-        touched_ema = (low <= ema21_val <= high) or (low <= ema50_val <= high)
-        is_bullish_rejection = price > open_price and body / full_range >= 0.5 and price > ema21_val
-        if touched_ema and is_bullish_rejection:
-            side = "long"
-
-    # Bearish: rally to 21 or 50 EMA, bearish rejection candle
-    elif trend == "bearish":
-        touched_ema = (low <= ema21_val <= high) or (low <= ema50_val <= high)
-        is_bearish_rejection = price < open_price and body / full_range >= 0.5 and price < ema21_val
-        if touched_ema and is_bearish_rejection:
-            side = "short"
-
-    if side is None:
-        return None
-
-    # SL: below rejection candle (long) or above (short), max 1.5x ATR
-    sl_distance = min(abs(price - (low if side == "long" else high)) + atr_val * 0.2, 1.5 * atr_val)
-
-    # TP: previous swing high/low
-    swing_highs = find_swing_highs(df, 50)
-    swing_lows = find_swing_lows(df, 50)
-
-    if side == "long":
-        sl_price = round(price - sl_distance)
-        tp_target = swing_highs[-1][1] if swing_highs else price + sl_distance * 2
-        # CRITICAL: TP must be ABOVE entry for longs -- fallback to ATR-based if swing target is wrong
-        if tp_target <= price:
-            tp_target = price + sl_distance * 2
-        tp_price = round(tp_target)
-    else:
-        sl_price = round(price + sl_distance)
-        tp_target = swing_lows[-1][1] if swing_lows else price - sl_distance * 2
-        # CRITICAL: TP must be BELOW entry for shorts -- fallback to ATR-based if swing target is wrong
-        if tp_target >= price:
-            tp_target = price - sl_distance * 2
-        tp_price = round(tp_target)
-
-    log.info("ema_trend_pullback signal: %s | trend=%s | EMA200 slope=%.3f%%", side, trend, ema200_slope)
-
-    return {"strategy": name, "side": side, "entry": price, "sl": sl_price, "tp": tp_price,
-            "atr": atr_val, "reason": f"EMA pullback, {trend} trend, EMA200 slope {ema200_slope:.3f}%"}
-
-
-# ---------------------------------------------------------------------------
-# Strategy 4 -- VWAP Reclaim (5m/15m)
-# ---------------------------------------------------------------------------
-
-async def strategy_vwap_reclaim():
-    """Price loses VWAP then reclaims with conviction."""
-    name = "vwap_reclaim"
-
-    for tf in ["15m", "5m"]:
-        df = await fetch_ohlcv(tf, 60)
-        if df.empty or len(df) < 25:
-            continue
-
-        df["vwap"] = calc_vwap(df)
-        rsi_series = calc_rsi(df["close"], 14)
-        atr_series = calc_atr(df, 14)
-        atr_val = float(atr_series.iloc[-1]) if not atr_series.empty and not np.isnan(atr_series.iloc[-1]) else 0.0
-
-        curr = df.iloc[-1]
-        prev = df.iloc[-2]
-        price = float(curr["close"])
-        open_price = float(curr["open"])
-        vwap_val = float(curr["vwap"])
-        rsi_val = float(rsi_series.iloc[-1]) if not np.isnan(rsi_series.iloc[-1]) else 50.0
-
-        if np.isnan(vwap_val) or vwap_val <= 0 or atr_val <= 0:
-            continue
-
-        body = abs(price - open_price)
-        full_range = float(curr["high"]) - float(curr["low"])
-        if full_range == 0:
-            continue
-
-        body_ratio = body / full_range
-
-        # Volume spike
-        avg_vol = float(df["volume"].iloc[-20:].mean())
-        curr_vol = float(curr["volume"])
-        vol_spike = curr_vol >= avg_vol * 1.5 if avg_vol > 0 else False
-
-        if not vol_spike or body_ratio < 0.6:
-            continue
-
-        # Chop filter: if price crossed VWAP > 4 times in last 20 candles, skip
-        vwap_crosses = 0
-        for i in range(-20, -1):
-            if abs(i) >= len(df):
-                continue
-            c_prev = float(df["close"].iloc[i])
-            c_curr = float(df["close"].iloc[i + 1])
-            v_prev = float(df["vwap"].iloc[i])
-            v_curr = float(df["vwap"].iloc[i + 1])
-            if np.isnan(v_prev) or np.isnan(v_curr):
-                continue
-            if (c_prev < v_prev and c_curr > v_curr) or (c_prev > v_prev and c_curr < v_curr):
-                vwap_crosses += 1
-        if vwap_crosses > 4:
-            continue
-
-        side = None
-        # Long: was below VWAP, strong bullish candle reclaims above
-        prev_below = float(prev["close"]) < float(prev["vwap"]) if not np.isnan(prev["vwap"]) else False
-        # Short: was above VWAP, strong bearish candle loses it
-        prev_above = float(prev["close"]) > float(prev["vwap"]) if not np.isnan(prev["vwap"]) else False
-
-        if prev_below and price > vwap_val and price > open_price and rsi_val > 50:
-            side = "long"
-        elif prev_above and price < vwap_val and price < open_price and rsi_val < 50:
-            side = "short"
-
-        if side is None:
-            continue
-
-        sl_distance = 1.0 * atr_val
-        if side == "long":
-            sl_price = round(float(curr["low"]) - sl_distance)
-            tp_price = round(price + max(sl_distance * 2, abs(price - sl_price) * 2))
-        else:
-            sl_price = round(float(curr["high"]) + sl_distance)
-            tp_price = round(price - max(sl_distance * 2, abs(sl_price - price) * 2))
-
-        log.info("vwap_reclaim signal: %s on %s | VWAP=%.0f | RSI=%.1f", side, tf, vwap_val, rsi_val)
-
-        return {"strategy": name, "side": side, "entry": price, "sl": sl_price, "tp": tp_price,
-                "atr": atr_val, "reason": f"VWAP reclaim on {tf}, RSI {rsi_val:.1f}, vol {curr_vol/avg_vol:.1f}x"}
-
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Strategy 5 -- Order Block Entry (15m/1H)
-# ---------------------------------------------------------------------------
-
-async def strategy_order_block():
-    """Identify order blocks from impulse moves and trade the retest."""
-    name = "order_block"
-
-    for tf in ["1h", "15m"]:
-        df = await fetch_ohlcv(tf, 100)
-        if df.empty or len(df) < 50:
-            continue
-
-        atr_series = calc_atr(df, 14)
-        atr_val = float(atr_series.iloc[-1]) if not atr_series.empty and not np.isnan(atr_series.iloc[-1]) else 0.0
-        rsi_series = calc_rsi(df["close"], 14)
-
-        price = float(df["close"].iloc[-1])
-        avg_vol = float(df["volume"].iloc[-20:].mean())
-
-        if atr_val <= 0 or price <= 0:
-            continue
-
-        # Scan for order blocks in recent history (last 30 candles)
-        for i in range(len(df) - 30, len(df) - 5):
-            if i < 3:
-                continue
-
-            # Check for bullish impulse (3+ consecutive bullish candles, 0.5%+ move)
-            bullish_impulse = True
-            impulse_start = float(df["open"].iloc[i])
-            impulse_end = float(df["close"].iloc[i + 2]) if i + 2 < len(df) else 0
-            for j in range(i, min(i + 3, len(df))):
-                if float(df["close"].iloc[j]) <= float(df["open"].iloc[j]):
-                    bullish_impulse = False
-                    break
-            if bullish_impulse and impulse_end > 0:
-                move_pct = (impulse_end - impulse_start) / impulse_start * 100
-                if move_pct >= 0.5:
-                    # Bullish OB = last bearish candle before impulse
-                    ob_idx = i - 1
-                    if ob_idx >= 0 and float(df["close"].iloc[ob_idx]) < float(df["open"].iloc[ob_idx]):
-                        ob_high = float(df["high"].iloc[ob_idx])
-                        ob_low = float(df["low"].iloc[ob_idx])
-
-                        # Check FVG (fair value gap)
-                        if i + 1 < len(df):
-                            gap = float(df["low"].iloc[i + 1]) - float(df["high"].iloc[ob_idx])
-                            has_fvg = gap > 0
-
-                            # Is price currently in the OB zone?
-                            if ob_low <= price <= ob_high and has_fvg:
-                                rsi_val = float(rsi_series.iloc[-1]) if not np.isnan(rsi_series.iloc[-1]) else 50
-                                curr_vol = float(df["volume"].iloc[-1])
-                                is_bullish = float(df["close"].iloc[-1]) > float(df["open"].iloc[-1])
-
-                                if is_bullish and rsi_val > 45 and curr_vol > avg_vol:
-                                    sl_price = round(ob_low - atr_val * 0.2)
-                                    # CRITICAL: TP must be ABOVE entry for longs
-                                    tp_target = impulse_end if impulse_end > price else price + abs(price - sl_price) * 2
-                                    tp_price = round(tp_target)
-
-                                    log.info("order_block signal: long on %s | OB zone %.0f-%.0f", tf, ob_low, ob_high)
-
-                                    return {"strategy": name, "side": "long", "entry": price,
-                                            "sl": sl_price, "tp": tp_price, "atr": atr_val,
-                                            "reason": f"Bullish OB retest on {tf}, FVG present, RSI {rsi_val:.1f}"}
-
-            # Check for bearish impulse
-            bearish_impulse = True
-            impulse_start = float(df["open"].iloc[i])
-            impulse_end = float(df["close"].iloc[i + 2]) if i + 2 < len(df) else 0
-            for j in range(i, min(i + 3, len(df))):
-                if float(df["close"].iloc[j]) >= float(df["open"].iloc[j]):
-                    bearish_impulse = False
-                    break
-            if bearish_impulse and impulse_end > 0:
-                move_pct = (impulse_start - impulse_end) / impulse_start * 100
-                if move_pct >= 0.5:
-                    ob_idx = i - 1
-                    if ob_idx >= 0 and float(df["close"].iloc[ob_idx]) > float(df["open"].iloc[ob_idx]):
-                        ob_high = float(df["high"].iloc[ob_idx])
-                        ob_low = float(df["low"].iloc[ob_idx])
-
-                        if i + 1 < len(df):
-                            gap = float(df["low"].iloc[ob_idx]) - float(df["high"].iloc[i + 1])
-                            has_fvg = gap > 0
-
-                            if ob_low <= price <= ob_high and has_fvg:
-                                rsi_val = float(rsi_series.iloc[-1]) if not np.isnan(rsi_series.iloc[-1]) else 50
-                                curr_vol = float(df["volume"].iloc[-1])
-                                is_bearish = float(df["close"].iloc[-1]) < float(df["open"].iloc[-1])
-
-                                if is_bearish and rsi_val < 55 and curr_vol > avg_vol:
-                                    sl_price = round(ob_high + atr_val * 0.2)
-                                    # CRITICAL: TP must be BELOW entry for shorts
-                                    tp_target = impulse_end if impulse_end < price else price - abs(sl_price - price) * 2
-                                    tp_price = round(tp_target)
-
-                                    log.info("order_block signal: short on %s | OB zone %.0f-%.0f", tf, ob_low, ob_high)
-
-                                    return {"strategy": name, "side": "short", "entry": price,
-                                            "sl": sl_price, "tp": tp_price, "atr": atr_val,
-                                            "reason": f"Bearish OB retest on {tf}, FVG present, RSI {rsi_val:.1f}"}
-
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1843,7 +2668,6 @@ async def ai_market_analysis(strategy: str, side: str, price: float, signal_reas
 
             # Parse confidence score
             confidence = 7  # default
-            import re
             conf_match = re.search(r"CONFIDENCE:\s*(\d+)", content)
             if conf_match:
                 confidence = min(10, max(1, int(conf_match.group(1))))
@@ -1862,43 +2686,74 @@ async def ai_market_analysis(strategy: str, side: str, price: float, signal_reas
 # ---------------------------------------------------------------------------
 
 async def run_all_strategies():
-    """Run all 5 strategies simultaneously. Strongest signal wins."""
+    """Run all active strategies. Strongest signal wins."""
     if state.paused or state.daily_loss_cap_hit:
         return
     if state.regime == Regime.VOLATILE:
         return
     if state.losses_today >= MAX_LOSSES_PER_DAY:
         return
+    if state.trades_today >= MAX_TRADES_PER_DAY:
+        return
 
-    # If a position is open, don't look for new signals (unless opposite direction, handled below)
+    # Session filter
+    hour = datetime.now(timezone.utc).hour
+    in_session = (7 <= hour < 11) or (13 <= hour < 17)
+    if not in_session:
+        return
+
+    # Weekend filter
+    if datetime.now(timezone.utc).weekday() >= 5:
+        return
+
+    # If a position is open, don't look for new signals
     if state.current_position is not None:
         return
 
+    # Fetch data for different timeframes
+    df_cache = {}
+    for tf in ["1m", "5m", "15m", "1h"]:
+        try:
+            df_cache[tf] = await fetch_ohlcv(tf, 250)
+            if not df_cache[tf].empty and len(df_cache[tf]) >= 55:
+                df_cache[tf] = precompute_indicators(df_cache[tf])
+        except Exception:
+            df_cache[tf] = pd.DataFrame()
+
+    # Build extras for strategies that need them
+    extras = {
+        "funding_rate": state.current_funding_rate,
+        "funding_pctl": get_funding_percentile(state.current_funding_rate),
+    }
+    intel = _intelligence_cache.get("report", {})
+    patterns = intel.get("patterns", {})
+    extras["top_trader_bias"] = patterns.get("dominant_direction", "NEUTRAL")
+
     # Gather signals from all active strategies
     signals = []
-    strategy_funcs = {
-        "funding_rate_fade": strategy_funding_rate_fade,
-        "liquidity_sweep": strategy_liquidity_sweep,
-        "ema_trend_pullback": strategy_ema_trend_pullback,
-        "vwap_reclaim": strategy_vwap_reclaim,
-        "order_block": strategy_order_block,
-    }
-
     for name in state.active_strategies:
         if state.strategy_paused.get(name, False):
             continue
+        sdef = ALL_STRATEGY_DEFS.get(name)
+        if not sdef:
+            continue
+        tf = sdef["tf"]
+        df = df_cache.get(tf)
+        if df is None or df.empty or len(df) < 55:
+            continue
         try:
-            result = await strategy_funcs[name]()
-            if result:
-                signals.append(result)
+            sig = sdef["signal_func"](df, len(df) - 1, extras)
+            if sig:
+                sig["strategy"] = name
+                sig["reason"] = f"{sdef['label']} signal"
+                signals.append(sig)
         except Exception as exc:
-            log.error("%s error: %s", name, exc)
+            log.error("Strategy %s error: %s", name, exc)
 
     if not signals:
         return
 
-    # Pick strongest signal (for now: first one that fires, they run sequentially)
-    # In practice: the strategy that fires on the most confluent setup wins
+    # Pick first signal
     signal = signals[0]
 
     # Pre-trade checklist
@@ -1913,32 +2768,32 @@ async def run_all_strategies():
         signal_reason=signal.get("reason", "")
     )
 
-    # --- AI BRAIN RULES (updated 2026-04-08) ---
+    # --- AI BRAIN RULES ---
     # Rule 1: Confidence 6+ = AI brain is INFORMATIONAL ONLY, cannot block the trade
-    # Rule 2: Confidence 5 and below = AI can veto but ONLY for technical reasons (never macro/geopolitical)
+    # Rule 2: Confidence 5 and below = AI can veto but ONLY for technical reasons
     # Rule 3: 3+ consecutive rejections from same strategy = informational only for 24h
     force_approve = False
+    strat_def = ALL_STRATEGY_DEFS.get(strat_name, {})
+    label = strat_def.get("label", strat_name)
 
     if confidence >= 6:
-        # Confidence 6+: AI brain is informational only -- trade executes regardless
         force_approve = True
         if not approved:
             log.info("AI Brain confidence %d >= 6 -- informational only, trade proceeds for %s", confidence, strat_name)
 
-    # --- Consecutive rejection override: 3+ rejections from same strategy -> informational only for 24h ---
+    # Consecutive rejection override
     if not approved and not force_approve:
         _ai_rejection_streak[strat_name] = _ai_rejection_streak.get(strat_name, 0) + 1
         if _ai_rejection_streak[strat_name] >= 3 and strat_name not in _ai_rejection_override_until:
-            _ai_rejection_override_until[strat_name] = time.time() + 86400  # 24 hours
+            _ai_rejection_override_until[strat_name] = time.time() + 86400
             await tg_send(
-                f"\u26a0\ufe0f <b>AI Brain override activated</b> for {STRATEGY_LABELS.get(strat_name, strat_name)}\n"
+                f"\u26a0\ufe0f <b>AI Brain override activated</b> for {label}\n"
                 f"3+ consecutive rejections -- AI brain is now informational only for this strategy for 24h.\n"
                 f"GG has been notified."
             )
     elif approved or force_approve:
-        _ai_rejection_streak[strat_name] = 0  # reset on approval
+        _ai_rejection_streak[strat_name] = 0
 
-    # Check if strategy has an active override (AI brain informational only)
     if not approved and not force_approve:
         override_until = _ai_rejection_override_until.get(strat_name, 0)
         if time.time() < override_until:
@@ -1947,16 +2802,14 @@ async def run_all_strategies():
             log.info("AI Brain override active for %s -- treating as informational, forcing APPROVE", strat_name)
 
     if not approved and not force_approve:
-        # Confidence <= 5 and AI rejected -- allowed ONLY for technical reasons
         log.info("AI Market Brain REJECTED %s %s (confidence %d): %s",
                  strat_name, signal["side"], confidence, ai_reason)
-        # --- Telegram rate limit: max 3 rejection messages per hour ---
         now = time.time()
         _tg_rejection_timestamps[:] = [t for t in _tg_rejection_timestamps if now - t < 3600]
         if len(_tg_rejection_timestamps) < 3:
             _tg_rejection_timestamps.append(now)
             await tg_send(
-                f"\u274c <b>AI Brain REJECTED</b> -- {STRATEGY_LABELS.get(strat_name, strat_name)}\n"
+                f"\u274c <b>AI Brain REJECTED</b> -- {label}\n"
                 f"{signal['side'].upper()} @ ${signal['entry']:,.2f} | Confidence: {confidence}/10\n"
                 f"{sanitize_html(ai_reason[:200])}"
             )
@@ -1966,14 +2819,13 @@ async def run_all_strategies():
                 f"\U0001f507 <b>AI Brain rejection notifications suppressed</b>\n"
                 f"3+ rejections this hour. Will send hourly summary instead."
             )
-        # else: suppressed
         return
     else:
         if force_approve and not approved:
             approved = True
             log.info("AI Brain overridden for %s -- proceeding with trade (confidence %d)", strat_name, confidence)
 
-    # Execute — respect per-strategy leverage caps
+    # Execute
     max_lev = signal.get("max_leverage")
     await execute_trade(
         signal["strategy"], signal["side"], signal["entry"],
@@ -2023,7 +2875,7 @@ async def position_monitor_loop():
                 await close_position(price, "Take Profit")
                 continue
 
-            # 3. Macro tighten: if HIGH macro, tighten SL. If CRITICAL and against us, close.
+            # 3. Macro tighten
             macro_text = _macro_intel_cache.get("text", "").upper()
             if "RISK_LEVEL: CRITICAL" in macro_text:
                 if side == "long":
@@ -2034,7 +2886,6 @@ async def position_monitor_loop():
                     await close_position(price, "CRITICAL macro + price moving against position")
                     continue
                 else:
-                    # Tighten SL to breakeven
                     if side == "long" and sl < entry:
                         pos["sl"] = entry
                         await tg_send(f"\u26a0\ufe0f <b>CRITICAL macro</b> -- SL tightened to breakeven ${entry:,.0f}")
@@ -2043,7 +2894,6 @@ async def position_monitor_loop():
                         await tg_send(f"\u26a0\ufe0f <b>CRITICAL macro</b> -- SL tightened to breakeven ${entry:,.0f}")
 
             elif "RISK_LEVEL: HIGH" in macro_text:
-                # Tighten SL by 30%
                 current_sl_dist = abs(entry - sl)
                 tighter_dist = current_sl_dist * 0.7
                 if side == "long":
@@ -2055,12 +2905,13 @@ async def position_monitor_loop():
                     if new_sl < sl:
                         pos["sl"] = new_sl
 
-            # 4. Intelligent early exit -- detect failed trade signals
+            # 4. Intelligent early exit
             await _check_intelligent_exit(pos, price)
 
             # 5. Max hold time
             strategy = pos["strategy"]
-            max_hold_min = STRATEGY_MAX_HOLD.get(strategy, 480)
+            strat_def = ALL_STRATEGY_DEFS.get(strategy, {})
+            max_hold_min = strat_def.get("max_hold", 480)
             open_time = datetime.fromisoformat(pos["open_time"])
             elapsed_min = (datetime.now(timezone.utc) - open_time).total_seconds() / 60.0
             if elapsed_min >= max_hold_min:
@@ -2114,20 +2965,6 @@ async def _check_intelligent_exit(pos: dict, price: float):
             log.info("Intelligent exit: strong bullish candle against short position")
             await close_position(price, "Intelligent exit -- strong opposing candle + volume")
 
-    # For liquidity_sweep: if price continues in sweep direction after entry, exit immediately
-    if strategy == "liquidity_sweep":
-        if side == "long" and price < entry - pos["sl_distance"] * 0.5:
-            await close_position(price, "Failed sweep -- price continuing down")
-        elif side == "short" and price > entry + pos["sl_distance"] * 0.5:
-            await close_position(price, "Failed sweep -- price continuing up")
-
-    # For order_block: if price closes through OB without reversing, exit
-    if strategy == "order_block" and elapsed > 600:
-        if side == "long" and price < pos["sl"] + pos["sl_distance"] * 0.3:
-            await close_position(price, "OB invalidated -- price breaking through zone")
-        elif side == "short" and price > pos["sl"] - pos["sl_distance"] * 0.3:
-            await close_position(price, "OB invalidated -- price breaking through zone")
-
 
 # ---------------------------------------------------------------------------
 # Background Tasks -- Scheduling
@@ -2165,15 +3002,15 @@ async def strategy_monitor_loop():
             now = datetime.now(timezone.utc)
             current_ts = now.timestamp()
 
-            # 5m boundary -- liquidity sweep, vwap reclaim
+            # 5m boundary
             current_5m = int(current_ts // 300) * 300
             new_5m = current_5m > state.last_5m_candle_ts
 
-            # 15m boundary -- liquidity sweep, vwap reclaim, order block
+            # 15m boundary
             current_15m = int(current_ts // 900) * 900
             new_15m = current_15m > state.last_15m_candle_ts
 
-            # 1h boundary -- funding rate fade, ema trend pullback, order block
+            # 1h boundary
             current_1h = int(current_ts // 3600) * 3600
             new_1h = current_1h > state.last_1h_candle_ts
 
@@ -2207,19 +3044,21 @@ async def periodic_status_log():
             log.info(
                 "=== PERIODIC STATUS ===\n"
                 "  Regime: %s | HTF Bias: %s (%s) | BTC: $%.2f | Mode: %s\n"
-                "  Active strategies: %s\n"
+                "  Active strategies: %d/%d\n"
                 "  Signals checked: %d | Signals blocked: %d\n"
-                "  Trades today: %d | Losses: %d/%d | PnL: $%.2f\n"
+                "  Trades today: %d/%d | Losses: %d/%d | PnL: $%.2f\n"
                 "  Position: %s\n"
-                "  Funding rate: %.6f",
+                "  Funding rate: %.6f | Research: %s",
                 state.regime.value, state.htf_bias, state.htf_bias_strength,
                 state.last_btc_price, state.mode,
-                ", ".join(state.active_strategies) if state.active_strategies else "none",
+                len(state.active_strategies), len(ALL_STRATEGY_DEFS),
                 state.signals_checked, state.signals_blocked,
-                state.trades_today, state.losses_today, MAX_LOSSES_PER_DAY,
+                state.trades_today, MAX_TRADES_PER_DAY,
+                state.losses_today, MAX_LOSSES_PER_DAY,
                 state.daily_pnl,
                 pos_text,
                 state.current_funding_rate,
+                "complete" if state.research_complete else "pending",
             )
         except Exception as exc:
             log.error("Periodic status error: %s", exc)
@@ -2360,6 +3199,325 @@ async def _check_crypto_news():
 
 
 # ---------------------------------------------------------------------------
+# Paginated Data Downloader
+# ---------------------------------------------------------------------------
+
+async def download_historical_data(timeframe: str, days: int = 90) -> pd.DataFrame:
+    """Download N days of data, paginating in chunks. Log progress to Telegram."""
+    if not hl_info:
+        return pd.DataFrame()
+
+    tf_seconds = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+                  "1h": 3600, "2h": 7200, "4h": 14400, "1d": 86400}
+    interval_sec = tf_seconds.get(timeframe, 60)
+    chunk_candles = 5000
+    chunk_ms = chunk_candles * interval_sec * 1000
+
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - (days * 24 * 3600 * 1000)
+
+    all_rows = []
+    cursor = start_ms
+    chunk_num = 0
+    total_chunks = max(1, int((now_ms - start_ms) / chunk_ms) + 1)
+
+    while cursor < now_ms:
+        end = min(cursor + chunk_ms, now_ms)
+        try:
+            loop = asyncio.get_event_loop()
+            raw = await loop.run_in_executor(
+                None, lambda s=cursor, e=end: hl_info.candles_snapshot("BTC", timeframe, s, e)
+            )
+            if raw:
+                for c in raw:
+                    all_rows.append({
+                        "timestamp": pd.to_datetime(c["t"], unit="ms"),
+                        "open": float(c["o"]),
+                        "high": float(c["h"]),
+                        "low": float(c["l"]),
+                        "close": float(c["c"]),
+                        "volume": float(c["v"]),
+                    })
+        except Exception as exc:
+            log.error("Download chunk error (%s, chunk %d): %s", timeframe, chunk_num, exc)
+
+        chunk_num += 1
+        cursor = end
+        if chunk_num % 5 == 0:
+            pct = min(100, int(chunk_num / total_chunks * 100))
+            log.info("Downloading %s: %d%% (%d candles so far)", timeframe, pct, len(all_rows))
+        await asyncio.sleep(0.2)  # Rate limit
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows)
+    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    log.info("Downloaded %d %s candles (%d days)", len(df), timeframe, days)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 90-Day Backtest Engine
+# ---------------------------------------------------------------------------
+
+def _simulate_trade_forward(df: pd.DataFrame, entry_idx: int, side: str,
+                             entry: float, sl: float, tp: float, size: float,
+                             max_bars: int = 48) -> Optional[dict]:
+    """Walk forward candle by candle to simulate a trade."""
+    for offset in range(1, max_bars + 1):
+        idx = entry_idx + offset
+        if idx >= len(df):
+            break
+
+        high = float(df["high"].iloc[idx])
+        low = float(df["low"].iloc[idx])
+
+        # SL check
+        if side == "long" and low <= sl:
+            pnl = (sl - entry) * size
+            return {"side": side, "entry": entry, "exit": sl, "pnl": round(pnl, 2),
+                    "reason": "SL", "bars_held": offset}
+        if side == "short" and high >= sl:
+            pnl = (entry - sl) * size
+            return {"side": side, "entry": entry, "exit": sl, "pnl": round(pnl, 2),
+                    "reason": "SL", "bars_held": offset}
+
+        # TP check
+        if side == "long" and high >= tp:
+            pnl = (tp - entry) * size
+            return {"side": side, "entry": entry, "exit": tp, "pnl": round(pnl, 2),
+                    "reason": "TP", "bars_held": offset}
+        if side == "short" and low <= tp:
+            pnl = (entry - tp) * size
+            return {"side": side, "entry": entry, "exit": tp, "pnl": round(pnl, 2),
+                    "reason": "TP", "bars_held": offset}
+
+    # Timeout
+    last_idx = min(entry_idx + max_bars, len(df) - 1)
+    exit_price = float(df["close"].iloc[last_idx])
+    if side == "long":
+        pnl = (exit_price - entry) * size
+    else:
+        pnl = (entry - exit_price) * size
+    return {"side": side, "entry": entry, "exit": exit_price, "pnl": round(pnl, 2),
+            "reason": "timeout", "bars_held": max_bars}
+
+
+def _calc_backtest_stats(strategy: str, trades: list) -> dict:
+    """Calculate backtest statistics for a strategy."""
+    if not trades:
+        return {
+            "strategy": strategy, "total_trades": 0, "wins": 0, "losses": 0,
+            "win_rate": 0.0, "total_pnl": 0.0, "avg_r": 0.0, "max_drawdown": 0.0,
+            "max_consec_losses": 0, "passed": False,
+        }
+
+    wins = sum(1 for t in trades if t["pnl"] > 0)
+    losses = sum(1 for t in trades if t["pnl"] <= 0)
+    total_pnl = sum(t["pnl"] for t in trades)
+    risk_per_trade = ACCOUNT_CAPITAL * TARGET_RISK_PCT  # $7.40
+
+    r_values = [t["pnl"] / risk_per_trade for t in trades]
+    avg_r = sum(r_values) / len(r_values) if r_values else 0.0
+    win_rate = wins / len(trades) if trades else 0.0
+
+    # Max drawdown
+    cum_pnl = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for t in trades:
+        cum_pnl += t["pnl"]
+        if cum_pnl > peak:
+            peak = cum_pnl
+        dd = peak - cum_pnl
+        if dd > max_dd:
+            max_dd = dd
+
+    # Max consecutive losses
+    max_consec = 0
+    current_consec = 0
+    for t in trades:
+        if t["pnl"] <= 0:
+            current_consec += 1
+            max_consec = max(max_consec, current_consec)
+        else:
+            current_consec = 0
+
+    # Max drawdown as percentage of account
+    max_dd_pct = max_dd / ACCOUNT_CAPITAL * 100
+
+    # PASS criteria
+    passed = (
+        win_rate >= BACKTEST_MIN_WIN_RATE and  # >55% win rate
+        len(trades) >= 30 and                   # Minimum 30 trades in 90 days
+        avg_r > 0 and                           # Positive expectancy
+        max_consec < 8 and                      # Max consecutive losses < 8
+        max_dd_pct < 25                         # Max drawdown < 25%
+    )
+
+    return {
+        "strategy": strategy, "total_trades": len(trades), "wins": wins, "losses": losses,
+        "win_rate": round(win_rate, 4), "total_pnl": round(total_pnl, 2),
+        "avg_r": round(avg_r, 2), "max_drawdown": round(max_dd, 2),
+        "max_drawdown_pct": round(max_dd_pct, 1),
+        "max_consec_losses": max_consec,
+        "passed": passed,
+        "trades": trades[-10:],
+    }
+
+
+def _is_session_candle(ts) -> bool:
+    """Check if a candle timestamp falls in London (07:00-11:00) or NY (13:00-17:00) sessions."""
+    if hasattr(ts, "hour"):
+        h = ts.hour
+        return (7 <= h < 11) or (13 <= h < 17)
+    return False
+
+
+def _is_weekend_candle(ts) -> bool:
+    """Check if a candle falls on Saturday or Sunday."""
+    if hasattr(ts, "weekday"):
+        return ts.weekday() >= 5
+    return False
+
+
+async def run_full_backtest():
+    """Phase 1-3: Download 90 days, test all 50 strategies, report results."""
+    log.info("Starting 90-day full backtest...")
+    await tg_send("\U0001f50d <b>Research phase starting...</b>\nDownloading 90 days of data...")
+
+    # Download data for each timeframe
+    data = {}
+    for tf in ["5m", "15m", "1h"]:
+        await tg_send(f"\U0001f4e5 Downloading {tf} data...")
+        data[tf] = await download_historical_data(tf, 90)
+        if not data[tf].empty:
+            await tg_send(f"\u2705 {tf}: {len(data[tf])} candles downloaded")
+        else:
+            await tg_send(f"\u26a0\ufe0f {tf}: No data received")
+
+    # Skip 1m download -- too much data, and most strategies use 5m+
+    data["1m"] = data.get("5m", pd.DataFrame())  # Use 5m as proxy for 1m strategies
+
+    # Precompute indicators
+    await tg_send("\U0001f4ca Precomputing indicators...")
+    for tf in data:
+        if not data[tf].empty and len(data[tf]) >= 55:
+            try:
+                data[tf] = precompute_indicators(data[tf])
+            except Exception as exc:
+                log.error("Precompute error for %s: %s", tf, exc)
+
+    # Test each strategy
+    results = {}
+    passed_names = []
+    failed_names = []
+
+    await tg_send(f"\U0001f9ea Testing {len(ALL_STRATEGY_DEFS)} strategies...")
+
+    for name, sdef in ALL_STRATEGY_DEFS.items():
+        tf = sdef["tf"]
+        df = data.get(tf, pd.DataFrame())
+        if df.empty or len(df) < 100:
+            results[name] = _calc_backtest_stats(name, [])
+            failed_names.append(name)
+            continue
+
+        signal_func = sdef["signal_func"]
+        max_bars = max(12, sdef["max_hold"] // 5)  # Convert hold time to bars
+
+        # Walk through data
+        trades = []
+        daily_trade_count = {}
+        i = 55
+
+        while i < len(df) - max_bars:
+            ts = df["timestamp"].iloc[i]
+
+            # Skip weekends
+            if _is_weekend_candle(ts):
+                i += 1
+                continue
+
+            # Sessions only
+            if not _is_session_candle(ts):
+                i += 1
+                continue
+
+            # Max 4 trades per day
+            day_key = ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10]
+            if daily_trade_count.get(day_key, 0) >= MAX_TRADES_PER_DAY:
+                i += 1
+                continue
+
+            try:
+                sig = signal_func(df, i)
+            except Exception:
+                i += 1
+                continue
+
+            if sig:
+                # Validate TP direction
+                if sig["side"] == "long" and sig["tp"] <= sig["entry"]:
+                    i += 1
+                    continue
+                if sig["side"] == "short" and sig["tp"] >= sig["entry"]:
+                    i += 1
+                    continue
+
+                sl_dist = abs(sig["entry"] - sig["sl"])
+                size = (ACCOUNT_CAPITAL * TARGET_RISK_PCT) / sl_dist if sl_dist > 0 else 0
+                if size <= 0:
+                    i += 1
+                    continue
+
+                result = _simulate_trade_forward(df, i, sig["side"], sig["entry"],
+                                                  sig["sl"], sig["tp"], size, max_bars)
+                if result:
+                    trades.append(result)
+                    daily_trade_count[day_key] = daily_trade_count.get(day_key, 0) + 1
+                    i += result.get("bars_held", 1) + 1
+                    continue
+            i += 1
+
+        stats = _calc_backtest_stats(name, trades)
+        results[name] = stats
+
+        if stats["passed"]:
+            passed_names.append(name)
+        else:
+            failed_names.append(name)
+
+    # Save results
+    results["timestamp"] = datetime.now(timezone.utc).isoformat()
+    try:
+        d = os.path.dirname(BACKTEST_FILE)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(BACKTEST_FILE, "w") as f:
+            json.dump(results, f, indent=2, default=str)
+        # Save failed strategies
+        with open(FAILED_STRATEGIES_FILE, "w") as f:
+            json.dump({"failed": failed_names, "timestamp": datetime.now(timezone.utc).isoformat()}, f, indent=2)
+    except Exception as exc:
+        log.error("Backtest save error: %s", exc)
+
+    # Report results
+    msg_lines = [f"\U0001f4ca <b>BACKTEST RESULTS (90 days)</b>\n"]
+    msg_lines.append(f"<b>PASSED ({len(passed_names)}):</b>")
+    for name in passed_names[:15]:
+        s = results[name]
+        msg_lines.append(f"  \u2705 {name}: WR {s['win_rate']*100:.0f}% | {s['total_trades']} trades | ${s['total_pnl']:+,.0f}")
+    if len(passed_names) > 15:
+        msg_lines.append(f"  ... and {len(passed_names) - 15} more")
+    msg_lines.append(f"\n<b>FAILED ({len(failed_names)}):</b> {len(failed_names)} strategies did not meet criteria")
+    await tg_send("\n".join(msg_lines))
+
+    return results, passed_names, failed_names
+
+
+# ---------------------------------------------------------------------------
 # Daily Summary & Reset
 # ---------------------------------------------------------------------------
 
@@ -2401,7 +3559,7 @@ async def send_daily_self_review():
 
     # Strategy metrics
     metrics_text = ""
-    for name in ALL_STRATEGY_NAMES:
+    for name in state.active_strategies:
         m = state.metrics.get(name, {})
         tc = m.get("trade_count", 0)
         wr = (m.get("wins", 0) / tc * 100) if tc > 0 else 0
@@ -2409,7 +3567,7 @@ async def send_daily_self_review():
 
     # Backtest results
     bt_text = ""
-    for name in ALL_STRATEGY_NAMES:
+    for name in state.active_strategies:
         bt = state.backtest_results.get(name, {})
         bt_text += f"  {name}: BT WR {bt.get('win_rate',0)*100:.0f}%, {bt.get('total_trades',0)} trades\n"
 
@@ -2422,7 +3580,7 @@ async def send_daily_self_review():
                 f"You are Vic's daily self-review analyst. Analyse today's trading and propose specific improvements.\n\n"
                 f"TODAY'S TRADES:\n{trades_text}\n"
                 f"LIFETIME STRATEGY METRICS:\n{metrics_text}\n"
-                f"30-DAY BACKTEST RESULTS:\n{bt_text}\n"
+                f"90-DAY BACKTEST RESULTS:\n{bt_text}\n"
                 f"TOP TRADER INTEL:\n{intel or 'No data'}\n\n"
                 f"Analyse:\n"
                 f"1. Each trade: why it won or lost, what filter would have caught the losers\n"
@@ -2481,16 +3639,18 @@ async def send_daily_self_review():
     # Send to Telegram
     summary_lines = [f"\U0001f4ca <b>DAILY SELF-REVIEW ({today})</b>\n"]
 
-    for name in ALL_STRATEGY_NAMES:
+    for name in state.active_strategies[:10]:
         m = state.metrics.get(name, {})
         tc = m.get("trade_count", 0)
         wr = (m.get("wins", 0) / tc * 100) if tc > 0 else 0
-        active = name in state.active_strategies
         paused = state.strategy_paused.get(name, False)
-        status = "PAUSED" if paused else ("Active" if active else "Inactive")
+        status = "PAUSED" if paused else "Active"
         summary_lines.append(
             f"  <b>{name}</b> [{status}]: WR {wr:.0f}% ({tc} trades) | PnL ${m.get('current_pnl', 0):+,.2f}"
         )
+
+    if len(state.active_strategies) > 10:
+        summary_lines.append(f"  ... and {len(state.active_strategies) - 10} more active strategies")
 
     summary_lines.append(f"\n<b>Today:</b> {len(today_trades)} trades | PnL ${state.daily_pnl:+,.2f}")
     summary_lines.append(f"\n<b>Review:</b>\n{sanitize_html(review_text[:1500])}")
@@ -2512,391 +3672,11 @@ async def daily_reset_scheduler():
 
 
 # ---------------------------------------------------------------------------
-# Backtesting Engine
+# Nightly Backtest Re-evaluation
 # ---------------------------------------------------------------------------
 
-def _simulate_trade_forward(df: pd.DataFrame, entry_idx: int, side: str,
-                             entry: float, sl: float, tp: float, size: float,
-                             max_bars: int = 48) -> Optional[dict]:
-    """Walk forward candle by candle to simulate a trade."""
-    for offset in range(1, max_bars + 1):
-        idx = entry_idx + offset
-        if idx >= len(df):
-            break
-
-        high = float(df["high"].iloc[idx])
-        low = float(df["low"].iloc[idx])
-
-        # SL check
-        if side == "long" and low <= sl:
-            pnl = (sl - entry) * size
-            return {"side": side, "entry": entry, "exit": sl, "pnl": round(pnl, 2),
-                    "reason": "SL", "bars_held": offset}
-        if side == "short" and high >= sl:
-            pnl = (entry - sl) * size
-            return {"side": side, "entry": entry, "exit": sl, "pnl": round(pnl, 2),
-                    "reason": "SL", "bars_held": offset}
-
-        # TP check
-        if side == "long" and high >= tp:
-            pnl = (tp - entry) * size
-            return {"side": side, "entry": entry, "exit": tp, "pnl": round(pnl, 2),
-                    "reason": "TP", "bars_held": offset}
-        if side == "short" and low <= tp:
-            pnl = (entry - tp) * size
-            return {"side": side, "entry": entry, "exit": tp, "pnl": round(pnl, 2),
-                    "reason": "TP", "bars_held": offset}
-
-    # Timeout
-    last_idx = min(entry_idx + max_bars, len(df) - 1)
-    exit_price = float(df["close"].iloc[last_idx])
-    if side == "long":
-        pnl = (exit_price - entry) * size
-    else:
-        pnl = (entry - exit_price) * size
-    return {"side": side, "entry": entry, "exit": exit_price, "pnl": round(pnl, 2),
-            "reason": "timeout", "bars_held": max_bars}
-
-
-def _backtest_strategy_generic(df: pd.DataFrame, strategy_name: str,
-                                signal_func, max_bars: int = 48) -> list:
-    """Generic backtester that takes a signal function and walks through data."""
-    trades = []
-    i = 50
-    while i < len(df) - 10:
-        signal = signal_func(df, i)
-        if signal:
-            result = _simulate_trade_forward(
-                df, i, signal["side"], signal["entry"], signal["sl"], signal["tp"],
-                signal.get("size", 0.001), max_bars
-            )
-            if result:
-                trades.append(result)
-                i += result.get("bars_held", 1) + 1
-            else:
-                i += 1
-        else:
-            i += 1
-    return trades
-
-
-def _bt_signal_ema_pullback(df: pd.DataFrame, i: int) -> Optional[dict]:
-    """Backtest signal generator for EMA trend pullback on 1H data."""
-    if i < 200:
-        return None
-
-    close = df["close"].values
-    high = df["high"].values
-    low = df["low"].values
-    open_prices = df["open"].values
-
-    # Calculate EMAs
-    ema200 = pd.Series(close[:i+1]).ewm(span=200, adjust=False).mean().values
-    ema21 = pd.Series(close[:i+1]).ewm(span=21, adjust=False).mean().values
-    ema50 = pd.Series(close[:i+1]).ewm(span=50, adjust=False).mean().values
-
-    if len(ema200) < 6:
-        return None
-
-    slope = (ema200[-1] - ema200[-5]) / ema200[-5] * 100 if ema200[-5] != 0 else 0
-    trend = "bullish" if slope > 0.01 else "bearish" if slope < -0.01 else None
-    if not trend:
-        return None
-
-    price = close[i]
-    body = abs(close[i] - open_prices[i])
-    full_range = high[i] - low[i]
-    if full_range == 0:
-        return None
-
-    touched_ema = (low[i] <= ema21[-1] <= high[i]) or (low[i] <= ema50[-1] <= high[i])
-    if not touched_ema:
-        return None
-
-    atr_vals = pd.Series(close[:i+1]).diff().abs().rolling(14).mean().values
-    atr_val = atr_vals[-1] if len(atr_vals) > 0 and not np.isnan(atr_vals[-1]) else 0
-    if atr_val <= 0:
-        return None
-
-    if trend == "bullish" and close[i] > open_prices[i] and body / full_range >= 0.5:
-        sl_dist = min(abs(price - low[i]) + atr_val * 0.2, 1.5 * atr_val)
-        size = 20.0 / sl_dist if sl_dist > 0 else 0
-        if size <= 0:
-            return None
-        return {"side": "long", "entry": price, "sl": price - sl_dist,
-                "tp": price + sl_dist * 2, "size": size}
-
-    if trend == "bearish" and close[i] < open_prices[i] and body / full_range >= 0.5:
-        sl_dist = min(abs(high[i] - price) + atr_val * 0.2, 1.5 * atr_val)
-        size = 20.0 / sl_dist if sl_dist > 0 else 0
-        if size <= 0:
-            return None
-        return {"side": "short", "entry": price, "sl": price + sl_dist,
-                "tp": price - sl_dist * 2, "size": size}
-
-    return None
-
-
-def _bt_signal_vwap_reclaim(df: pd.DataFrame, i: int) -> Optional[dict]:
-    """Backtest signal generator for VWAP reclaim on 5m/15m data."""
-    if i < 25:
-        return None
-
-    vwap = calc_vwap(df.iloc[:i+1])
-    if len(vwap) < 2 or np.isnan(vwap.iloc[-1]) or np.isnan(vwap.iloc[-2]):
-        return None
-
-    price = float(df["close"].iloc[i])
-    prev_close = float(df["close"].iloc[i-1])
-    open_price = float(df["open"].iloc[i])
-    vwap_now = float(vwap.iloc[-1])
-    vwap_prev = float(vwap.iloc[-2])
-    body = abs(price - open_price)
-    full_range = float(df["high"].iloc[i]) - float(df["low"].iloc[i])
-    if full_range == 0:
-        return None
-
-    avg_vol = float(df["volume"].iloc[max(0,i-20):i].mean())
-    curr_vol = float(df["volume"].iloc[i])
-    if avg_vol == 0 or curr_vol < avg_vol * 1.5 or body / full_range < 0.6:
-        return None
-
-    rsi = calc_rsi(df["close"].iloc[:i+1], 14)
-    rsi_val = float(rsi.iloc[-1]) if len(rsi) > 0 and not np.isnan(rsi.iloc[-1]) else 50
-
-    atr_s = calc_atr(df.iloc[max(0,i-20):i+1], 14)
-    atr_val = float(atr_s.iloc[-1]) if len(atr_s) > 0 and not np.isnan(atr_s.iloc[-1]) else 0
-    if atr_val <= 0:
-        return None
-
-    if prev_close < vwap_prev and price > vwap_now and price > open_price and rsi_val > 50:
-        sl_dist = 1.0 * atr_val
-        size = 20.0 / sl_dist if sl_dist > 0 else 0
-        return {"side": "long", "entry": price, "sl": price - sl_dist,
-                "tp": price + sl_dist * 2, "size": size} if size > 0 else None
-
-    if prev_close > vwap_prev and price < vwap_now and price < open_price and rsi_val < 50:
-        sl_dist = 1.0 * atr_val
-        size = 20.0 / sl_dist if sl_dist > 0 else 0
-        return {"side": "short", "entry": price, "sl": price + sl_dist,
-                "tp": price - sl_dist * 2, "size": size} if size > 0 else None
-
-    return None
-
-
-def _calc_backtest_stats(strategy: str, trades: list) -> dict:
-    """Calculate backtest statistics for a strategy."""
-    if not trades:
-        return {
-            "strategy": strategy, "total_trades": 0, "wins": 0, "losses": 0,
-            "win_rate": 0.0, "total_pnl": 0.0, "avg_r": 0.0, "max_drawdown": 0.0,
-        }
-
-    wins = sum(1 for t in trades if t["pnl"] > 0)
-    losses = sum(1 for t in trades if t["pnl"] <= 0)
-    total_pnl = sum(t["pnl"] for t in trades)
-    risk_per_trade = 20.0  # Backtest uses $20 risk
-
-    r_values = [t["pnl"] / risk_per_trade for t in trades]
-    avg_r = sum(r_values) / len(r_values) if r_values else 0.0
-    win_rate = wins / len(trades) if trades else 0.0
-
-    # Max drawdown
-    cum_pnl = 0.0
-    peak = 0.0
-    max_dd = 0.0
-    for t in trades:
-        cum_pnl += t["pnl"]
-        if cum_pnl > peak:
-            peak = cum_pnl
-        dd = peak - cum_pnl
-        if dd > max_dd:
-            max_dd = dd
-
-    return {
-        "strategy": strategy, "total_trades": len(trades), "wins": wins, "losses": losses,
-        "win_rate": round(win_rate, 4), "total_pnl": round(total_pnl, 2),
-        "avg_r": round(avg_r, 2), "max_drawdown": round(max_dd, 2),
-        "trades": trades[-10:],
-    }
-
-
-async def run_backtest() -> dict:
-    """Run 30-day backtest on all 5 strategies."""
-    log.info("Starting 30-day backtest...")
-
-    now_ms = int(time.time() * 1000)
-    start_ms = now_ms - (30 * 24 * 3600 * 1000)
-
-    # Fetch data for different timeframes
-    log.info("Fetching 30 days of 1h candles...")
-    df_1h = await fetch_ohlcv_range("1h", start_ms, now_ms)
-    log.info("Fetched %d 1h candles", len(df_1h))
-
-    log.info("Fetching 30 days of 5m candles...")
-    df_5m = await fetch_ohlcv_range("5m", start_ms, now_ms)
-    log.info("Fetched %d 5m candles", len(df_5m))
-
-    log.info("Fetching 30 days of 15m candles...")
-    df_15m = await fetch_ohlcv_range("15m", start_ms, now_ms)
-    log.info("Fetched %d 15m candles", len(df_15m))
-
-    results = {}
-
-    # Strategy 1: Funding Rate Fade -- can't properly backtest without historical funding data
-    # We'll report N/A and always activate it
-    results["funding_rate_fade"] = {
-        "strategy": "funding_rate_fade", "total_trades": 0, "wins": 0, "losses": 0,
-        "win_rate": 0.55, "total_pnl": 0, "avg_r": 0, "max_drawdown": 0,
-        "note": "Funding rate history not available for backtest -- strategy always active",
-    }
-
-    # Strategy 2: Liquidity Sweep -- complex to backtest, use simplified version
-    # Using 5m data with swing detection
-    log.info("Backtesting Liquidity Sweep (simplified)...")
-    sweep_trades = []
-    if not df_5m.empty and len(df_5m) > 60:
-        df_bt = df_5m.copy()
-        df_bt["rsi"] = calc_rsi(df_bt["close"], 14)
-        atr_s = calc_atr(df_bt, 14)
-        i = 55
-        while i < len(df_bt) - 10:
-            # Find swing lows/highs in lookback
-            if i < 55:
-                i += 1
-                continue
-            highs_lb = df_bt["high"].values[i-50:i]
-            lows_lb = df_bt["low"].values[i-50:i]
-            sh = [highs_lb[j] for j in range(2, len(highs_lb)-2)
-                  if highs_lb[j] > highs_lb[j-1] and highs_lb[j] > highs_lb[j+1]]
-            sl_pts = [lows_lb[j] for j in range(2, len(lows_lb)-2)
-                      if lows_lb[j] < lows_lb[j-1] and lows_lb[j] < lows_lb[j+1]]
-
-            price = float(df_bt["close"].iloc[i])
-            low = float(df_bt["low"].iloc[i])
-            high = float(df_bt["high"].iloc[i])
-            atr = float(atr_s.iloc[i]) if i < len(atr_s) and not np.isnan(atr_s.iloc[i]) else 0
-            if atr <= 0 or not sl_pts or not sh:
-                i += 1
-                continue
-
-            avg_vol = float(df_bt["volume"].iloc[i-20:i].mean())
-            curr_vol = float(df_bt["volume"].iloc[i])
-
-            signal = None
-            for sw_low in sl_pts[-3:]:
-                if low < sw_low and price > sw_low and curr_vol > avg_vol * 1.5:
-                    sl_d = abs(price - low) + atr * 0.2
-                    size = 20.0 / sl_d if sl_d > 0 else 0
-                    if size > 0 and sh:
-                        signal = {"side": "long", "entry": price, "sl": low - atr * 0.2,
-                                  "tp": sh[-1], "size": size}
-                    break
-
-            if not signal:
-                for sw_high in sh[-3:]:
-                    if high > sw_high and price < sw_high and curr_vol > avg_vol * 1.5:
-                        sl_d = abs(high - price) + atr * 0.2
-                        size = 20.0 / sl_d if sl_d > 0 else 0
-                        if size > 0 and sl_pts:
-                            signal = {"side": "short", "entry": price, "sl": high + atr * 0.2,
-                                      "tp": sl_pts[-1], "size": size}
-                        break
-
-            if signal:
-                result = _simulate_trade_forward(df_bt, i, signal["side"], signal["entry"],
-                                                  signal["sl"], signal["tp"], signal["size"], 48)
-                if result:
-                    sweep_trades.append(result)
-                    i += result.get("bars_held", 1) + 1
-                    continue
-            i += 1
-
-    results["liquidity_sweep"] = _calc_backtest_stats("liquidity_sweep", sweep_trades)
-    log.info("Liquidity Sweep: %d trades, %.1f%% WR",
-             results["liquidity_sweep"]["total_trades"], results["liquidity_sweep"]["win_rate"] * 100)
-
-    # Strategy 3: EMA Trend Pullback on 1H
-    log.info("Backtesting EMA Trend Pullback...")
-    ema_trades = _backtest_strategy_generic(df_1h, "ema_trend_pullback", _bt_signal_ema_pullback, 12)
-    results["ema_trend_pullback"] = _calc_backtest_stats("ema_trend_pullback", ema_trades)
-    log.info("EMA Trend Pullback: %d trades, %.1f%% WR",
-             results["ema_trend_pullback"]["total_trades"], results["ema_trend_pullback"]["win_rate"] * 100)
-
-    # Strategy 4: VWAP Reclaim on 15m
-    log.info("Backtesting VWAP Reclaim...")
-    vwap_trades = _backtest_strategy_generic(df_15m, "vwap_reclaim", _bt_signal_vwap_reclaim, 12)
-    results["vwap_reclaim"] = _calc_backtest_stats("vwap_reclaim", vwap_trades)
-    log.info("VWAP Reclaim: %d trades, %.1f%% WR",
-             results["vwap_reclaim"]["total_trades"], results["vwap_reclaim"]["win_rate"] * 100)
-
-    # Strategy 5: Order Block -- complex, simplified backtest
-    log.info("Backtesting Order Block (simplified)...")
-    ob_trades = []
-    if not df_15m.empty and len(df_15m) > 60:
-        df_bt = df_15m.copy()
-        atr_s = calc_atr(df_bt, 14)
-        rsi_s = calc_rsi(df_bt["close"], 14)
-        i = 55
-        while i < len(df_bt) - 10:
-            atr = float(atr_s.iloc[i]) if i < len(atr_s) and not np.isnan(atr_s.iloc[i]) else 0
-            if atr <= 0:
-                i += 1
-                continue
-
-            price = float(df_bt["close"].iloc[i])
-            # Look for bullish impulse in last 20 candles
-            for k in range(max(3, i-20), i-3):
-                impulse_ok = all(float(df_bt["close"].iloc[k+j]) > float(df_bt["open"].iloc[k+j]) for j in range(3))
-                if impulse_ok:
-                    start_p = float(df_bt["open"].iloc[k])
-                    end_p = float(df_bt["close"].iloc[k+2])
-                    if start_p > 0 and (end_p - start_p) / start_p * 100 >= 0.5:
-                        ob_idx = k - 1
-                        if ob_idx >= 0 and float(df_bt["close"].iloc[ob_idx]) < float(df_bt["open"].iloc[ob_idx]):
-                            ob_high = float(df_bt["high"].iloc[ob_idx])
-                            ob_low = float(df_bt["low"].iloc[ob_idx])
-                            if ob_low <= price <= ob_high:
-                                sl_p = ob_low - atr * 0.2
-                                tp_p = end_p
-                                sl_d = abs(price - sl_p)
-                                size = 20.0 / sl_d if sl_d > 0 else 0
-                                if size > 0:
-                                    result = _simulate_trade_forward(df_bt, i, "long", price, sl_p, tp_p, size, 32)
-                                    if result:
-                                        ob_trades.append(result)
-                                        i += result.get("bars_held", 1) + 1
-                                        break
-            else:
-                i += 1
-                continue
-            continue
-
-    results["order_block"] = _calc_backtest_stats("order_block", ob_trades)
-    log.info("Order Block: %d trades, %.1f%% WR",
-             results["order_block"]["total_trades"], results["order_block"]["win_rate"] * 100)
-
-    # Save results
-    results["timestamp"] = datetime.now(timezone.utc).isoformat()
-    results["data_range"] = {
-        "start": datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).isoformat(),
-        "end": datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc).isoformat(),
-    }
-
-    try:
-        d = os.path.dirname(BACKTEST_FILE)
-        if d:
-            os.makedirs(d, exist_ok=True)
-        with open(BACKTEST_FILE, "w") as f:
-            json.dump(results, f, indent=2)
-    except Exception as exc:
-        log.error("Backtest save error: %s", exc)
-
-    return results
-
-
 async def backtest_scheduler():
-    """Run backtest daily at midnight UTC."""
+    """Run backtest daily at midnight UTC and re-evaluate strategies."""
     while True:
         now = datetime.now(timezone.utc)
         target = (now + timedelta(days=1)).replace(hour=0, minute=5, second=0, microsecond=0)
@@ -2907,27 +3687,28 @@ async def backtest_scheduler():
         await asyncio.sleep(wait_seconds)
 
         try:
-            bt_results = await run_backtest()
+            bt_results, passed_names, failed_names = await run_full_backtest()
             state.backtest_results = bt_results
+            state.active_strategies = passed_names
+            state.backtest_complete = True
 
-            # Only activate strategies that pass 50% WR in backtest
-            new_active = []
-            for name in ALL_STRATEGY_NAMES:
-                bt = bt_results.get(name, {})
-                wr = bt.get("win_rate", 0)
-                if wr >= BACKTEST_MIN_WIN_RATE or bt.get("note"):
-                    new_active.append(name)
-            state.active_strategies = new_active
+            # Initialize metrics for new strategies
+            for name in passed_names:
+                state._ensure_strategy_metrics(name)
+                state.strategy_paused[name] = False
+
             save_state()
 
-            bt_msg = ["\U0001f4ca <b>NIGHTLY BACKTEST (30 days)</b>\n"]
-            for name in ALL_STRATEGY_NAMES:
+            bt_msg = [f"\U0001f4ca <b>NIGHTLY BACKTEST (90 days)</b>\n"]
+            bt_msg.append(f"<b>Passed:</b> {len(passed_names)} | <b>Failed:</b> {len(failed_names)}")
+            for name in passed_names[:10]:
                 bt = bt_results.get(name, {})
                 wr = bt.get("win_rate", 0) * 100
                 total = bt.get("total_trades", 0)
-                passed = "\u2705" if bt.get("win_rate", 0) >= BACKTEST_MIN_WIN_RATE or bt.get("note") else "\u274c"
-                bt_msg.append(f"  {passed} <b>{name}</b>: {total} trades | WR {wr:.1f}%")
-            bt_msg.append(f"\n<b>Active:</b> {', '.join(new_active)}")
+                bt_msg.append(f"  \u2705 {name}: {total} trades | WR {wr:.1f}%")
+            if len(passed_names) > 10:
+                bt_msg.append(f"  ... and {len(passed_names) - 10} more")
+            bt_msg.append(f"\n<b>Active:</b> {len(passed_names)} strategies scanning for signals.")
             await tg_send("\n".join(bt_msg))
 
         except Exception as exc:
@@ -2963,37 +3744,38 @@ async def send_sunday_report():
     # Fresh backtest
     lines.append("<b>=== FRESH BACKTEST ===</b>")
     try:
-        bt_results = await run_backtest()
-        new_active = []
-        for name in ALL_STRATEGY_NAMES:
+        bt_results, passed_names, failed_names = await run_full_backtest()
+        state.active_strategies = passed_names
+        state.backtest_results = bt_results
+
+        for name in passed_names:
+            state._ensure_strategy_metrics(name)
+            state.strategy_paused[name] = False
+
+        save_state()
+
+        lines.append(f"Passed: {len(passed_names)} | Failed: {len(failed_names)}")
+        for name in passed_names[:10]:
             bt = bt_results.get(name, {})
             wr = bt.get("win_rate", 0) * 100
             total = bt.get("total_trades", 0)
-            passed_bt = bt.get("win_rate", 0) >= BACKTEST_MIN_WIN_RATE or bt.get("note")
-            passed = "PASS" if passed_bt else "FAIL"
-            lines.append(f"  <b>{name}</b>: {total} trades | WR {wr:.1f}% [{passed}]")
-            if passed_bt:
-                new_active.append(name)
-
-        state.active_strategies = new_active
-        state.backtest_results = bt_results
-        save_state()
+            lines.append(f"  \u2705 {name}: {total} trades | WR {wr:.1f}%")
     except Exception as exc:
         lines.append(f"  Backtest error: {sanitize_html(str(exc))}")
 
-    # Live vs backtest
+    # Live performance
     lines.append("\n<b>=== LIVE PERFORMANCE ===</b>")
-    for name in ALL_STRATEGY_NAMES:
+    for name in state.active_strategies[:10]:
         m = state.metrics.get(name, {})
         tc = m.get("trade_count", 0)
         wr = (m.get("wins", 0) / tc * 100) if tc > 0 else 0
         lines.append(f"  <b>{name}</b>: {tc} trades | WR {wr:.0f}% | PnL ${m.get('current_pnl', 0):+,.2f}")
 
-    total_pnl = sum(state.metrics.get(n, {}).get("current_pnl", 0) for n in ALL_STRATEGY_NAMES)
+    total_pnl = sum(m.get("current_pnl", 0) for m in state.metrics.values())
     lines.append(f"\n<b>Total PnL:</b> ${total_pnl:+,.2f}")
     lines.append(f"<b>Lifetime trades:</b> {state.total_trade_count}")
     lines.append(f"<b>Mode:</b> {state.mode.upper()}")
-    lines.append(f"<b>Active:</b> {', '.join(state.active_strategies)}")
+    lines.append(f"<b>Active:</b> {len(state.active_strategies)} strategies")
 
     intel = _get_intelligence_summary()
     if intel:
@@ -3405,29 +4187,35 @@ async def telegram_polling_loop():
 
                     if cmd == "/start":
                         await tg_reply(chat_id,
-                            "Hey! I'm Vic v5, your BTC trading agent.\n\n"
+                            "Hey! I'm Vic v6, your BTC trading agent.\n\n"
                             "Commands: /strategies /backtest /funding /journal /metrics /regime /news "
                             "/intelligence /review /approve /reject /closeall"
                         )
                         continue
 
                     if cmd == "/strategies":
-                        lines = ["\U0001f4ca <b>Strategy Status</b>\n"]
-                        for name in ALL_STRATEGY_NAMES:
+                        lines = [f"\U0001f4ca <b>Strategy Status</b> ({len(state.active_strategies)} active / {len(ALL_STRATEGY_DEFS)} total)\n"]
+                        for name in state.active_strategies[:15]:
                             m = state.metrics.get(name, {})
                             tc = m.get("trade_count", 0)
                             wr = (m.get("wins", 0) / tc * 100) if tc > 0 else 0
-                            active = name in state.active_strategies
                             paused = state.strategy_paused.get(name, False)
-                            status = "PAUSED" if paused else ("Active" if active else "Inactive")
+                            status = "PAUSED" if paused else "Active"
                             bt = state.backtest_results.get(name, {})
                             bt_wr = bt.get("win_rate", 0) * 100
-                            label = STRATEGY_LABELS.get(name, name)
+                            sdef = ALL_STRATEGY_DEFS.get(name, {})
+                            label = sdef.get("label", name)
                             lines.append(
-                                f"{label} [{status}]\n"
+                                f"<b>{label}</b> [{status}]\n"
                                 f"  Live: {tc} trades | WR {wr:.0f}% | PnL ${m.get('current_pnl', 0):+,.2f}\n"
                                 f"  Backtest: WR {bt_wr:.0f}%"
                             )
+                        if len(state.active_strategies) > 15:
+                            lines.append(f"\n... and {len(state.active_strategies) - 15} more")
+                        # Show inactive count
+                        inactive = len(ALL_STRATEGY_DEFS) - len(state.active_strategies)
+                        if inactive > 0:
+                            lines.append(f"\n{inactive} strategies failed backtest criteria")
                         await tg_reply(chat_id, "\n".join(lines))
                         continue
 
@@ -3437,14 +4225,23 @@ async def telegram_polling_loop():
                                 with open(BACKTEST_FILE, "r") as f:
                                     bt = json.load(f)
                                 lines = [f"\U0001f4ca <b>Backtest Results</b>\nDate: {bt.get('timestamp', 'unknown')}\n"]
-                                for name in STRATEGY_NAMES:
+                                passed_count = 0
+                                for name in ALL_STRATEGY_DEFS:
                                     s = bt.get(name, {})
+                                    if not isinstance(s, dict):
+                                        continue
+                                    passed_icon = "\u2705" if s.get("passed") else "\u274c"
                                     lines.append(
-                                        f"<b>{name}</b>: {s.get('total_trades',0)} trades | "
+                                        f"{passed_icon} <b>{name}</b>: {s.get('total_trades',0)} trades | "
                                         f"WR {s.get('win_rate',0)*100:.1f}% | "
-                                        f"Avg R {s.get('avg_r',0):+.2f} | "
-                                        f"MaxDD ${s.get('max_drawdown',0):,.2f}"
+                                        f"Avg R {s.get('avg_r',0):+.2f}"
                                     )
+                                    if s.get("passed"):
+                                        passed_count += 1
+                                    if len(lines) > 30:
+                                        lines.append("... (truncated)")
+                                        break
+                                lines.append(f"\n<b>Total passed: {passed_count}/{len(ALL_STRATEGY_DEFS)}</b>")
                                 await tg_reply(chat_id, "\n".join(lines))
                             else:
                                 await tg_reply(chat_id, "No backtest results yet.")
@@ -3524,20 +4321,21 @@ async def telegram_polling_loop():
                         continue
 
                     if cmd == "/metrics":
-                        lines = ["\U0001f4ca <b>Per-Strategy Metrics</b>\n"]
-                        for n in ALL_STRATEGY_NAMES:
+                        lines = [f"\U0001f4ca <b>Per-Strategy Metrics</b> ({len(state.active_strategies)} active)\n"]
+                        for n in state.active_strategies[:15]:
                             m = state.metrics.get(n, {})
                             tc = m.get("trade_count", 0)
                             wr = (m.get("wins", 0) / tc * 100) if tc > 0 else 0
                             exp = (m.get("total_r_achieved", 0) / tc) if tc > 0 else 0
-                            active = n in state.active_strategies
                             paused = state.strategy_paused.get(n, False)
-                            status = "PAUSED" if paused else ("Active" if active else "Inactive")
+                            status = "PAUSED" if paused else "Active"
                             lines.append(
                                 f"<b>{n}</b> [{status}]: {tc} trades | WR {wr:.0f}% | Exp {exp:+.2f}R\n"
                                 f"  PnL ${m.get('current_pnl', 0):+,.2f} | MaxDD ${m.get('max_drawdown', 0):,.2f} | "
                                 f"Streak {m.get('current_losing_streak', 0)}/{m.get('max_losing_streak', 0)}"
                             )
+                        if len(state.active_strategies) > 15:
+                            lines.append(f"\n... and {len(state.active_strategies) - 15} more")
                         await tg_reply(chat_id, "\n".join(lines))
                         continue
 
@@ -3547,7 +4345,8 @@ async def telegram_polling_loop():
                             f"1H Bias: {state.htf_bias} ({state.htf_bias_strength})\n"
                             f"BTC: ${state.last_btc_price:,.2f}\n"
                             f"Funding: {state.current_funding_rate:.6f}\n"
-                            f"Active: {', '.join(state.active_strategies)}"
+                            f"Active: {len(state.active_strategies)} strategies\n"
+                            f"Research: {'complete' if state.research_complete else 'pending'}"
                         )
                         await tg_reply(chat_id, msg)
                         continue
@@ -3644,23 +4443,21 @@ async def ask_claude_market_question(question: str) -> str:
                     f"(SL ${p['sl']:,.2f}, TP ${p['tp']:,.2f}, unrealized ${unrealized:+.2f}, {p['leverage']}x)")
 
     metrics_lines = []
-    for n in ALL_STRATEGY_NAMES:
+    for n in state.active_strategies[:10]:
         m = state.metrics.get(n, {})
         tc = m.get("trade_count", 0)
         wr = (m.get("wins", 0) / tc * 100) if tc > 0 else 0
         metrics_lines.append(f"  {n}: {tc} trades, WR {wr:.0f}%, PnL ${m.get('current_pnl', 0):+,.2f}")
 
     system_prompt = (
-        f"You are Vic v5, an AI BTC trading agent on Hyperliquid. "
-        f"5 strategies, dynamic leverage (10-20x), $500 account.\n\n"
-        f"=== STRATEGIES ===\n"
-        f"1. Funding Rate Fade (1H) | 2. Liquidity Sweep (5m/15m) | "
-        f"3. EMA Trend Pullback (1H) | 4. VWAP Reclaim (5m/15m) | 5. Order Block (15m/1H)\n\n"
+        f"You are Vic v6, an AI BTC trading agent on Hyperliquid. "
+        f"50 strategies (research-first), dynamic leverage (10-20x), $370 account.\n\n"
         f"=== STATE ===\n"
         f"BTC: ${state.last_btc_price:,.2f} | Regime: {state.regime.value} | "
         f"Bias: {state.htf_bias} | Mode: {state.mode.upper()}\n"
         f"Funding: {state.current_funding_rate:.6f} | Losses: {state.losses_today}/{MAX_LOSSES_PER_DAY}\n"
-        f"PnL today: ${state.daily_pnl:+,.2f} | Lifetime: {state.total_trade_count} trades\n\n"
+        f"PnL today: ${state.daily_pnl:+,.2f} | Lifetime: {state.total_trade_count} trades\n"
+        f"Active strategies: {len(state.active_strategies)} | Research: {'complete' if state.research_complete else 'pending'}\n\n"
         f"=== POSITION ===\n{pos_text}\n\n"
         f"=== METRICS ===\n" + "\n".join(metrics_lines) + "\n\n"
         f"Answer concisely. Use numbers. Under 300 words."
@@ -3757,8 +4554,7 @@ async def close_all_positions() -> str:
 @app.get("/")
 async def health():
     return {
-        "bot": "Vic v5.1",
-        "build": "3276e94",
+        "bot": "Vic v6.0",
         "status": "running" if state.polling_alive else "DEGRADED -- polling dead",
         "telegram_polling": "alive" if state.polling_alive else "DEAD",
         "mode": state.mode,
@@ -3770,16 +4566,18 @@ async def health():
         "trades_today": state.trades_today,
         "losses_today": state.losses_today,
         "daily_pnl": state.daily_pnl,
-        "active_strategies": state.active_strategies,
+        "active_strategies": len(state.active_strategies),
+        "total_strategies": len(ALL_STRATEGY_DEFS),
         "has_position": state.current_position is not None,
         "funding_rate": state.current_funding_rate,
+        "research_complete": state.research_complete,
     }
 
 
 @app.get("/status")
 async def full_status():
     strategies_status = {}
-    for name in ALL_STRATEGY_NAMES:
+    for name in ALL_STRATEGY_DEFS:
         m = state.metrics.get(name, {})
         tc = m.get("trade_count", 0)
         win_rate = (m.get("wins", 0) / tc * 100) if tc > 0 else 0.0
@@ -3795,19 +4593,23 @@ async def full_status():
         }
 
     return {
-        "bot": "Vic v5",
+        "bot": "Vic v6",
         "mode": state.mode,
         "base_leverage": BASE_LEVERAGE,
         "account_capital": ACCOUNT_CAPITAL,
         "global_paused": state.paused,
+        "research_complete": state.research_complete,
         "regime": state.regime.value,
         "htf_bias": f"{state.htf_bias} ({state.htf_bias_strength})",
         "btc_price": state.last_btc_price,
         "funding_rate": state.current_funding_rate,
         "strategies": strategies_status,
+        "active_strategy_count": len(state.active_strategies),
+        "total_strategy_count": len(ALL_STRATEGY_DEFS),
         "active_strategies": state.active_strategies,
         "current_position": state.current_position,
         "trades_today": state.trades_today,
+        "max_trades_per_day": MAX_TRADES_PER_DAY,
         "losses_today": state.losses_today,
         "daily_pnl": state.daily_pnl,
         "daily_loss_cap_hit": state.daily_loss_cap_hit,
@@ -3921,24 +4723,19 @@ async def startup():
         log.error(f"MISSING REQUIRED ENV VARS: {', '.join(_missing)} -- Vic cannot start properly")
 
     # Ensure data directories exist
-    for filepath in [JOURNAL_FILE, STATE_FILE, BACKTEST_FILE, INTELLIGENCE_FILE, REVIEW_FILE]:
+    for filepath in [JOURNAL_FILE, STATE_FILE, BACKTEST_FILE, FAILED_STRATEGIES_FILE, INTELLIGENCE_FILE, REVIEW_FILE]:
         d = os.path.dirname(filepath)
         if d:
             os.makedirs(d, exist_ok=True)
 
     state.startup_time = datetime.now(timezone.utc).isoformat()
-    log.info("Vic v5 starting up -- mode: %s", state.mode)
+    log.info("Vic v6 starting up -- mode: %s", state.mode)
+
+    # Start paused for research phase
+    state.paused = True
 
     # Load persisted state
-    load_state()
-
-    # HARD OVERRIDE: active_strategies can only contain strategies in STRATEGY_NAMES
-    # This ensures deactivated strategies (liquidity_sweep, ema_trend_pullback, order_block)
-    # cannot be restored from old state files
-    state.active_strategies = [s for s in state.active_strategies if s in STRATEGY_NAMES]
-    if not state.active_strategies:
-        state.active_strategies = list(STRATEGY_NAMES)
-    log.info("Active strategies after state load filter: %s", state.active_strategies)
+    loaded = load_state()
 
     # Initialize candle boundary tracking
     now_ts = datetime.now(timezone.utc).timestamp()
@@ -3954,56 +4751,46 @@ async def startup():
 
     # Startup message
     startup_msg = (
-        f"\U0001f916 <b>Vic v5 is online -- {state.mode.upper()} MODE</b>\n"
+        f"\U0001f916 <b>Vic v6 is online -- {state.mode.upper()} MODE</b>\n"
         f"BTC/USDC perp | {BASE_LEVERAGE}x+ leverage | ${ACCOUNT_CAPITAL:.0f} account\n\n"
-        f"1\ufe0f\u20e3 Funding Rate Fade\n"
-        f"2\ufe0f\u20e3 Liquidity Sweep Reversal\n"
-        f"3\ufe0f\u20e3 EMA Trend Pullback\n"
-        f"4\ufe0f\u20e3 VWAP Reclaim\n"
-        f"5\ufe0f\u20e3 Order Block Entry\n\n"
-        f"Max risk: {MAX_RISK_PCT*100:.0f}% per trade | {MAX_LOSSES_PER_DAY} loss limit\n"
-        f"AI Market Brain: confidence scoring 1-10\n\n"
-        f"\U0001f50d Running 30-day backtest..."
+        f"50 strategies | 2% risk per trade | Max {MAX_TRADES_PER_DAY} trades/day\n"
+        f"Sessions: London 07-11 UTC | NY 13-17 UTC\n"
+        f"Backtest criteria: 55% WR, 30+ trades, positive expectancy\n\n"
+        f"\U0001f50d <b>Research phase starting...</b>"
     )
     await tg_send(startup_msg)
 
-    # Initial backtest
+    # Run initial 90-day backtest
     try:
-        bt_results = await run_backtest()
+        bt_results, passed_names, failed_names = await run_full_backtest()
         state.backtest_results = bt_results
+        state.active_strategies = passed_names
 
-        # Only activate strategies that pass 50% WR in backtest
-        active = []
-        bt_lines = ["\U0001f4ca <b>BACKTEST RESULTS (30 days)</b>\n"]
-        for name in ALL_STRATEGY_NAMES:
-            bt = bt_results.get(name, {})
-            wr = bt.get("win_rate", 0)
-            total = bt.get("total_trades", 0)
-            passed = wr >= BACKTEST_MIN_WIN_RATE or bt.get("note")
-            status = "\u2705 PASS" if passed else "\u274c FAIL"
-            bt_lines.append(
-                f"  <b>{name}</b>: {total} trades | WR {wr*100:.1f}% [{status}]"
-            )
-            if passed:
-                active.append(name)
+        # Initialize metrics for active strategies
+        for name in passed_names:
+            state._ensure_strategy_metrics(name)
+            state.strategy_paused[name] = False
 
-        state.active_strategies = active
+        state.research_complete = True
+        state.paused = False  # Unpause after research
         state.backtest_complete = True
         save_state()
 
-        if active:
-            bt_lines.append(f"\n<b>Active:</b> {', '.join(active)}")
-            bt_lines.append(f"All {len(active)} strategies scanning for signals.")
-        else:
-            bt_lines.append(f"\n\u26a0\ufe0f No strategies passed backtest.")
-
-        await tg_send("\n".join(bt_lines))
+        result_msg = (
+            f"\u2705 <b>Research complete!</b>\n\n"
+            f"<b>{len(passed_names)}/{len(ALL_STRATEGY_DEFS)}</b> strategies passed backtest criteria.\n"
+            f"Trading ACTIVE with {len(passed_names)} strategies.\n"
+            f"All background tasks starting."
+        )
+        await tg_send(result_msg)
 
     except Exception as exc:
         log.error("Startup backtest failed: %s", exc)
-        await tg_send(f"\u26a0\ufe0f Backtest failed: {sanitize_html(str(exc))}\nActivating all strategies.")
-        state.active_strategies = list(STRATEGY_NAMES)  # Only the 2 approved strategies
-        state.backtest_complete = True
+        await tg_send(f"\u26a0\ufe0f Research phase failed: {sanitize_html(str(exc))}\nStarting with no active strategies. Run /backtest to retry.")
+        state.active_strategies = []
+        state.research_complete = False
+        state.paused = True  # Stay paused if research failed
+        state.backtest_complete = False
         save_state()
 
     # Start all background tasks
