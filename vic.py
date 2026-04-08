@@ -170,7 +170,7 @@ class Regime(str, Enum):
 # ---------------------------------------------------------------------------
 # App & state
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Vic Trading Agent", version="5.0.0")
+app = FastAPI(title="Vic Trading Agent", version="5.1.0")
 
 hl_info: Optional[Info] = None
 hl_exchange: Optional[HLExchange] = None
