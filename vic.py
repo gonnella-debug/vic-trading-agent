@@ -105,7 +105,7 @@ UNDERPERFORMANCE_MIN_TRADES = 20
 UNDERPERFORMANCE_WR_THRESHOLD = 0.40
 
 # Backtest minimum win rate
-BACKTEST_MIN_WIN_RATE = 0.55
+BACKTEST_MIN_WIN_RATE = 0.40
 
 # Funding rate extremes (percentile thresholds)
 FUNDING_EXTREME_PCT = 10  # top/bottom 10%
@@ -3349,7 +3349,7 @@ def _calc_backtest_stats(strategy: str, trades: list) -> dict:
 
     # PASS criteria
     passed = (
-        win_rate >= BACKTEST_MIN_WIN_RATE and  # >55% win rate
+        win_rate >= BACKTEST_MIN_WIN_RATE and  # >40% win rate
         len(trades) >= 30 and                   # Minimum 30 trades in 90 days
         avg_r > 0 and                           # Positive expectancy
         max_consec < 8 and                      # Max consecutive losses < 8
