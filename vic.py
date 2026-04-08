@@ -3757,7 +3757,8 @@ async def close_all_positions() -> str:
 @app.get("/")
 async def health():
     return {
-        "bot": "Vic v5",
+        "bot": "Vic v5.1",
+        "build": "3276e94",
         "status": "running" if state.polling_alive else "DEGRADED -- polling dead",
         "telegram_polling": "alive" if state.polling_alive else "DEAD",
         "mode": state.mode,
