@@ -90,7 +90,14 @@ TARGET_RISK_PCT = 0.04            # 3-5% target risk per trade
 MAX_LOSSES_PER_DAY = 3            # 3 losing trades = stop for the day
 
 # Strategy definitions
+# Active strategies only -- deactivated strategies kept in ALL_STRATEGY_NAMES for reference/backtest
 STRATEGY_NAMES = [
+    "funding_rate_fade",
+    "vwap_reclaim",
+]
+
+# All strategies including deactivated (for metrics display, backtest re-evaluation)
+ALL_STRATEGY_NAMES = [
     "funding_rate_fade",
     "liquidity_sweep",
     "ema_trend_pullback",
@@ -197,7 +204,7 @@ class TradingState:
 
         # Metrics tracking per strategy
         self.metrics: dict = {}
-        for name in STRATEGY_NAMES:
+        for name in ALL_STRATEGY_NAMES:
             self.metrics[name] = {
                 "wins": 0,
                 "losses": 0,
@@ -238,7 +245,7 @@ class TradingState:
         self.pending_review: Optional[dict] = None
 
         # Strategy paused states
-        self.strategy_paused: dict = {name: False for name in STRATEGY_NAMES}
+        self.strategy_paused: dict = {name: False for name in ALL_STRATEGY_NAMES}
 
     def reset_daily(self):
         self.trades_today = 0
@@ -249,8 +256,9 @@ class TradingState:
         self.signals_blocked = 0
         self.last_block_reasons = []
         # Reset per-strategy losing streaks for daily count
-        for name in STRATEGY_NAMES:
-            self.metrics[name]["current_losing_streak"] = 0
+        for name in ALL_STRATEGY_NAMES:
+            if name in self.metrics:
+                self.metrics[name]["current_losing_streak"] = 0
         log.info("Daily PnL and trade counts reset.")
 
 
@@ -311,12 +319,12 @@ def load_state():
         state.pending_review = data.get("pending_review")
 
         saved_metrics = data.get("metrics", {})
-        for name in STRATEGY_NAMES:
+        for name in ALL_STRATEGY_NAMES:
             if name in saved_metrics:
                 state.metrics[name] = saved_metrics[name]
 
         saved_paused = data.get("strategy_paused", {})
-        for name in STRATEGY_NAMES:
+        for name in ALL_STRATEGY_NAMES:
             if name in saved_paused:
                 state.strategy_paused[name] = saved_paused[name]
 
@@ -823,6 +831,18 @@ async def execute_trade(strategy: str, side: str, entry: float,
     if not allowed:
         return
 
+    # HARD VALIDATION: TP must be in the correct direction relative to entry
+    if side == "long" and tp_price <= entry:
+        error_msg = f"TP calculation error [{strategy}] — trade cancelled. TP ${tp_price:,.2f} is below entry ${entry:,.2f}"
+        log.error(error_msg)
+        await tg_send(f"🚨 <b>{error_msg}</b>")
+        return
+    if side == "short" and tp_price >= entry:
+        error_msg = f"TP calculation error [{strategy}] — trade cancelled. TP ${tp_price:,.2f} is above entry ${entry:,.2f}"
+        log.error(error_msg)
+        await tg_send(f"🚨 <b>{error_msg}</b>")
+        return
+
     leverage = calc_leverage_from_confidence(confidence)
     if max_leverage is not None:
         leverage = min(leverage, max_leverage)
@@ -1007,11 +1027,21 @@ def _read_journal() -> list:
 # Close Position
 # ---------------------------------------------------------------------------
 
-async def close_position(exit_price: float, reason: str):
-    """Close the current position and book PnL."""
+async def close_position(exit_price: float, reason: str, force: bool = False):
+    """Close the current position and book PnL.
+    force=True bypasses the 60-second minimum hold time (used by /closeall only).
+    """
     pos = state.current_position
     if pos is None:
         return
+
+    # Minimum 60-second hold time to prevent open/close loops
+    if not force:
+        open_time = datetime.fromisoformat(pos["open_time"])
+        elapsed_sec = (datetime.now(timezone.utc) - open_time).total_seconds()
+        if elapsed_sec < 60:
+            log.info("Hold time guard: %.0fs < 60s minimum, ignoring close request (%s)", elapsed_sec, reason)
+            return
 
     strategy = pos["strategy"]
     if pos["side"] == "long":
@@ -1369,9 +1399,15 @@ async def strategy_liquidity_sweep():
         if side == "long":
             sl_price = round(sweep_extreme - sl_buffer)
             tp_price = round(target_pool) if target_pool > price else round(price + abs(price - sl_price) * 2)
+            # CRITICAL: final TP sanity -- must be ABOVE entry for longs
+            if tp_price <= price:
+                tp_price = round(price + abs(price - sl_price) * 2)
         else:
             sl_price = round(sweep_extreme + sl_buffer)
             tp_price = round(target_pool) if target_pool < price else round(price - abs(sl_price - price) * 2)
+            # CRITICAL: final TP sanity -- must be BELOW entry for shorts
+            if tp_price >= price:
+                tp_price = round(price - abs(sl_price - price) * 2)
 
         log.info("liquidity_sweep signal: %s on %s | sweep=%.0f | entry=%.0f | vol=%.1fx | pin_bar=yes",
                  side, tf, sweep_extreme, price, curr_vol / avg_vol)
@@ -1472,10 +1508,16 @@ async def strategy_ema_trend_pullback():
     if side == "long":
         sl_price = round(price - sl_distance)
         tp_target = swing_highs[-1][1] if swing_highs else price + sl_distance * 2
+        # CRITICAL: TP must be ABOVE entry for longs -- fallback to ATR-based if swing target is wrong
+        if tp_target <= price:
+            tp_target = price + sl_distance * 2
         tp_price = round(tp_target)
     else:
         sl_price = round(price + sl_distance)
         tp_target = swing_lows[-1][1] if swing_lows else price - sl_distance * 2
+        # CRITICAL: TP must be BELOW entry for shorts -- fallback to ATR-based if swing target is wrong
+        if tp_target >= price:
+            tp_target = price - sl_distance * 2
         tp_price = round(tp_target)
 
     log.info("ema_trend_pullback signal: %s | trend=%s | EMA200 slope=%.3f%%", side, trend, ema200_slope)
@@ -1631,7 +1673,9 @@ async def strategy_order_block():
 
                                 if is_bullish and rsi_val > 45 and curr_vol > avg_vol:
                                     sl_price = round(ob_low - atr_val * 0.2)
-                                    tp_price = round(impulse_end)  # Full fill of the impulse
+                                    # CRITICAL: TP must be ABOVE entry for longs
+                                    tp_target = impulse_end if impulse_end > price else price + abs(price - sl_price) * 2
+                                    tp_price = round(tp_target)
 
                                     log.info("order_block signal: long on %s | OB zone %.0f-%.0f", tf, ob_low, ob_high)
 
@@ -1666,7 +1710,9 @@ async def strategy_order_block():
 
                                 if is_bearish and rsi_val < 55 and curr_vol > avg_vol:
                                     sl_price = round(ob_high + atr_val * 0.2)
-                                    tp_price = round(impulse_end)
+                                    # CRITICAL: TP must be BELOW entry for shorts
+                                    tp_target = impulse_end if impulse_end < price else price - abs(sl_price - price) * 2
+                                    tp_price = round(tp_target)
 
                                     log.info("order_block signal: short on %s | OB zone %.0f-%.0f", tf, ob_low, ob_high)
 
@@ -1767,7 +1813,7 @@ async def ai_market_analysis(strategy: str, side: str, price: float, signal_reas
             f"DECISION: APPROVE or REJECT\n"
             f"CONFIDENCE: [1-10]\n"
             f"REASON: [1-2 sentences]\n\n"
-            f"Score guide: 1-5 = reject, 6 = borderline reject, 7-8 = solid trade (10x leverage), 9 = strong confluence (15x), 10 = exceptional setup (20x)."
+            f"Score guide: 1-5 = may be rejected (technical reasons only), 6+ = trade will execute (AI brain informational only). 7-8 = solid trade (10x leverage), 9 = strong confluence (15x), 10 = exceptional setup (20x)."
         )
 
         payload = {
@@ -1867,17 +1913,17 @@ async def run_all_strategies():
         signal_reason=signal.get("reason", "")
     )
 
-    # --- Funding Rate Fade bypass: if in London/NY, not VOLATILE, confidence >= 6 ---
+    # --- AI BRAIN RULES (updated 2026-04-08) ---
+    # Rule 1: Confidence 6+ = AI brain is INFORMATIONAL ONLY, cannot block the trade
+    # Rule 2: Confidence 5 and below = AI can veto but ONLY for technical reasons (never macro/geopolitical)
+    # Rule 3: 3+ consecutive rejections from same strategy = informational only for 24h
     force_approve = False
-    if strat_name == "funding_rate_fade" and _is_london_or_ny() and state.regime != Regime.VOLATILE:
-        if confidence >= 6 or (not approved and confidence >= 6):
-            force_approve = True
-            log.info("Funding Rate Fade BYPASS: London/NY session, not VOLATILE, confidence %d -- overriding AI brain", confidence)
-        elif not approved:
-            # AI rejected but check raw confidence from signal (7/10 threshold from GG)
-            force_approve = True
-            confidence = max(confidence, 7)
-            log.info("Funding Rate Fade FORCE APPROVE: strategy meets all session/regime criteria")
+
+    if confidence >= 6:
+        # Confidence 6+: AI brain is informational only -- trade executes regardless
+        force_approve = True
+        if not approved:
+            log.info("AI Brain confidence %d >= 6 -- informational only, trade proceeds for %s", confidence, strat_name)
 
     # --- Consecutive rejection override: 3+ rejections from same strategy -> informational only for 24h ---
     if not approved and not force_approve:
@@ -1901,27 +1947,27 @@ async def run_all_strategies():
             log.info("AI Brain override active for %s -- treating as informational, forcing APPROVE", strat_name)
 
     if not approved and not force_approve:
-        if confidence < 6:
-            log.info("AI Market Brain REJECTED %s %s (confidence %d): %s",
-                     strat_name, signal["side"], confidence, ai_reason)
-            # --- Telegram rate limit: max 3 rejection messages per hour ---
-            now = time.time()
-            _tg_rejection_timestamps[:] = [t for t in _tg_rejection_timestamps if now - t < 3600]
-            if len(_tg_rejection_timestamps) < 3:
-                _tg_rejection_timestamps.append(now)
-                await tg_send(
-                    f"\u274c <b>AI Brain REJECTED</b> -- {STRATEGY_LABELS.get(strat_name, strat_name)}\n"
-                    f"{signal['side'].upper()} @ ${signal['entry']:,.2f} | Confidence: {confidence}/10\n"
-                    f"{sanitize_html(ai_reason[:200])}"
-                )
-            elif len(_tg_rejection_timestamps) == 3:
-                _tg_rejection_timestamps.append(now)
-                await tg_send(
-                    f"\U0001f507 <b>AI Brain rejection notifications suppressed</b>\n"
-                    f"3+ rejections this hour. Will send hourly summary instead."
-                )
-            # else: suppressed
-            return
+        # Confidence <= 5 and AI rejected -- allowed ONLY for technical reasons
+        log.info("AI Market Brain REJECTED %s %s (confidence %d): %s",
+                 strat_name, signal["side"], confidence, ai_reason)
+        # --- Telegram rate limit: max 3 rejection messages per hour ---
+        now = time.time()
+        _tg_rejection_timestamps[:] = [t for t in _tg_rejection_timestamps if now - t < 3600]
+        if len(_tg_rejection_timestamps) < 3:
+            _tg_rejection_timestamps.append(now)
+            await tg_send(
+                f"\u274c <b>AI Brain REJECTED</b> -- {STRATEGY_LABELS.get(strat_name, strat_name)}\n"
+                f"{signal['side'].upper()} @ ${signal['entry']:,.2f} | Confidence: {confidence}/10\n"
+                f"{sanitize_html(ai_reason[:200])}"
+            )
+        elif len(_tg_rejection_timestamps) == 3:
+            _tg_rejection_timestamps.append(now)
+            await tg_send(
+                f"\U0001f507 <b>AI Brain rejection notifications suppressed</b>\n"
+                f"3+ rejections this hour. Will send hourly summary instead."
+            )
+        # else: suppressed
+        return
     else:
         if force_approve and not approved:
             approved = True
@@ -2355,15 +2401,15 @@ async def send_daily_self_review():
 
     # Strategy metrics
     metrics_text = ""
-    for name in STRATEGY_NAMES:
-        m = state.metrics[name]
-        tc = m["trade_count"]
-        wr = (m["wins"] / tc * 100) if tc > 0 else 0
-        metrics_text += f"  {name}: {tc} trades, WR {wr:.0f}%, PnL ${m['current_pnl']:+,.2f}\n"
+    for name in ALL_STRATEGY_NAMES:
+        m = state.metrics.get(name, {})
+        tc = m.get("trade_count", 0)
+        wr = (m.get("wins", 0) / tc * 100) if tc > 0 else 0
+        metrics_text += f"  {name}: {tc} trades, WR {wr:.0f}%, PnL ${m.get('current_pnl', 0):+,.2f}\n"
 
     # Backtest results
     bt_text = ""
-    for name in STRATEGY_NAMES:
+    for name in ALL_STRATEGY_NAMES:
         bt = state.backtest_results.get(name, {})
         bt_text += f"  {name}: BT WR {bt.get('win_rate',0)*100:.0f}%, {bt.get('total_trades',0)} trades\n"
 
@@ -2435,15 +2481,15 @@ async def send_daily_self_review():
     # Send to Telegram
     summary_lines = [f"\U0001f4ca <b>DAILY SELF-REVIEW ({today})</b>\n"]
 
-    for name in STRATEGY_NAMES:
-        m = state.metrics[name]
-        tc = m["trade_count"]
-        wr = (m["wins"] / tc * 100) if tc > 0 else 0
+    for name in ALL_STRATEGY_NAMES:
+        m = state.metrics.get(name, {})
+        tc = m.get("trade_count", 0)
+        wr = (m.get("wins", 0) / tc * 100) if tc > 0 else 0
         active = name in state.active_strategies
         paused = state.strategy_paused.get(name, False)
         status = "PAUSED" if paused else ("Active" if active else "Inactive")
         summary_lines.append(
-            f"  <b>{name}</b> [{status}]: WR {wr:.0f}% ({tc} trades) | PnL ${m['current_pnl']:+,.2f}"
+            f"  <b>{name}</b> [{status}]: WR {wr:.0f}% ({tc} trades) | PnL ${m.get('current_pnl', 0):+,.2f}"
         )
 
     summary_lines.append(f"\n<b>Today:</b> {len(today_trades)} trades | PnL ${state.daily_pnl:+,.2f}")
@@ -2864,16 +2910,22 @@ async def backtest_scheduler():
             bt_results = await run_backtest()
             state.backtest_results = bt_results
 
-            # All 5 always active — backtest is for reporting, not gating
-            state.active_strategies = list(STRATEGY_NAMES)
+            # Only activate strategies that pass 50% WR in backtest
+            new_active = []
+            for name in ALL_STRATEGY_NAMES:
+                bt = bt_results.get(name, {})
+                wr = bt.get("win_rate", 0)
+                if wr >= BACKTEST_MIN_WIN_RATE or bt.get("note"):
+                    new_active.append(name)
+            state.active_strategies = new_active
             save_state()
 
             bt_msg = ["\U0001f4ca <b>NIGHTLY BACKTEST (30 days)</b>\n"]
-            for name in STRATEGY_NAMES:
+            for name in ALL_STRATEGY_NAMES:
                 bt = bt_results.get(name, {})
                 wr = bt.get("win_rate", 0) * 100
                 total = bt.get("total_trades", 0)
-                passed = "\u2705" if bt.get("win_rate", 0) >= BACKTEST_MIN_WIN_RATE or bt.get("note") else "\u26a0\ufe0f"
+                passed = "\u2705" if bt.get("win_rate", 0) >= BACKTEST_MIN_WIN_RATE or bt.get("note") else "\u274c"
                 bt_msg.append(f"  {passed} <b>{name}</b>: {total} trades | WR {wr:.1f}%")
             bt_msg.append(f"\n<b>Active:</b> {', '.join(new_active)}")
             await tg_send("\n".join(bt_msg))
@@ -2912,14 +2964,18 @@ async def send_sunday_report():
     lines.append("<b>=== FRESH BACKTEST ===</b>")
     try:
         bt_results = await run_backtest()
-        for name in STRATEGY_NAMES:
+        new_active = []
+        for name in ALL_STRATEGY_NAMES:
             bt = bt_results.get(name, {})
             wr = bt.get("win_rate", 0) * 100
             total = bt.get("total_trades", 0)
-            passed = "PASS" if bt.get("win_rate", 0) >= BACKTEST_MIN_WIN_RATE or bt.get("note") else "FAIL"
+            passed_bt = bt.get("win_rate", 0) >= BACKTEST_MIN_WIN_RATE or bt.get("note")
+            passed = "PASS" if passed_bt else "FAIL"
             lines.append(f"  <b>{name}</b>: {total} trades | WR {wr:.1f}% [{passed}]")
+            if passed_bt:
+                new_active.append(name)
 
-        state.active_strategies = list(STRATEGY_NAMES)
+        state.active_strategies = new_active
         state.backtest_results = bt_results
         save_state()
     except Exception as exc:
@@ -2927,13 +2983,13 @@ async def send_sunday_report():
 
     # Live vs backtest
     lines.append("\n<b>=== LIVE PERFORMANCE ===</b>")
-    for name in STRATEGY_NAMES:
-        m = state.metrics[name]
-        tc = m["trade_count"]
-        wr = (m["wins"] / tc * 100) if tc > 0 else 0
-        lines.append(f"  <b>{name}</b>: {tc} trades | WR {wr:.0f}% | PnL ${m['current_pnl']:+,.2f}")
+    for name in ALL_STRATEGY_NAMES:
+        m = state.metrics.get(name, {})
+        tc = m.get("trade_count", 0)
+        wr = (m.get("wins", 0) / tc * 100) if tc > 0 else 0
+        lines.append(f"  <b>{name}</b>: {tc} trades | WR {wr:.0f}% | PnL ${m.get('current_pnl', 0):+,.2f}")
 
-    total_pnl = sum(state.metrics[n]["current_pnl"] for n in STRATEGY_NAMES)
+    total_pnl = sum(state.metrics.get(n, {}).get("current_pnl", 0) for n in ALL_STRATEGY_NAMES)
     lines.append(f"\n<b>Total PnL:</b> ${total_pnl:+,.2f}")
     lines.append(f"<b>Lifetime trades:</b> {state.total_trade_count}")
     lines.append(f"<b>Mode:</b> {state.mode.upper()}")
@@ -3357,10 +3413,10 @@ async def telegram_polling_loop():
 
                     if cmd == "/strategies":
                         lines = ["\U0001f4ca <b>Strategy Status</b>\n"]
-                        for name in STRATEGY_NAMES:
-                            m = state.metrics[name]
-                            tc = m["trade_count"]
-                            wr = (m["wins"] / tc * 100) if tc > 0 else 0
+                        for name in ALL_STRATEGY_NAMES:
+                            m = state.metrics.get(name, {})
+                            tc = m.get("trade_count", 0)
+                            wr = (m.get("wins", 0) / tc * 100) if tc > 0 else 0
                             active = name in state.active_strategies
                             paused = state.strategy_paused.get(name, False)
                             status = "PAUSED" if paused else ("Active" if active else "Inactive")
@@ -3369,7 +3425,7 @@ async def telegram_polling_loop():
                             label = STRATEGY_LABELS.get(name, name)
                             lines.append(
                                 f"{label} [{status}]\n"
-                                f"  Live: {tc} trades | WR {wr:.0f}% | PnL ${m['current_pnl']:+,.2f}\n"
+                                f"  Live: {tc} trades | WR {wr:.0f}% | PnL ${m.get('current_pnl', 0):+,.2f}\n"
                                 f"  Backtest: WR {bt_wr:.0f}%"
                             )
                         await tg_reply(chat_id, "\n".join(lines))
@@ -3469,18 +3525,18 @@ async def telegram_polling_loop():
 
                     if cmd == "/metrics":
                         lines = ["\U0001f4ca <b>Per-Strategy Metrics</b>\n"]
-                        for n in STRATEGY_NAMES:
-                            m = state.metrics[n]
-                            tc = m["trade_count"]
-                            wr = (m["wins"] / tc * 100) if tc > 0 else 0
-                            exp = (m["total_r_achieved"] / tc) if tc > 0 else 0
+                        for n in ALL_STRATEGY_NAMES:
+                            m = state.metrics.get(n, {})
+                            tc = m.get("trade_count", 0)
+                            wr = (m.get("wins", 0) / tc * 100) if tc > 0 else 0
+                            exp = (m.get("total_r_achieved", 0) / tc) if tc > 0 else 0
                             active = n in state.active_strategies
                             paused = state.strategy_paused.get(n, False)
                             status = "PAUSED" if paused else ("Active" if active else "Inactive")
                             lines.append(
                                 f"<b>{n}</b> [{status}]: {tc} trades | WR {wr:.0f}% | Exp {exp:+.2f}R\n"
-                                f"  PnL ${m['current_pnl']:+,.2f} | MaxDD ${m['max_drawdown']:,.2f} | "
-                                f"Streak {m['current_losing_streak']}/{m['max_losing_streak']}"
+                                f"  PnL ${m.get('current_pnl', 0):+,.2f} | MaxDD ${m.get('max_drawdown', 0):,.2f} | "
+                                f"Streak {m.get('current_losing_streak', 0)}/{m.get('max_losing_streak', 0)}"
                             )
                         await tg_reply(chat_id, "\n".join(lines))
                         continue
@@ -3588,11 +3644,11 @@ async def ask_claude_market_question(question: str) -> str:
                     f"(SL ${p['sl']:,.2f}, TP ${p['tp']:,.2f}, unrealized ${unrealized:+.2f}, {p['leverage']}x)")
 
     metrics_lines = []
-    for n in STRATEGY_NAMES:
-        m = state.metrics[n]
-        tc = m["trade_count"]
-        wr = (m["wins"] / tc * 100) if tc > 0 else 0
-        metrics_lines.append(f"  {n}: {tc} trades, WR {wr:.0f}%, PnL ${m['current_pnl']:+,.2f}")
+    for n in ALL_STRATEGY_NAMES:
+        m = state.metrics.get(n, {})
+        tc = m.get("trade_count", 0)
+        wr = (m.get("wins", 0) / tc * 100) if tc > 0 else 0
+        metrics_lines.append(f"  {n}: {tc} trades, WR {wr:.0f}%, PnL ${m.get('current_pnl', 0):+,.2f}")
 
     system_prompt = (
         f"You are Vic v5, an AI BTC trading agent on Hyperliquid. "
@@ -3651,6 +3707,7 @@ async def ask_claude_market_question(question: str) -> str:
 # ---------------------------------------------------------------------------
 
 async def close_all_positions() -> str:
+    """Close all positions. Bypasses the 60-second minimum hold time."""
     closed = []
     errors = []
 
@@ -3721,17 +3778,18 @@ async def health():
 @app.get("/status")
 async def full_status():
     strategies_status = {}
-    for name in STRATEGY_NAMES:
-        m = state.metrics[name]
-        win_rate = (m["wins"] / m["trade_count"] * 100) if m["trade_count"] > 0 else 0.0
+    for name in ALL_STRATEGY_NAMES:
+        m = state.metrics.get(name, {})
+        tc = m.get("trade_count", 0)
+        win_rate = (m.get("wins", 0) / tc * 100) if tc > 0 else 0.0
         strategies_status[name] = {
             "active": name in state.active_strategies,
             "paused": state.strategy_paused.get(name, False),
             "metrics": {
                 "win_rate": round(win_rate, 1),
-                "total_trades": m["trade_count"],
-                "pnl": m["current_pnl"],
-                "max_drawdown": m["max_drawdown"],
+                "total_trades": tc,
+                "pnl": m.get("current_pnl", 0),
+                "max_drawdown": m.get("max_drawdown", 0),
             },
         }
 
@@ -3905,18 +3963,20 @@ async def startup():
         bt_results = await run_backtest()
         state.backtest_results = bt_results
 
-        # ALL 5 strategies active from day 1 — backtest is for reporting only, not gating
-        active = list(STRATEGY_NAMES)
+        # Only activate strategies that pass 50% WR in backtest
+        active = []
         bt_lines = ["\U0001f4ca <b>BACKTEST RESULTS (30 days)</b>\n"]
-        for name in STRATEGY_NAMES:
+        for name in ALL_STRATEGY_NAMES:
             bt = bt_results.get(name, {})
             wr = bt.get("win_rate", 0)
             total = bt.get("total_trades", 0)
             passed = wr >= BACKTEST_MIN_WIN_RATE or bt.get("note")
-            status = "\u2705 PASS" if passed else "\u26a0\ufe0f WATCH"
+            status = "\u2705 PASS" if passed else "\u274c FAIL"
             bt_lines.append(
                 f"  <b>{name}</b>: {total} trades | WR {wr*100:.1f}% [{status}]"
             )
+            if passed:
+                active.append(name)
 
         state.active_strategies = active
         state.backtest_complete = True
@@ -3933,7 +3993,7 @@ async def startup():
     except Exception as exc:
         log.error("Startup backtest failed: %s", exc)
         await tg_send(f"\u26a0\ufe0f Backtest failed: {sanitize_html(str(exc))}\nActivating all strategies.")
-        state.active_strategies = list(STRATEGY_NAMES)
+        state.active_strategies = list(STRATEGY_NAMES)  # Only the 2 approved strategies
         state.backtest_complete = True
         save_state()
 
