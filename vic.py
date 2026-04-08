@@ -3931,6 +3931,14 @@ async def startup():
     # Load persisted state
     load_state()
 
+    # HARD OVERRIDE: active_strategies can only contain strategies in STRATEGY_NAMES
+    # This ensures deactivated strategies (liquidity_sweep, ema_trend_pullback, order_block)
+    # cannot be restored from old state files
+    state.active_strategies = [s for s in state.active_strategies if s in STRATEGY_NAMES]
+    if not state.active_strategies:
+        state.active_strategies = list(STRATEGY_NAMES)
+    log.info("Active strategies after state load filter: %s", state.active_strategies)
+
     # Initialize candle boundary tracking
     now_ts = datetime.now(timezone.utc).timestamp()
     state.last_1m_candle_ts = int(now_ts // 60) * 60
