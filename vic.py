@@ -240,6 +240,7 @@ def save_state():
             "funding_history": state.funding_history[-720:],  # ~30 days of hourly samples
             "pending_review": state.pending_review,
             "research_complete": state.research_complete,
+            "daily_loss_cap_hit": state.daily_loss_cap_hit,
             "saved_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -276,6 +277,19 @@ def load_state():
         saved_paused = data.get("strategy_paused", {})
         for name, p in saved_paused.items():
             state.strategy_paused[name] = p
+
+        # Restore daily counters if saved state is from today
+        saved_at = data.get("saved_at", "")
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if saved_at and saved_at[:10] == today_str:
+            state.losses_today = data.get("losses_today", 0)
+            state.trades_today = data.get("trades_today", 0)
+            state.daily_pnl = data.get("daily_pnl", 0.0)
+            state.daily_loss_cap_hit = data.get("daily_loss_cap_hit", False)
+            log.info("Daily counters restored (same day): losses=%d, trades=%d, pnl=$%.2f, cap_hit=%s",
+                     state.losses_today, state.trades_today, state.daily_pnl, state.daily_loss_cap_hit)
+        else:
+            log.info("State from different day (%s) -- daily counters start fresh", saved_at[:10] if saved_at else "unknown")
 
         # Don't restore current_position -- orphaned recovery handles that
         log.info("State loaded from %s -- %d lifetime trades, active: %s",
@@ -2400,6 +2414,19 @@ def calc_leverage_from_confidence(confidence: int) -> int:
         return 20
 
 
+def validate_tp(side: str, entry: float, tp: float, strategy: str) -> bool:
+    """Validate take profit is in the correct direction. Called before EVERY order."""
+    if side == "long" and tp <= entry:
+        log.error(f"INVALID TP: {strategy} LONG entry={entry} tp={tp} — TP below entry. Trade cancelled.")
+        asyncio.create_task(tg_send(f"\U0001f6ab TP ERROR — {strategy} LONG: entry ${entry:,.2f} but TP ${tp:,.2f} is below entry. Trade blocked."))
+        return False
+    if side == "short" and tp >= entry:
+        log.error(f"INVALID TP: {strategy} SHORT entry={entry} tp={tp} — TP above entry. Trade cancelled.")
+        asyncio.create_task(tg_send(f"\U0001f6ab TP ERROR — {strategy} SHORT: entry ${entry:,.2f} but TP ${tp:,.2f} is above entry. Trade blocked."))
+        return False
+    return True
+
+
 async def execute_trade(strategy: str, side: str, entry: float,
                         sl_price: float, tp_price: float,
                         confidence: int = 7, max_leverage: Optional[int] = None):
@@ -2413,16 +2440,8 @@ async def execute_trade(strategy: str, side: str, entry: float,
     if not allowed:
         return
 
-    # HARD VALIDATION: TP must be in the correct direction relative to entry
-    if side == "long" and tp_price <= entry:
-        error_msg = f"TP calculation error [{strategy}] — trade cancelled. TP ${tp_price:,.2f} is below entry ${entry:,.2f}"
-        log.error(error_msg)
-        await tg_send(f"\U0001f6a8 <b>{error_msg}</b>")
-        return
-    if side == "short" and tp_price >= entry:
-        error_msg = f"TP calculation error [{strategy}] — trade cancelled. TP ${tp_price:,.2f} is above entry ${entry:,.2f}"
-        log.error(error_msg)
-        await tg_send(f"\U0001f6a8 <b>{error_msg}</b>")
+    # HARD VALIDATION: TP must be in the correct direction relative to signal entry
+    if not validate_tp(side, entry, tp_price, strategy):
         return
 
     leverage = calc_leverage_from_confidence(confidence)
@@ -2488,6 +2507,46 @@ async def execute_trade(strategy: str, side: str, entry: float,
                 if "error" in s:
                     raise Exception(f"Order error: {s['error']}")
             log.info("%s LIVE order placed: %s", strategy, result)
+
+            # Fetch actual fill price and recalculate TP/SL relative to real entry
+            try:
+                await asyncio.sleep(0.5)
+                user_st = await loop.run_in_executor(None, lambda: hl_info.user_state(HL_WALLET_ADDRESS))
+                hl_positions = user_st.get("assetPositions", [])
+                for p in hl_positions:
+                    pd_pos = p.get("position", {})
+                    if pd_pos.get("coin") == "BTC" and float(pd_pos.get("szi", 0)) != 0:
+                        actual_entry = float(pd_pos.get("entryPx", 0))
+                        if actual_entry > 0 and abs(actual_entry - entry) > 1:
+                            log.info("%s -- Actual fill $%.2f vs signal entry $%.2f (diff $%.2f)",
+                                     strategy, actual_entry, entry, actual_entry - entry)
+                            # Preserve TP/SL distances, recalculate from actual fill price
+                            old_tp_dist = abs(tp_price - entry)
+                            old_sl_dist = sl_distance
+                            entry = actual_entry
+                            if side == "long":
+                                tp_price = round(entry + old_tp_dist)
+                                sl_price = round(entry - old_sl_dist)
+                            else:
+                                tp_price = round(entry - old_tp_dist)
+                                sl_price = round(entry + old_sl_dist)
+                            tp_distance = old_tp_dist
+                            log.info("%s -- Recalculated from fill: SL $%.2f, TP $%.2f", strategy, sl_price, tp_price)
+                        break
+            except Exception as fill_exc:
+                log.warning("%s -- Could not fetch actual fill price: %s (using signal entry)", strategy, fill_exc)
+
+            # Re-validate TP against actual entry — absolute safety check
+            if not validate_tp(side, entry, tp_price, strategy):
+                log.error("%s -- TP INVALID after fill adjustment — emergency close", strategy)
+                try:
+                    await loop.run_in_executor(
+                        None, lambda: hl_exchange.market_close("BTC", sz=size)
+                    )
+                    await tg_send(f"\U0001f6a8 {strategy} — TP invalid after fill. Position closed immediately.")
+                except Exception as close_exc:
+                    await tg_send(f"\U0001f6a8\U0001f6a8 CRITICAL: {strategy} TP invalid AND close failed: {close_exc}. CLOSE MANUALLY.")
+                return
 
             # Place exchange-level SL
             sl_ok = False
@@ -2782,6 +2841,8 @@ async def close_position(exit_price: float, reason: str, force: bool = False):
     # Check daily loss limit
     if state.losses_today >= MAX_LOSSES_PER_DAY:
         state.daily_loss_cap_hit = True
+        log.info("DAILY LOSS CAP HIT: %d losses today — all trading stopped", state.losses_today)
+        save_state()  # Persist cap IMMEDIATELY so restart can't bypass it
         await tg_send(
             f"\U0001f6d1 <b>{MAX_LOSSES_PER_DAY} losing trades today -- ALL trading stopped until midnight UTC</b>\n"
             f"Daily PnL: ${state.daily_pnl:+,.2f}"
@@ -2790,6 +2851,8 @@ async def close_position(exit_price: float, reason: str, force: bool = False):
     # Check max daily loss (10% of account as absolute cap)
     if state.daily_pnl <= -(ACCOUNT_CAPITAL * MAX_RISK_PCT):
         state.daily_loss_cap_hit = True
+        log.info("DAILY PNL CAP HIT: $%.2f — all trading stopped", state.daily_pnl)
+        save_state()  # Persist cap IMMEDIATELY so restart can't bypass it
         await tg_send(
             f"\U0001f6d1 <b>Daily loss limit hit (${state.daily_pnl:+,.2f})</b>\n"
             f"All trading stopped until tomorrow."
@@ -2957,11 +3020,15 @@ async def ai_market_analysis(strategy: str, side: str, price: float, signal_reas
 
 async def run_all_strategies():
     """Run all active strategies. Strongest signal wins."""
-    if state.paused or state.daily_loss_cap_hit:
+    if state.daily_loss_cap_hit:
+        log.debug("run_all_strategies BLOCKED — daily loss cap hit (losses=%d)", state.losses_today)
+        return
+    if state.paused:
         return
     if state.regime == Regime.VOLATILE:
         return
     if state.losses_today >= MAX_LOSSES_PER_DAY:
+        log.debug("run_all_strategies BLOCKED — losses_today=%d >= MAX=%d", state.losses_today, MAX_LOSSES_PER_DAY)
         return
     if state.trades_today >= MAX_TRADES_PER_DAY:
         return
