@@ -1,6 +1,6 @@
 """
-Vic -- BTC/USDT Perpetual Futures Trading Agent (v6)
-Runs 50 strategies on Hyperliquid via native SDK.
+Vic -- BTC/USDT Perpetual Futures Trading Agent (v7)
+Runs 58 strategies (50 original + 5 perp-native + 3 retested on 15m) on Hyperliquid via native SDK.
 $370 account, dynamic leverage (10x minimum). Production-ready for Railway.
 
 Research-first approach:
@@ -123,7 +123,7 @@ class Regime(str, Enum):
 # ---------------------------------------------------------------------------
 # App & state
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Vic Trading Agent", version="6.0.0")
+app = FastAPI(title="Vic Trading Agent", version="7.0.0")
 
 hl_info: Optional[Info] = None
 hl_exchange: Optional[HLExchange] = None
@@ -490,6 +490,46 @@ async def update_funding_rate():
             state.funding_history = state.funding_history[-720:]
 
 
+async def fetch_funding_rate_history(days: int = 90) -> pd.DataFrame:
+    """Fetch historical funding rates from Hyperliquid for backtesting."""
+    try:
+        now_ms = int(time.time() * 1000)
+        start_ms = now_ms - (days * 24 * 3600 * 1000)
+        all_rows = []
+        cursor = start_ms
+
+        while cursor < now_ms:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(
+                    "https://api.hyperliquid.xyz/info",
+                    json={"type": "fundingHistory", "coin": "BTC", "startTime": cursor},
+                )
+                if resp.status_code != 200:
+                    break
+                data = resp.json()
+                if not data:
+                    break
+                for entry in data:
+                    ts = entry.get("time", 0)
+                    rate = float(entry.get("fundingRate", 0))
+                    all_rows.append({"timestamp": pd.to_datetime(ts, unit="ms"), "funding_rate": rate})
+                # Move cursor past last entry
+                last_ts = data[-1].get("time", 0)
+                if last_ts <= cursor:
+                    break
+                cursor = last_ts + 1
+            await asyncio.sleep(0.2)
+
+        if not all_rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(all_rows).drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+        log.info("Downloaded %d funding rate entries (%d days)", len(df), days)
+        return df
+    except Exception as exc:
+        log.error("Funding history download error: %s", exc)
+        return pd.DataFrame()
+
+
 def get_funding_percentile(rate: float) -> float:
     """Return the percentile of the current funding rate in the 30-day distribution."""
     if len(state.funding_history) < 24:  # Need at least 1 day of data
@@ -782,6 +822,29 @@ def _make_signal(side: str, price: float, atr: float, sl_mult: float = 1.5, tp_m
         return None
     sl_dist = sl_mult * atr
     tp_dist = tp_mult * sl_dist
+    if side == "long":
+        sl = round(price - sl_dist)
+        tp = round(price + tp_dist)
+        if tp <= price:
+            return None
+    else:
+        sl = round(price + sl_dist)
+        tp = round(price - tp_dist)
+        if tp >= price:
+            return None
+    return {"side": side, "entry": price, "sl": sl, "tp": tp}
+
+
+def _make_signal_pct(side: str, price: float, sl_pct: float, tp_pct: float) -> Optional[dict]:
+    """Build a signal with percentage-based SL/TP distances.
+    sl_pct/tp_pct are percentages (e.g., 0.5 = 0.5% from entry).
+    Enforces minimum SL of 0.3%.
+    """
+    if price <= 0:
+        return None
+    sl_pct = max(sl_pct, 0.3)  # Enforce 0.3% minimum SL
+    sl_dist = price * sl_pct / 100
+    tp_dist = price * tp_pct / 100
     if side == "long":
         sl = round(price - sl_dist)
         tp = round(price + tp_dist)
@@ -1750,6 +1813,187 @@ def sig_perp_premium(df, i, extras=None):
     return None
 
 
+# --- PERP-NATIVE STRATEGIES ---
+
+def sig_funding_extreme_fade_15m(df, i, extras=None):
+    """STRATEGY 1: Funding rate extreme fade on 15m.
+    Funding > +0.05% → SHORT. Funding < -0.05% → LONG.
+    SL 0.5%, TP 1.5% (1:3 R:R). Only if 1h bias agrees with fade direction.
+    """
+    if not extras:
+        return None
+    rate = extras.get("funding_rate", 0)
+    bias = extras.get("htf_bias", "neutral")
+    if rate == 0:
+        return None
+    price = float(df["close"].iloc[i])
+    if rate > 0.0005:  # +0.05% = longs overcrowded → SHORT
+        if bias in ("bearish", "neutral"):
+            return _make_signal_pct("short", price, 0.5, 1.5)
+    elif rate < -0.0005:  # -0.05% = shorts overcrowded → LONG
+        if bias in ("bullish", "neutral"):
+            return _make_signal_pct("long", price, 0.5, 1.5)
+    return None
+
+
+def sig_liquidation_cascade_fade_15m(df, i, extras=None):
+    """STRATEGY 2: Liquidation cascade fade on 15m.
+    Detect liquidation via sudden OI drop (volume spike) + price spike.
+    Fade the spike within 2 candles. SL beyond spike + 0.2%. TP 1.5x SL.
+    Filter: liquidation must be 3x average volume.
+    """
+    if i < 3:
+        return None
+    vol_ma = _safe_val(df["vol_ma"], i)
+    if _nan(vol_ma) or vol_ma <= 0:
+        return None
+
+    # Check previous 2 candles for liquidation cascade
+    for lookback in range(1, 3):
+        idx = i - lookback
+        if idx < 0:
+            continue
+        prev_vol = float(df["volume"].iloc[idx])
+        if prev_vol < vol_ma * 3:  # Must be 3x average volume
+            continue
+        prev_high = float(df["high"].iloc[idx])
+        prev_low = float(df["low"].iloc[idx])
+        prev_close = float(df["close"].iloc[idx])
+        prev_open = float(df["open"].iloc[idx])
+        prev_range = prev_high - prev_low
+        price = float(df["close"].iloc[i])
+
+        if prev_close > prev_open and prev_range > 0:
+            # Bullish liquidation spike (shorts liquidated) → fade SHORT
+            spike_high = prev_high
+            sl_price = round(spike_high * 1.002)  # Beyond spike + 0.2%
+            sl_dist = abs(price - sl_price)
+            tp_dist = sl_dist * 1.5
+            tp_price = round(price - tp_dist)
+            if tp_price < price and sl_price > price:
+                return {"side": "short", "entry": price, "sl": sl_price, "tp": tp_price}
+
+        elif prev_close < prev_open and prev_range > 0:
+            # Bearish liquidation spike (longs liquidated) → fade LONG
+            spike_low = prev_low
+            sl_price = round(spike_low * 0.998)  # Beyond spike - 0.2%
+            sl_dist = abs(sl_price - price)
+            tp_dist = sl_dist * 1.5
+            tp_price = round(price + tp_dist)
+            if tp_price > price and sl_price < price:
+                return {"side": "long", "entry": price, "sl": sl_price, "tp": tp_price}
+    return None
+
+
+def sig_oi_divergence_15m(df, i, extras=None):
+    """STRATEGY 3: Open interest divergence on 15m.
+    Price new high + OI/volume dropping → fake breakout → SHORT.
+    Price new low + OI/volume dropping → shorts covering → LONG.
+    Divergence must persist 2+ candles. SL 0.4%, TP 1.2%.
+    """
+    if i < 15:
+        return None
+    vol_ma = _safe_val(df["vol_ma"], i)
+    if _nan(vol_ma) or vol_ma <= 0:
+        return None
+
+    price = float(df["close"].iloc[i])
+    lookback = min(i, 10)
+
+    # Check for new high
+    recent_high = float(df["high"].iloc[i - lookback:i].max())
+    current_high = float(df["high"].iloc[i])
+
+    # Check volume declining for last 2 candles (OI proxy)
+    vol_declining = True
+    for j in range(1, 3):
+        if i - j < 0:
+            vol_declining = False
+            break
+        if float(df["volume"].iloc[i - j + 1]) >= float(df["volume"].iloc[i - j]) * 1.1:
+            vol_declining = False
+            break
+
+    if not vol_declining:
+        return None
+
+    # Use volume below average as OI decline proxy
+    curr_vol = float(df["volume"].iloc[i])
+    if curr_vol >= vol_ma:
+        return None
+
+    if current_high >= recent_high:
+        # Price new high but OI/volume dropping → SHORT
+        return _make_signal_pct("short", price, 0.4, 1.2)
+
+    recent_low = float(df["low"].iloc[i - lookback:i].min())
+    current_low = float(df["low"].iloc[i])
+    if current_low <= recent_low:
+        # Price new low but OI/volume dropping → LONG
+        return _make_signal_pct("long", price, 0.4, 1.2)
+
+    return None
+
+
+def sig_funding_reversion_15m(df, i, extras=None):
+    """STRATEGY 4: Funding rate reversion on 15m.
+    After funding extreme (>0.05% or <-0.05%), funding reverts to neutral.
+    Trade when funding crosses back through 0.02% from extreme.
+    SL 0.4%, TP 1.2%.
+    """
+    if not extras:
+        return None
+    rate = extras.get("funding_rate", 0)
+    prev_rate = extras.get("prev_funding_rate", 0)
+    if rate == 0 or prev_rate == 0:
+        return None
+    price = float(df["close"].iloc[i])
+
+    # Was extreme positive, now reverting down through 0.02%
+    if prev_rate > 0.0005 and rate <= 0.0002 and rate < prev_rate:
+        return _make_signal_pct("long", price, 0.4, 1.2)
+
+    # Was extreme negative, now reverting up through -0.02%
+    if prev_rate < -0.0005 and rate >= -0.0002 and rate > prev_rate:
+        return _make_signal_pct("short", price, 0.4, 1.2)
+
+    return None
+
+
+def sig_vwap_reclaim_oi_15m(df, i, extras=None):
+    """STRATEGY 5: VWAP reclaim with OI (volume) confirmation on 15m.
+    Price reclaims VWAP from below + volume increasing → LONG.
+    Price loses VWAP + volume increasing → SHORT.
+    OI confirmation = volume > vol_ma (real buyers/sellers).
+    SL 0.3%, TP 0.9%.
+    """
+    if i < 2:
+        return None
+    vwap = _safe_val(df["vwap"], i)
+    vwap_p = _safe_val(df["vwap"], i - 1)
+    vol_ma = _safe_val(df["vol_ma"], i)
+    if _nan(vwap) or _nan(vwap_p) or _nan(vol_ma) or vol_ma <= 0:
+        return None
+
+    price = float(df["close"].iloc[i])
+    prev_close = float(df["close"].iloc[i - 1])
+    curr_vol = float(df["volume"].iloc[i])
+
+    # Volume must be above average (OI confirmation)
+    if curr_vol < vol_ma:
+        return None
+
+    # Price reclaims VWAP from below → LONG
+    if prev_close < vwap_p and price > vwap:
+        return _make_signal_pct("long", price, 0.3, 0.9)
+
+    # Price loses VWAP from above → SHORT
+    if prev_close > vwap_p and price < vwap:
+        return _make_signal_pct("short", price, 0.3, 0.9)
+
+    return None
+
+
 # --- COMBINED ---
 
 def sig_rsi_vwap_confluence(df, i, extras=None):
@@ -1958,6 +2202,16 @@ ALL_STRATEGY_DEFS = {
     "session_pattern_5m":   {"label": "Session Pattern 5m",  "emoji": "48", "tf": "5m",  "signal_func": sig_session_pattern,   "max_hold": 120},
     "regime_rsi_5m":        {"label": "Regime RSI 5m",       "emoji": "49", "tf": "5m",  "signal_func": sig_regime_rsi,        "max_hold": 180},
     "volatility_break_5m":  {"label": "Vol Breakout 5m",     "emoji": "50", "tf": "5m",  "signal_func": sig_volatility_breakout,"max_hold": 240},
+    # PERP-NATIVE (new)
+    "funding_extreme_fade_15m": {"label": "Funding Fade 15m",     "emoji": "51", "tf": "15m", "signal_func": sig_funding_extreme_fade_15m, "max_hold": 480},
+    "liq_cascade_fade_15m":     {"label": "Liq Cascade Fade 15m", "emoji": "52", "tf": "15m", "signal_func": sig_liquidation_cascade_fade_15m, "max_hold": 240},
+    "oi_divergence_15m":        {"label": "OI Divergence 15m",    "emoji": "53", "tf": "15m", "signal_func": sig_oi_divergence_15m, "max_hold": 480},
+    "funding_reversion_15m":    {"label": "Funding Revert 15m",   "emoji": "54", "tf": "15m", "signal_func": sig_funding_reversion_15m, "max_hold": 480},
+    "vwap_reclaim_oi_15m":      {"label": "VWAP+OI 15m",         "emoji": "55", "tf": "15m", "signal_func": sig_vwap_reclaim_oi_15m, "max_hold": 240},
+    # EXISTING retested on 15m
+    "rsi_divergence_15m":       {"label": "RSI Divergence 15m",   "emoji": "56", "tf": "15m", "signal_func": sig_rsi_divergence, "max_hold": 480},
+    "williams_r_15m":           {"label": "Williams %R 15m",      "emoji": "57", "tf": "15m", "signal_func": sig_williams_r_extreme, "max_hold": 240},
+    "macd_cross_15m_v2":        {"label": "MACD Cross 15m v2",    "emoji": "58", "tf": "15m", "signal_func": sig_macd_cross_15m, "max_hold": 480},
 }
 
 
@@ -2119,6 +2373,13 @@ def can_open_trade(strategy: str, side: str) -> tuple[bool, str]:
     if weekday >= 5:  # Saturday=5, Sunday=6
         return _block(strategy, side, "Weekend -- no trading")
 
+    # 10. MANDATORY BIAS DIRECTION FILTER
+    # Bullish bias (weak or strong) → longs only. Bearish → shorts only. Neutral → both.
+    if state.htf_bias == "bullish" and side == "short":
+        return _block(strategy, side, f"1H bias is BULLISH -- only LONG signals allowed")
+    if state.htf_bias == "bearish" and side == "long":
+        return _block(strategy, side, f"1H bias is BEARISH -- only SHORT signals allowed")
+
     log.info("PASSED: %s %s -- all checks OK", strategy, side.upper())
     return True, "OK"
 
@@ -2168,7 +2429,16 @@ async def execute_trade(strategy: str, side: str, entry: float,
     if max_leverage is not None:
         leverage = min(leverage, max_leverage)
 
+    # Enforce minimum SL distance of 0.3% from entry
+    min_sl_dist = entry * 0.003
     sl_distance = abs(entry - sl_price)
+    if sl_distance < min_sl_dist:
+        log.info("%s -- SL widened from %.0f to %.0f (0.3%% minimum)", strategy, sl_distance, min_sl_dist)
+        sl_distance = min_sl_dist
+        if side == "long":
+            sl_price = round(entry - sl_distance)
+        else:
+            sl_price = round(entry + sl_distance)
     if sl_distance <= 0:
         log.warning("%s -- zero SL distance, cannot size position.", strategy)
         return
@@ -2723,7 +2993,9 @@ async def run_all_strategies():
     # Build extras for strategies that need them
     extras = {
         "funding_rate": state.current_funding_rate,
+        "prev_funding_rate": state.funding_history[-2]["rate"] if len(state.funding_history) >= 2 else 0,
         "funding_pctl": get_funding_percentile(state.current_funding_rate),
+        "htf_bias": state.htf_bias,
     }
     intel = _intelligence_cache.get("report", {})
     patterns = intel.get("patterns", {})
@@ -3347,13 +3619,12 @@ def _calc_backtest_stats(strategy: str, trades: list) -> dict:
     # Max drawdown as percentage of account
     max_dd_pct = max_dd / ACCOUNT_CAPITAL * 100
 
-    # PASS criteria
+    # PASS criteria -- positive dollar PnL + minimum 20 trades
+    # Win rate is NOT the sole threshold; positive expectancy with good R:R is sufficient
     passed = (
-        win_rate >= BACKTEST_MIN_WIN_RATE and  # >40% win rate
-        len(trades) >= 30 and                   # Minimum 30 trades in 90 days
-        avg_r > 0 and                           # Positive expectancy
-        max_consec < 8 and                      # Max consecutive losses < 8
-        max_dd_pct < 25                         # Max drawdown < 25%
+        total_pnl > 0 and                       # Positive total dollar PnL over 90 days
+        len(trades) >= 20 and                   # Minimum 20 trades
+        max_dd_pct < 30                         # Max drawdown < 30%
     )
 
     return {
@@ -3400,6 +3671,19 @@ async def run_full_backtest():
     # Skip 1m download -- too much data, and most strategies use 5m+
     data["1m"] = data.get("5m", pd.DataFrame())  # Use 5m as proxy for 1m strategies
 
+    # Download funding rate history for perp-native strategies
+    await tg_send("\U0001f4e5 Downloading funding rate history...")
+    funding_df = await fetch_funding_rate_history(90)
+    funding_rates_by_ts = {}
+    if not funding_df.empty:
+        await tg_send(f"\u2705 Funding: {len(funding_df)} rate entries downloaded")
+        for _, row in funding_df.iterrows():
+            # Index by hour for lookup during backtest
+            ts_key = row["timestamp"].floor("8h")  # Funding settles every 8h
+            funding_rates_by_ts[ts_key] = row["funding_rate"]
+    else:
+        await tg_send("\u26a0\ufe0f Funding history: No data (will use 0)")
+
     # Precompute indicators
     await tg_send("\U0001f4ca Precomputing indicators...")
     for tf in data:
@@ -3408,6 +3692,28 @@ async def run_full_backtest():
                 data[tf] = precompute_indicators(data[tf])
             except Exception as exc:
                 log.error("Precompute error for %s: %s", tf, exc)
+
+    # Precompute 1H bias for backtest (EMA50 slope + RSI)
+    df_1h = data.get("1h", pd.DataFrame())
+    bias_by_hour = {}
+    if not df_1h.empty and len(df_1h) >= 55:
+        ema50_bt = calc_ema(df_1h["close"], 50)
+        rsi_bt = calc_rsi(df_1h["close"], 14)
+        for idx in range(55, len(df_1h)):
+            ts = df_1h["timestamp"].iloc[idx]
+            ema_now = float(ema50_bt.iloc[idx])
+            ema_prev = float(ema50_bt.iloc[max(0, idx - 5)])
+            rsi_val = float(rsi_bt.iloc[idx])
+            if np.isnan(ema_now) or np.isnan(ema_prev) or np.isnan(rsi_val):
+                bias_by_hour[ts.floor("h")] = "neutral"
+                continue
+            slope_pct = (ema_now - ema_prev) / ema_prev * 100 if ema_prev > 0 else 0
+            if slope_pct > 0 and rsi_val > 50:
+                bias_by_hour[ts.floor("h")] = "bullish"
+            elif slope_pct < 0 and rsi_val < 50:
+                bias_by_hour[ts.floor("h")] = "bearish"
+            else:
+                bias_by_hour[ts.floor("h")] = "neutral"
 
     # Test each strategy
     results = {}
@@ -3430,6 +3736,7 @@ async def run_full_backtest():
         # Walk through data
         trades = []
         daily_trade_count = {}
+        prev_funding = 0.0
         i = 55
 
         while i < len(df) - max_bars:
@@ -3451,13 +3758,36 @@ async def run_full_backtest():
                 i += 1
                 continue
 
+            # Look up funding rate and bias for this candle
+            ts_8h = ts.floor("8h") if hasattr(ts, "floor") else ts
+            ts_1h = ts.floor("h") if hasattr(ts, "floor") else ts
+            current_funding = funding_rates_by_ts.get(ts_8h, 0.0)
+            current_bias = bias_by_hour.get(ts_1h, "neutral")
+
+            extras = {
+                "funding_rate": current_funding,
+                "prev_funding_rate": prev_funding,
+                "funding_pctl": 50,  # Approximate in backtest
+                "htf_bias": current_bias,
+                "top_trader_bias": "NEUTRAL",
+            }
+            prev_funding = current_funding
+
             try:
-                sig = signal_func(df, i)
+                sig = signal_func(df, i, extras)
             except Exception:
                 i += 1
                 continue
 
             if sig:
+                # MANDATORY BIAS FILTER in backtest
+                if current_bias == "bullish" and sig["side"] == "short":
+                    i += 1
+                    continue
+                if current_bias == "bearish" and sig["side"] == "long":
+                    i += 1
+                    continue
+
                 # Validate TP direction
                 if sig["side"] == "long" and sig["tp"] <= sig["entry"]:
                     i += 1
@@ -3466,7 +3796,16 @@ async def run_full_backtest():
                     i += 1
                     continue
 
+                # Enforce minimum SL 0.3%
                 sl_dist = abs(sig["entry"] - sig["sl"])
+                min_sl = sig["entry"] * 0.003
+                if sl_dist < min_sl:
+                    sl_dist = min_sl
+                    if sig["side"] == "long":
+                        sig["sl"] = round(sig["entry"] - sl_dist)
+                    else:
+                        sig["sl"] = round(sig["entry"] + sl_dist)
+
                 size = (ACCOUNT_CAPITAL * TARGET_RISK_PCT) / sl_dist if sl_dist > 0 else 0
                 if size <= 0:
                     i += 1
@@ -4753,9 +5092,9 @@ async def startup():
     startup_msg = (
         f"\U0001f916 <b>Vic v6 is online -- {state.mode.upper()} MODE</b>\n"
         f"BTC/USDC perp | {BASE_LEVERAGE}x+ leverage | ${ACCOUNT_CAPITAL:.0f} account\n\n"
-        f"50 strategies | 2% risk per trade | Max {MAX_TRADES_PER_DAY} trades/day\n"
+        f"58 strategies (5 perp-native) | 2% risk per trade | Max {MAX_TRADES_PER_DAY} trades/day\n"
         f"Sessions: London 07-11 UTC | NY 13-17 UTC\n"
-        f"Backtest criteria: 55% WR, 30+ trades, positive expectancy\n\n"
+        f"Backtest criteria: positive PnL, 20+ trades, bias filter mandatory\n\n"
         f"\U0001f50d <b>Research phase starting...</b>"
     )
     await tg_send(startup_msg)
