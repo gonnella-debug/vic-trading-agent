@@ -852,7 +852,7 @@ def _make_signal(side: str, price: float, atr: float, sl_mult: float = 1.5, tp_m
 def _make_signal_pct(side: str, price: float, sl_pct: float, tp_pct: float) -> Optional[dict]:
     """Build a signal with percentage-based SL/TP distances.
     sl_pct/tp_pct are percentages (e.g., 0.5 = 0.5% from entry).
-    Enforces minimum SL of 0.3%.
+    Enforces minimum SL of 0.5%.
     """
     if price <= 0:
         return None
@@ -1979,7 +1979,7 @@ def sig_vwap_reclaim_oi_15m(df, i, extras=None):
     Price reclaims VWAP from below + volume increasing → LONG.
     Price loses VWAP + volume increasing → SHORT.
     OI confirmation = volume > vol_ma (real buyers/sellers).
-    SL 0.3%, TP 0.9%.
+    SL 0.5%, TP 0.9%.
     """
     if i < 2:
         return None
@@ -1999,11 +1999,11 @@ def sig_vwap_reclaim_oi_15m(df, i, extras=None):
 
     # Price reclaims VWAP from below → LONG
     if prev_close < vwap_p and price > vwap:
-        return _make_signal_pct("long", price, 0.3, 0.9)
+        return _make_signal_pct("long", price, 0.5, 0.9)
 
     # Price loses VWAP from above → SHORT
     if prev_close > vwap_p and price < vwap:
-        return _make_signal_pct("short", price, 0.3, 0.9)
+        return _make_signal_pct("short", price, 0.5, 0.9)
 
     return None
 
@@ -2327,6 +2327,27 @@ async def update_htf_bias():
 # Pre-Trade Checklist
 # ---------------------------------------------------------------------------
 
+_rejection_tg_count = 0
+_rejection_tg_hour = 0
+_rejection_tg_suppressed = 0
+
+def _should_send_rejection_tg() -> bool:
+    """Rate limit rejection Telegram notifications: max 3 per hour, then hourly summary."""
+    global _rejection_tg_count, _rejection_tg_hour, _rejection_tg_suppressed
+    current_hour = int(time.time()) // 3600
+    if current_hour != _rejection_tg_hour:
+        if _rejection_tg_suppressed > 0:
+            asyncio.create_task(tg_send(f"Suppressed {_rejection_tg_suppressed} rejection notifications last hour"))
+        _rejection_tg_hour = current_hour
+        _rejection_tg_count = 0
+        _rejection_tg_suppressed = 0
+    _rejection_tg_count += 1
+    if _rejection_tg_count <= 3:
+        return True
+    _rejection_tg_suppressed += 1
+    return False
+
+
 def _block(strategy: str, side: str, reason: str) -> tuple[bool, str]:
     state.signals_blocked += 1
     state.last_block_reasons.append(f"BLOCKED: {strategy} {side.upper()} -- {reason}")
@@ -2393,10 +2414,12 @@ def can_open_trade(strategy: str, side: str) -> tuple[bool, str]:
     # 10. MANDATORY BIAS DIRECTION FILTER
     # Bullish bias (weak or strong) → longs only. Bearish → shorts only. Neutral → both.
     if state.htf_bias == "bullish" and side == "short":
-        asyncio.create_task(tg_send(f'\U0001f6ab BIAS FILTER: {strategy} {side.upper()} blocked \u2014 1H bias is {state.htf_bias.upper()}'))
+        if _should_send_rejection_tg():
+            asyncio.create_task(tg_send(f'\U0001f6ab BIAS FILTER: {strategy} {side.upper()} blocked \u2014 1H bias is {state.htf_bias.upper()}'))
         return _block(strategy, side, f"1H bias is BULLISH -- only LONG signals allowed")
     if state.htf_bias == "bearish" and side == "long":
-        asyncio.create_task(tg_send(f'\U0001f6ab BIAS FILTER: {strategy} {side.upper()} blocked \u2014 1H bias is {state.htf_bias.upper()}'))
+        if _should_send_rejection_tg():
+            asyncio.create_task(tg_send(f'\U0001f6ab BIAS FILTER: {strategy} {side.upper()} blocked \u2014 1H bias is {state.htf_bias.upper()}'))
         return _block(strategy, side, f"1H bias is BEARISH -- only SHORT signals allowed")
 
     log.info("PASSED: %s %s -- all checks OK", strategy, side.upper())
@@ -2846,8 +2869,8 @@ async def close_position(exit_price: float, reason: str, force: bool = False):
     # Check daily loss limit
     if state.losses_today >= MAX_LOSSES_PER_DAY:
         state.daily_loss_cap_hit = True
-        log.info("DAILY LOSS CAP HIT: %d losses today — all trading stopped", state.losses_today)
-        save_state()  # Persist cap IMMEDIATELY so restart can't bypass it
+        save_state()
+        log.info("DAILY CAP HIT AND SAVED — losses=%d cap_hit=%s", state.losses_today, state.daily_loss_cap_hit)
         await tg_send(
             f"\U0001f6d1 <b>{MAX_LOSSES_PER_DAY} losing trades today -- ALL trading stopped until midnight UTC</b>\n"
             f"Daily PnL: ${state.daily_pnl:+,.2f}"
@@ -2856,8 +2879,8 @@ async def close_position(exit_price: float, reason: str, force: bool = False):
     # Check max daily loss (10% of account as absolute cap)
     if state.daily_pnl <= -(ACCOUNT_CAPITAL * MAX_RISK_PCT):
         state.daily_loss_cap_hit = True
-        log.info("DAILY PNL CAP HIT: $%.2f — all trading stopped", state.daily_pnl)
-        save_state()  # Persist cap IMMEDIATELY so restart can't bypass it
+        save_state()
+        log.info("DAILY CAP HIT AND SAVED — pnl=$%.2f cap_hit=%s", state.daily_pnl, state.daily_loss_cap_hit)
         await tg_send(
             f"\U0001f6d1 <b>Daily loss limit hit (${state.daily_pnl:+,.2f})</b>\n"
             f"All trading stopped until tomorrow."
@@ -3025,16 +3048,12 @@ async def ai_market_analysis(strategy: str, side: str, price: float, signal_reas
 
 async def run_all_strategies():
     """Run all active strategies. Strongest signal wins."""
-    log.info("DAILY CAP CHECK: losses=%d cap_hit=%s", state.losses_today, state.daily_loss_cap_hit)
-    if state.daily_loss_cap_hit:
-        log.info("run_all_strategies BLOCKED — daily loss cap hit (losses=%d)", state.losses_today)
+    if state.daily_loss_cap_hit or state.losses_today >= MAX_LOSSES_PER_DAY:
+        log.debug("run_all_strategies blocked: cap_hit=%s losses=%d", state.daily_loss_cap_hit, state.losses_today)
         return
     if state.paused:
         return
     if state.regime == Regime.VOLATILE:
-        return
-    if state.losses_today >= MAX_LOSSES_PER_DAY:
-        log.debug("run_all_strategies BLOCKED — losses_today=%d >= MAX=%d", state.losses_today, MAX_LOSSES_PER_DAY)
         return
     if state.trades_today >= MAX_TRADES_PER_DAY:
         return
