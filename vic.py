@@ -856,7 +856,7 @@ def _make_signal_pct(side: str, price: float, sl_pct: float, tp_pct: float) -> O
     """
     if price <= 0:
         return None
-    sl_pct = max(sl_pct, 0.3)  # Enforce 0.3% minimum SL
+    sl_pct = max(sl_pct, 0.5)  # Enforce 0.5% minimum SL
     sl_dist = price * sl_pct / 100
     tp_dist = price * tp_pct / 100
     if side == "long":
@@ -2319,6 +2319,9 @@ async def update_htf_bias():
         state.htf_bias = "neutral"
         state.htf_bias_strength = "weak"
 
+    log.info("HTF BIAS UPDATE: bias=%s strength=%s (EMA_slope=%.4f%% RSI=%.1f)",
+             state.htf_bias, state.htf_bias_strength, ema_slope_pct, rsi_val)
+
 
 # ---------------------------------------------------------------------------
 # Pre-Trade Checklist
@@ -2390,8 +2393,10 @@ def can_open_trade(strategy: str, side: str) -> tuple[bool, str]:
     # 10. MANDATORY BIAS DIRECTION FILTER
     # Bullish bias (weak or strong) → longs only. Bearish → shorts only. Neutral → both.
     if state.htf_bias == "bullish" and side == "short":
+        asyncio.create_task(tg_send(f'\U0001f6ab BIAS FILTER: {strategy} {side.upper()} blocked \u2014 1H bias is {state.htf_bias.upper()}'))
         return _block(strategy, side, f"1H bias is BULLISH -- only LONG signals allowed")
     if state.htf_bias == "bearish" and side == "long":
+        asyncio.create_task(tg_send(f'\U0001f6ab BIAS FILTER: {strategy} {side.upper()} blocked \u2014 1H bias is {state.htf_bias.upper()}'))
         return _block(strategy, side, f"1H bias is BEARISH -- only SHORT signals allowed")
 
     log.info("PASSED: %s %s -- all checks OK", strategy, side.upper())
@@ -2448,11 +2453,11 @@ async def execute_trade(strategy: str, side: str, entry: float,
     if max_leverage is not None:
         leverage = min(leverage, max_leverage)
 
-    # Enforce minimum SL distance of 0.3% from entry
-    min_sl_dist = entry * 0.003
+    # Enforce minimum SL distance of 0.5% from entry
+    min_sl_dist = entry * 0.005
     sl_distance = abs(entry - sl_price)
     if sl_distance < min_sl_dist:
-        log.info("%s -- SL widened from %.0f to %.0f (0.3%% minimum)", strategy, sl_distance, min_sl_dist)
+        log.info("%s -- SL widened from %.0f to %.0f (0.5%% minimum)", strategy, sl_distance, min_sl_dist)
         sl_distance = min_sl_dist
         if side == "long":
             sl_price = round(entry - sl_distance)
@@ -3020,8 +3025,9 @@ async def ai_market_analysis(strategy: str, side: str, price: float, signal_reas
 
 async def run_all_strategies():
     """Run all active strategies. Strongest signal wins."""
+    log.info("DAILY CAP CHECK: losses=%d cap_hit=%s", state.losses_today, state.daily_loss_cap_hit)
     if state.daily_loss_cap_hit:
-        log.debug("run_all_strategies BLOCKED — daily loss cap hit (losses=%d)", state.losses_today)
+        log.info("run_all_strategies BLOCKED — daily loss cap hit (losses=%d)", state.losses_today)
         return
     if state.paused:
         return
@@ -3863,9 +3869,9 @@ async def run_full_backtest():
                     i += 1
                     continue
 
-                # Enforce minimum SL 0.3%
+                # Enforce minimum SL 0.5%
                 sl_dist = abs(sig["entry"] - sig["sl"])
-                min_sl = sig["entry"] * 0.003
+                min_sl = sig["entry"] * 0.005
                 if sl_dist < min_sl:
                     sl_dist = min_sl
                     if sig["side"] == "long":
