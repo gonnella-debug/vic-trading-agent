@@ -3150,11 +3150,7 @@ async def run_all_strategies():
         _ai_rejection_streak[strat_name] = _ai_rejection_streak.get(strat_name, 0) + 1
         if _ai_rejection_streak[strat_name] >= 3 and strat_name not in _ai_rejection_override_until:
             _ai_rejection_override_until[strat_name] = time.time() + 86400
-            await tg_send(
-                f"\u26a0\ufe0f <b>AI Brain override activated</b> for {label}\n"
-                f"3+ consecutive rejections -- AI brain is now informational only for this strategy for 24h.\n"
-                f"GG has been notified."
-            )
+            log.info("AI Brain override activated for %s -- 3+ consecutive rejections, informational only for 24h", label)
     elif approved or force_approve:
         _ai_rejection_streak[strat_name] = 0
 
@@ -3169,20 +3165,8 @@ async def run_all_strategies():
         log.info("AI Market Brain REJECTED %s %s (confidence %d): %s",
                  strat_name, signal["side"], confidence, ai_reason)
         now = time.time()
-        _tg_rejection_timestamps[:] = [t for t in _tg_rejection_timestamps if now - t < 3600]
-        if len(_tg_rejection_timestamps) < 3:
-            _tg_rejection_timestamps.append(now)
-            await tg_send(
-                f"\u274c <b>AI Brain REJECTED</b> -- {label}\n"
-                f"{signal['side'].upper()} @ ${signal['entry']:,.2f} | Confidence: {confidence}/10\n"
-                f"{sanitize_html(ai_reason[:200])}"
-            )
-        elif len(_tg_rejection_timestamps) == 3:
-            _tg_rejection_timestamps.append(now)
-            await tg_send(
-                f"\U0001f507 <b>AI Brain rejection notifications suppressed</b>\n"
-                f"3+ rejections this hour. Will send hourly summary instead."
-            )
+        log.info("AI Brain REJECTED %s %s @ $%.2f (confidence %d): %s",
+                 label, signal['side'], signal['entry'], confidence, ai_reason[:200])
         return
     else:
         if force_approve and not approved:
@@ -3517,11 +3501,7 @@ async def _run_macro_scan():
                             f"Details:\n{result[:500]}"
                         )
                 elif "RISK_LEVEL: HIGH" in result.upper():
-                    await tg_send(
-                        f"\u26a0\ufe0f <b>MACRO RISK -- HIGH</b>\n\n"
-                        f"{result[:400]}\n\n"
-                        f"Trading continues but AI Market Brain will factor this in."
-                    )
+                    log.info("Macro risk HIGH detected -- trading continues, AI Brain will factor in. %s", result[:200])
     except Exception as exc:
         log.error("Macro scan error: %s", exc)
 
@@ -3748,36 +3728,36 @@ def _is_weekend_candle(ts) -> bool:
 async def run_full_backtest():
     """Phase 1-3: Download 90 days, test all 50 strategies, report results."""
     log.info("Starting 90-day full backtest...")
-    await tg_send("\U0001f50d <b>Research phase starting...</b>\nDownloading 90 days of data...")
+    log.info("Research phase starting -- downloading 90 days of data...")
 
     # Download data for each timeframe
     data = {}
     for tf in ["5m", "15m", "1h"]:
-        await tg_send(f"\U0001f4e5 Downloading {tf} data...")
+        log.info("Downloading %s data...", tf)
         data[tf] = await download_historical_data(tf, 90)
         if not data[tf].empty:
-            await tg_send(f"\u2705 {tf}: {len(data[tf])} candles downloaded")
+            log.info("%s: %d candles downloaded", tf, len(data[tf]))
         else:
-            await tg_send(f"\u26a0\ufe0f {tf}: No data received")
+            log.warning("%s: No data received", tf)
 
     # Skip 1m download -- too much data, and most strategies use 5m+
     data["1m"] = data.get("5m", pd.DataFrame())  # Use 5m as proxy for 1m strategies
 
     # Download funding rate history for perp-native strategies
-    await tg_send("\U0001f4e5 Downloading funding rate history...")
+    log.info("Downloading funding rate history...")
     funding_df = await fetch_funding_rate_history(90)
     funding_rates_by_ts = {}
     if not funding_df.empty:
-        await tg_send(f"\u2705 Funding: {len(funding_df)} rate entries downloaded")
+        log.info("Funding: %d rate entries downloaded", len(funding_df))
         for _, row in funding_df.iterrows():
             # Index by hour for lookup during backtest
             ts_key = row["timestamp"].floor("8h")  # Funding settles every 8h
             funding_rates_by_ts[ts_key] = row["funding_rate"]
     else:
-        await tg_send("\u26a0\ufe0f Funding history: No data (will use 0)")
+        log.warning("Funding history: No data (will use 0)")
 
     # Precompute indicators
-    await tg_send("\U0001f4ca Precomputing indicators...")
+    log.info("Precomputing indicators...")
     for tf in data:
         if not data[tf].empty and len(data[tf]) >= 55:
             try:
@@ -3812,7 +3792,7 @@ async def run_full_backtest():
     passed_names = []
     failed_names = []
 
-    await tg_send(f"\U0001f9ea Testing {len(ALL_STRATEGY_DEFS)} strategies...")
+    log.info("Testing %d strategies...", len(ALL_STRATEGY_DEFS))
 
     for name, sdef in ALL_STRATEGY_DEFS.items():
         tf = sdef["tf"]
@@ -3943,7 +3923,7 @@ async def run_full_backtest():
     if len(passed_names) > 15:
         msg_lines.append(f"  ... and {len(passed_names) - 15} more")
     msg_lines.append(f"\n<b>FAILED ({len(failed_names)}):</b> {len(failed_names)} strategies did not meet criteria")
-    await tg_send("\n".join(msg_lines))
+    log.info("Backtest results: %d passed, %d failed", len(passed_names), len(failed_names))
 
     return results, passed_names, failed_names
 
@@ -4087,7 +4067,8 @@ async def send_daily_self_review():
     summary_lines.append(f"\n<b>Review:</b>\n{sanitize_html(review_text[:1500])}")
     summary_lines.append(f"\n\u2753 <b>Use /approve to apply changes or /reject to discard.</b>")
 
-    await tg_send("\n".join(summary_lines))
+    # Store review to file only -- send via /review command on demand
+    log.info("Daily self-review complete. Use /review to see results.")
 
 
 async def daily_reset_scheduler():
@@ -4099,7 +4080,7 @@ async def daily_reset_scheduler():
         log.info("Daily reset in %.0f seconds.", wait_seconds)
         await asyncio.sleep(wait_seconds)
         state.reset_daily()
-        await tg_send("\U0001f504 Daily reset complete. All strategies resumed.")
+        log.info("Daily reset complete. All strategies resumed.")
 
 
 # ---------------------------------------------------------------------------
@@ -4140,7 +4121,7 @@ async def backtest_scheduler():
             if len(passed_names) > 10:
                 bt_msg.append(f"  ... and {len(passed_names) - 10} more")
             bt_msg.append(f"\n<b>Active:</b> {len(passed_names)} strategies scanning for signals.")
-            await tg_send("\n".join(bt_msg))
+            log.info("Nightly backtest complete: %d passed, %d failed", len(passed_names), len(failed_names))
 
         except Exception as exc:
             log.error("Nightly backtest error: %s", exc)
@@ -4212,7 +4193,7 @@ async def send_sunday_report():
     if intel:
         lines.append(f"\n<b>=== TOP TRADER INTEL ===</b>\n{sanitize_html(intel)}")
 
-    await tg_send("\n".join(lines))
+    log.info("Sunday report generated. Use /review to see results.")
 
 
 # ---------------------------------------------------------------------------
