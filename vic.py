@@ -2473,7 +2473,9 @@ def calc_leverage_from_confidence(confidence: int) -> int:
 
 
 async def fetch_live_equity() -> float:
-    """Fetch Emma's current Hyperliquid account equity in USD.
+    """Fetch Vic's current Hyperliquid account equity in USD.
+    Handles BOTH unified-account mode (balance in spot USDC)
+    and legacy perp-only mode (balance in clearinghouse marginSummary).
     Falls back to state.live_equity or ACCOUNT_CAPITAL_FALLBACK if fetch fails.
     Also updates peak_equity and the drawdown killswitch.
     """
@@ -2482,9 +2484,33 @@ async def fetch_live_equity() -> float:
         loop = asyncio.get_running_loop()
         user_st = await loop.run_in_executor(None, lambda: hl_info.user_state(HL_WALLET_ADDRESS))
         margin_summary = user_st.get("marginSummary", {}) if isinstance(user_st, dict) else {}
-        equity = float(margin_summary.get("accountValue", 0) or 0)
+        perp_equity = float(margin_summary.get("accountValue", 0) or 0)
+
+        # Unified account: balance lives in spot USDC, not perp marginSummary.
+        # Use HL's POST /info with spotClearinghouseState.
+        spot_equity = 0.0
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.post(
+                    "https://api.hyperliquid.xyz/info",
+                    json={"type": "spotClearinghouseState", "user": HL_WALLET_ADDRESS},
+                )
+                if r.status_code == 200:
+                    spot_data = r.json()
+                    for bal in spot_data.get("balances", []) or []:
+                        if bal.get("coin") == "USDC":
+                            spot_equity = float(bal.get("total", 0) or 0)
+                            break
+        except Exception as spot_exc:
+            log.warning(f"spotClearinghouseState fetch failed: {spot_exc}")
+
+        # Under unified mode, perp_equity will be 0 and spot_equity holds the real balance.
+        # Under legacy mode, perp_equity holds everything. Use whichever is larger.
+        equity = max(perp_equity, spot_equity)
+        log.info(f"fetch_live_equity -- perp=${perp_equity:.2f} spot=${spot_equity:.2f} using=${equity:.2f}")
+
         if equity <= 0:
-            raise ValueError(f"Invalid equity from HL: {equity}")
+            raise ValueError(f"Both perp (${perp_equity}) and spot (${spot_equity}) equity are zero")
         state.live_equity = equity
         if equity > state.peak_equity:
             state.peak_equity = equity
@@ -5147,6 +5173,8 @@ async def equity_check():
     """
     try:
         eq = await fetch_live_equity()
+        # Connection is OK if we got a real number from HL (not the silent fallback)
+        connection = "ok" if state.live_equity > 0 else "check_hyperliquid"
         return {
             "live_equity_usd": round(eq, 2),
             "peak_equity_usd": round(state.peak_equity, 2),
@@ -5154,10 +5182,36 @@ async def equity_check():
             "drawdown_killswitch_hit": state.drawdown_killswitch_hit,
             "drawdown_killswitch_threshold_pct": EQUITY_DRAWDOWN_KILLSWITCH * 100,
             "hyperliquid_wallet": HL_WALLET_ADDRESS[:10] + "..." if HL_WALLET_ADDRESS else "not_set",
-            "connection": "ok" if eq > 0 and eq != ACCOUNT_CAPITAL_FALLBACK else "check_hyperliquid",
+            "connection": connection,
         }
     except Exception as e:
         return {"error": str(e), "connection": "failed"}
+
+
+@app.post("/clear-phantom-position")
+async def clear_phantom_position(token: str = Query("")):
+    """Clear Vic's internal current_position if Hyperliquid shows no actual position.
+    Used to fix state-drift bugs where Vic thinks it has a position that doesn't exist on HL.
+    """
+    if token != WEBHOOK_SECRET:
+        return JSONResponse(status_code=403, content={"error": "Invalid token"})
+    try:
+        loop = asyncio.get_running_loop()
+        user_st = await loop.run_in_executor(None, lambda: hl_info.user_state(HL_WALLET_ADDRESS))
+        hl_positions = [p for p in user_st.get("assetPositions", []) or []
+                        if float(p.get("position", {}).get("szi", 0)) != 0]
+        before = state.current_position
+        if not hl_positions:
+            state.current_position = None
+            save_state()
+            await tg_send(
+                f"🧹 Phantom position cleared.\n"
+                f"Vic's internal state had a position that HL didn't recognise. Cleared."
+            )
+            return {"cleared": True, "was": before, "hl_positions": 0}
+        return {"cleared": False, "reason": "HL shows real positions", "hl_positions": len(hl_positions)}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @app.get("/status")
