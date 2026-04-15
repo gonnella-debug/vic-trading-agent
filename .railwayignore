@@ -1,0 +1,7 @@
+cache/
+*.backup
+*.pyc
+__pycache__/
+.git/
+backtest_results.json
+backtest_alternatives_results.json
