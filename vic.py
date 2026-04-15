@@ -5117,6 +5117,17 @@ VIC_VERSION_SHA = os.getenv("RAILWAY_GIT_COMMIT_SHA", "unknown")[:7]
 VIC_VERSION_TAG = "safety-v2-10x-cap-drawdown-killswitch-fee-aware"
 
 
+@app.get("/hl-dump")
+async def hl_dump():
+    """Dump raw Hyperliquid user_state for debugging equity parsing."""
+    try:
+        loop = asyncio.get_running_loop()
+        user_st = await loop.run_in_executor(None, lambda: hl_info.user_state(HL_WALLET_ADDRESS))
+        return {"raw": user_st, "type": str(type(user_st))}
+    except Exception as e:
+        return {"error": str(e), "type": type(e).__name__}
+
+
 @app.get("/version")
 async def version_check():
     """Returns the exact git commit + feature tag of the deployed code.
