@@ -86,11 +86,17 @@ CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
 # ---------------------------------------------------------------------------
 SYMBOL = "BTC"
 BASE_LEVERAGE = 10
-ACCOUNT_CAPITAL = 370.0
-MAX_RISK_PCT = 0.10               # 10% hard ceiling per trade
+MAX_LEVERAGE_HARD_CAP = 10        # GG standard: never exceed 10x regardless of AI confidence
+ACCOUNT_CAPITAL_FALLBACK = 500.0  # Only used if Hyperliquid balance fetch fails
+ACCOUNT_CAPITAL = ACCOUNT_CAPITAL_FALLBACK  # Legacy alias (display/backtest only — runtime uses fetch_live_equity)
+MAX_RISK_PCT = 0.02               # 2% hard cap per trade — no confidence scaling
 TARGET_RISK_PCT = 0.02            # 2% target risk per trade
+MIN_SL_PCT = 2.0                  # 2% minimum stop distance (was 0.5%)
 MAX_TRADES_PER_DAY = 4            # Max 4 trades per day
 MAX_LOSSES_PER_DAY = 3            # 3 losing trades = stop for the day
+FEE_PER_TRADE_USD = 3.0           # Hyperliquid fee per entry/exit (round trip ~ $6)
+MIN_NET_PROFIT_MULT = 2.0         # TP must clear >= 2× round-trip fees net
+EQUITY_DRAWDOWN_KILLSWITCH = 0.20  # Pause bot if equity drops 20% from peak
 
 # Persistence files
 JOURNAL_FILE = os.getenv("JOURNAL_FILE", "/data/vic_journal.json")
@@ -155,6 +161,11 @@ class TradingState:
         self.losses_today: int = 0
         self.daily_pnl: float = 0.0
         self.daily_loss_cap_hit: bool = False
+
+        # Live equity + drawdown killswitch
+        self.live_equity: float = 0.0           # Last fetched Hyperliquid account equity
+        self.peak_equity: float = 0.0           # Highest equity ever seen (for drawdown calc)
+        self.drawdown_killswitch_hit: bool = False
 
         # Metrics tracking per strategy (dynamic -- populated after backtest)
         self.metrics: dict = {}
@@ -243,6 +254,9 @@ def save_state():
             "pending_review": state.pending_review,
             "research_complete": state.research_complete,
             "daily_loss_cap_hit": state.daily_loss_cap_hit,
+            "live_equity": state.live_equity,
+            "peak_equity": state.peak_equity,
+            "drawdown_killswitch_hit": state.drawdown_killswitch_hit,
             "saved_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -271,6 +285,9 @@ def load_state():
         state.funding_history = data.get("funding_history", [])
         state.pending_review = data.get("pending_review")
         state.research_complete = data.get("research_complete", False)
+        state.live_equity = float(data.get("live_equity", 0.0) or 0.0)
+        state.peak_equity = float(data.get("peak_equity", 0.0) or 0.0)
+        state.drawdown_killswitch_hit = bool(data.get("drawdown_killswitch_hit", False))
 
         saved_metrics = data.get("metrics", {})
         for name, m in saved_metrics.items():
@@ -858,7 +875,7 @@ def _make_signal_pct(side: str, price: float, sl_pct: float, tp_pct: float) -> O
     """
     if price <= 0:
         return None
-    sl_pct = max(sl_pct, 0.5)  # Enforce 0.5% minimum SL
+    sl_pct = max(sl_pct, MIN_SL_PCT)  # Enforce 2% minimum SL (GG standard)
     sl_dist = price * sl_pct / 100
     tp_dist = price * tp_pct / 100
     if side == "long":
@@ -2382,6 +2399,10 @@ def can_open_trade(strategy: str, side: str) -> tuple[bool, str]:
     if state.daily_loss_cap_hit:
         return _block(strategy, side, "Daily loss cap hit")
 
+    # Equity drawdown killswitch
+    if state.drawdown_killswitch_hit:
+        return _block(strategy, side, f"Equity drawdown killswitch active (>={EQUITY_DRAWDOWN_KILLSWITCH*100:.0f}% drawdown from peak)")
+
     # 4. Max trades per day
     if state.trades_today >= MAX_TRADES_PER_DAY:
         return _block(strategy, side, f"Max trades per day ({state.trades_today}/{MAX_TRADES_PER_DAY})")
@@ -2444,15 +2465,45 @@ def can_open_trade(strategy: str, side: str) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 def calc_leverage_from_confidence(confidence: int) -> int:
-    """Determine leverage from AI confidence score."""
-    if confidence <= 6:
-        return BASE_LEVERAGE  # Should not reach here (rejected), but safety
-    elif confidence <= 8:
-        return BASE_LEVERAGE  # 10x
-    elif confidence == 9:
-        return 15
-    else:  # 10
-        return 20
+    """Determine leverage from AI confidence score.
+    GG standard: HARD CAPPED at 10x regardless of confidence. Higher leverage
+    amplified losses during the $500→$85 drawdown, so scaling is disabled.
+    """
+    return min(BASE_LEVERAGE, MAX_LEVERAGE_HARD_CAP)
+
+
+async def fetch_live_equity() -> float:
+    """Fetch Emma's current Hyperliquid account equity in USD.
+    Falls back to state.live_equity or ACCOUNT_CAPITAL_FALLBACK if fetch fails.
+    Also updates peak_equity and the drawdown killswitch.
+    """
+    global state
+    try:
+        loop = asyncio.get_running_loop()
+        user_st = await loop.run_in_executor(None, lambda: hl_info.user_state(HL_WALLET_ADDRESS))
+        margin_summary = user_st.get("marginSummary", {}) if isinstance(user_st, dict) else {}
+        equity = float(margin_summary.get("accountValue", 0) or 0)
+        if equity <= 0:
+            raise ValueError(f"Invalid equity from HL: {equity}")
+        state.live_equity = equity
+        if equity > state.peak_equity:
+            state.peak_equity = equity
+        if state.peak_equity > 0:
+            drawdown = 1.0 - (equity / state.peak_equity)
+            if drawdown >= EQUITY_DRAWDOWN_KILLSWITCH and not state.drawdown_killswitch_hit:
+                state.drawdown_killswitch_hit = True
+                state.paused = True
+                save_state()
+                await tg_send(
+                    f"🛑 DRAWDOWN KILLSWITCH — Vic paused.\n"
+                    f"Equity ${equity:.2f} vs peak ${state.peak_equity:.2f} "
+                    f"({drawdown*100:.1f}% drawdown >= {EQUITY_DRAWDOWN_KILLSWITCH*100:.0f}% limit).\n"
+                    f"Review trades before /resume."
+                )
+        return equity
+    except Exception as e:
+        log.warning(f"fetch_live_equity failed: {e} — using fallback")
+        return state.live_equity if state.live_equity > 0 else ACCOUNT_CAPITAL_FALLBACK
 
 
 def validate_tp(side: str, entry: float, tp: float, strategy: str) -> bool:
@@ -2489,11 +2540,11 @@ async def execute_trade(strategy: str, side: str, entry: float,
     if max_leverage is not None:
         leverage = min(leverage, max_leverage)
 
-    # Enforce minimum SL distance of 0.5% from entry
-    min_sl_dist = entry * 0.005
+    # Enforce minimum SL distance (GG standard: 2% minimum)
+    min_sl_dist = entry * (MIN_SL_PCT / 100.0)
     sl_distance = abs(entry - sl_price)
     if sl_distance < min_sl_dist:
-        log.info("%s -- SL widened from %.0f to %.0f (0.5%% minimum)", strategy, sl_distance, min_sl_dist)
+        log.info("%s -- SL widened from %.0f to %.0f (%.1f%% minimum)", strategy, sl_distance, min_sl_dist, MIN_SL_PCT)
         sl_distance = min_sl_dist
         if side == "long":
             sl_price = round(entry - sl_distance)
@@ -2503,9 +2554,18 @@ async def execute_trade(strategy: str, side: str, entry: float,
         log.warning("%s -- zero SL distance, cannot size position.", strategy)
         return
 
-    # Size: 2% risk per trade, hard cap at 10%
-    risk_pct = min(TARGET_RISK_PCT + (confidence - 7) * 0.005, MAX_RISK_PCT)
-    risk_dollars = ACCOUNT_CAPITAL * risk_pct
+    # Fee-aware profit check: TP must clear at least 2× round-trip fees net
+    tp_distance = abs(tp_price - entry)
+    min_net_profit = FEE_PER_TRADE_USD * 2 * MIN_NET_PROFIT_MULT  # $12 min net
+    # We'll size based on risk, so estimate gross TP $ at that size below. For now skip size-dependent check until after sizing.
+
+    # Size: HARD 2% risk per trade (no confidence scaling — GG standard)
+    account_equity = await fetch_live_equity()
+    if state.drawdown_killswitch_hit:
+        log.warning("%s -- drawdown killswitch active, cannot open trade", strategy)
+        return
+    risk_pct = TARGET_RISK_PCT
+    risk_dollars = account_equity * risk_pct
     size = math.floor(risk_dollars / sl_distance * 100000) / 100000
 
     if size <= 0:
@@ -2518,8 +2578,23 @@ async def execute_trade(strategy: str, side: str, entry: float,
         log.warning("%s -- notional $%.2f below HL minimum, skipping.", strategy, notional)
         return
 
+    # Fee-aware profit check: expected gross TP must clear 2× round-trip fees
+    expected_tp_gross = size * tp_distance
+    round_trip_fees = FEE_PER_TRADE_USD * 2
+    min_required_profit = round_trip_fees * MIN_NET_PROFIT_MULT
+    if expected_tp_gross < min_required_profit:
+        log.warning(
+            "%s -- TP gross $%.2f < min $%.2f (2× round-trip fees $%.2f × %.1f). Edge too thin after fees. Skipping.",
+            strategy, expected_tp_gross, min_required_profit, round_trip_fees, MIN_NET_PROFIT_MULT
+        )
+        asyncio.create_task(tg_send(
+            f"⚠️ {strategy} {side.upper()} rejected — TP too small vs fees "
+            f"(gross ${expected_tp_gross:.2f} < min ${min_required_profit:.2f})"
+        ))
+        return
+
     # Cap to leverage limit
-    max_size = math.floor(ACCOUNT_CAPITAL * leverage / entry * 100000) / 100000
+    max_size = math.floor(account_equity * leverage / entry * 100000) / 100000
     if size > max_size:
         size = max_size
         log.info("%s -- size capped to leverage limit: %.6f BTC", strategy, size)
@@ -2889,8 +2964,9 @@ async def close_position(exit_price: float, reason: str, force: bool = False):
             f"Daily PnL: ${state.daily_pnl:+,.2f}"
         )
 
-    # Check max daily loss (10% of account as absolute cap)
-    if state.daily_pnl <= -(ACCOUNT_CAPITAL * MAX_RISK_PCT):
+    # Check max daily loss (2% of LIVE account equity — tight cap)
+    _daily_cap_equity = state.live_equity if state.live_equity > 0 else ACCOUNT_CAPITAL_FALLBACK
+    if state.daily_pnl <= -(_daily_cap_equity * MAX_RISK_PCT * MAX_LOSSES_PER_DAY):
         state.daily_loss_cap_hit = True
         save_state()
         log.info("DAILY CAP HIT AND SAVED — pnl=$%.2f cap_hit=%s", state.daily_pnl, state.daily_loss_cap_hit)
@@ -5107,6 +5183,16 @@ async def resume_trading(token: str = Query("")):
     if token != WEBHOOK_SECRET:
         return JSONResponse(status_code=403, content={"error": "Invalid token"})
     state.paused = False
+    # Clear drawdown killswitch on manual resume AND reset peak to current equity
+    # (so the killswitch measures drawdown from this resume point, not the old peak)
+    if state.drawdown_killswitch_hit:
+        state.drawdown_killswitch_hit = False
+        try:
+            eq = await fetch_live_equity()
+            state.peak_equity = eq
+        except Exception:
+            pass
+    save_state()
     await tg_send("\u25b6\ufe0f Trading RESUMED by manual command.")
     return {"status": "resumed"}
 
