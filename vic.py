@@ -5113,6 +5113,22 @@ async def health():
     }
 
 
+VIC_VERSION_SHA = os.getenv("RAILWAY_GIT_COMMIT_SHA", "unknown")[:7]
+VIC_VERSION_TAG = "safety-v2-10x-cap-drawdown-killswitch-fee-aware"
+
+
+@app.get("/version")
+async def version_check():
+    """Returns the exact git commit + feature tag of the deployed code.
+    Use this to verify a Railway deploy landed the expected changes.
+    """
+    return {
+        "commit_sha": VIC_VERSION_SHA,
+        "feature_tag": VIC_VERSION_TAG,
+        "deployed_at": state.startup_time,
+    }
+
+
 @app.get("/equity")
 async def equity_check():
     """Live equity check — pulls actual Hyperliquid balance in real time.
