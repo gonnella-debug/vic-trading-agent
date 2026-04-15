@@ -5113,6 +5113,26 @@ async def health():
     }
 
 
+@app.get("/equity")
+async def equity_check():
+    """Live equity check — pulls actual Hyperliquid balance in real time.
+    Use this to confirm Vic is correctly seeing his working capital.
+    """
+    try:
+        eq = await fetch_live_equity()
+        return {
+            "live_equity_usd": round(eq, 2),
+            "peak_equity_usd": round(state.peak_equity, 2),
+            "drawdown_from_peak_pct": round((1 - eq / state.peak_equity) * 100, 2) if state.peak_equity > 0 else 0,
+            "drawdown_killswitch_hit": state.drawdown_killswitch_hit,
+            "drawdown_killswitch_threshold_pct": EQUITY_DRAWDOWN_KILLSWITCH * 100,
+            "hyperliquid_wallet": HL_WALLET_ADDRESS[:10] + "..." if HL_WALLET_ADDRESS else "not_set",
+            "connection": "ok" if eq > 0 and eq != ACCOUNT_CAPITAL_FALLBACK else "check_hyperliquid",
+        }
+    except Exception as e:
+        return {"error": str(e), "connection": "failed"}
+
+
 @app.get("/status")
 async def full_status():
     strategies_status = {}
@@ -5135,7 +5155,14 @@ async def full_status():
         "bot": "Vic v6",
         "mode": state.mode,
         "base_leverage": BASE_LEVERAGE,
-        "account_capital": ACCOUNT_CAPITAL,
+        "max_leverage_hard_cap": MAX_LEVERAGE_HARD_CAP,
+        "account_capital_fallback": ACCOUNT_CAPITAL_FALLBACK,
+        "live_equity": round(state.live_equity, 2) if state.live_equity else None,
+        "peak_equity": round(state.peak_equity, 2) if state.peak_equity else None,
+        "drawdown_killswitch_hit": state.drawdown_killswitch_hit,
+        "min_sl_pct": MIN_SL_PCT,
+        "max_risk_pct": MAX_RISK_PCT,
+        "fee_per_trade_usd": FEE_PER_TRADE_USD,
         "global_paused": state.paused,
         "research_complete": state.research_complete,
         "regime": state.regime.value,
