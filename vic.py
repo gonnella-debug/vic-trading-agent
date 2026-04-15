@@ -167,8 +167,9 @@ class TradingState:
         self._ohlcv_cache: dict = {}
 
         # Signal tracking
-        self.signals_checked: int = 0
+        self.signals_checked: int = 0  # Candidates that reached can_open_trade gate
         self.signals_blocked: int = 0
+        self.strategy_evals: int = 0   # Total sig_* function invocations (all returned signals + Nones)
         self.last_block_reasons: list = []
 
         # Polling watchdog
@@ -205,6 +206,7 @@ class TradingState:
         self.daily_loss_cap_hit = False
         self.signals_checked = 0
         self.signals_blocked = 0
+        self.strategy_evals = 0
         self.last_block_reasons = []
         for name in list(self.metrics.keys()):
             self.metrics[name]["current_losing_streak"] = 0
@@ -2422,6 +2424,17 @@ def can_open_trade(strategy: str, side: str) -> tuple[bool, str]:
             asyncio.create_task(tg_send(f'\U0001f6ab BIAS FILTER: {strategy} {side.upper()} blocked \u2014 1H bias is {state.htf_bias.upper()}'))
         return _block(strategy, side, f"1H bias is BEARISH -- only SHORT signals allowed")
 
+    # 11. PROPOSAL 5: Top-trader dominance bias filter
+    # If top-3 traders show dominant LONG, block shorts; if dominant SHORT, block longs.
+    # NEUTRAL allows both.
+    intel = _intelligence_cache.get("report", {})
+    patterns = intel.get("patterns", {})
+    dominant = str(patterns.get("dominant_direction", "NEUTRAL")).upper()
+    if dominant == "LONG" and side == "short":
+        return _block(strategy, side, f"Top-trader dominance is LONG -- short blocked")
+    if dominant == "SHORT" and side == "long":
+        return _block(strategy, side, f"Top-trader dominance is SHORT -- long blocked")
+
     log.info("PASSED: %s %s -- all checks OK", strategy, side.upper())
     return True, "OK"
 
@@ -3093,10 +3106,17 @@ async def run_all_strategies():
     patterns = intel.get("patterns", {})
     extras["top_trader_bias"] = patterns.get("dominant_direction", "NEUTRAL")
 
+    # PROPOSAL 3: Session whitelist -- during Asia hours, restrict to high-WR range strategies
+    session = _get_trading_session()
+    ASIA_WHITELIST = {"liq_cascade_fade_15m", "inside_bar_5m", "ema_cross_9_21_5m"}
+
     # Gather signals from all active strategies
     signals = []
     for name in state.active_strategies:
         if state.strategy_paused.get(name, False):
+            continue
+        # PROPOSAL 3: filter to Asia whitelist when in Asia session
+        if session == "asia" and name not in ASIA_WHITELIST:
             continue
         sdef = ALL_STRATEGY_DEFS.get(name)
         if not sdef:
@@ -3106,7 +3126,21 @@ async def run_all_strategies():
         if df is None or df.empty or len(df) < 55:
             continue
         try:
+            state.strategy_evals += 1
+            log.debug("EVAL: %s tf=%s bars=%d", name, tf, len(df))
             sig = sdef["signal_func"](df, len(df) - 1, extras)
+            # PROPOSAL 4: obv_divergence_15m requires EMA(9)/EMA(21) trend alignment
+            if sig and name == "obv_divergence_15m":
+                e9 = _safe_val(df["ema_9"], len(df) - 1)
+                e21 = _safe_val(df["ema_21"], len(df) - 1)
+                if _nan(e9) or _nan(e21):
+                    sig = None
+                elif sig["side"] == "long" and not (e9 > e21):
+                    log.debug("obv_divergence_15m LONG suppressed -- EMA9 not > EMA21")
+                    sig = None
+                elif sig["side"] == "short" and not (e9 < e21):
+                    log.debug("obv_divergence_15m SHORT suppressed -- EMA9 not < EMA21")
+                    sig = None
             if sig:
                 sig["strategy"] = name
                 sig["reason"] = f"{sdef['label']} signal"
@@ -3350,6 +3384,10 @@ async def strategy_monitor_loop():
             now = datetime.now(timezone.utc)
             current_ts = now.timestamp()
 
+            # 1m boundary
+            current_1m = int(current_ts // 60) * 60
+            new_1m = current_1m > state.last_1m_candle_ts
+
             # 5m boundary
             current_5m = int(current_ts // 300) * 300
             new_5m = current_5m > state.last_5m_candle_ts
@@ -3362,6 +3400,8 @@ async def strategy_monitor_loop():
             current_1h = int(current_ts // 3600) * 3600
             new_1h = current_1h > state.last_1h_candle_ts
 
+            if new_1m:
+                state.last_1m_candle_ts = current_1m
             if new_5m:
                 state.last_5m_candle_ts = current_5m
             if new_15m:
@@ -3370,7 +3410,7 @@ async def strategy_monitor_loop():
                 state.last_1h_candle_ts = current_1h
 
             # Run strategies on appropriate boundaries
-            if new_5m or new_15m or new_1h:
+            if new_1m or new_5m or new_15m or new_1h:
                 await run_all_strategies()
 
         except Exception as exc:
@@ -3393,14 +3433,14 @@ async def periodic_status_log():
                 "=== PERIODIC STATUS ===\n"
                 "  Regime: %s | HTF Bias: %s (%s) | BTC: $%.2f | Mode: %s\n"
                 "  Active strategies: %d/%d\n"
-                "  Signals checked: %d | Signals blocked: %d\n"
+                "  Strategy evals: %d | Signals checked: %d | Signals blocked: %d\n"
                 "  Trades today: %d/%d | Losses: %d/%d | PnL: $%.2f\n"
                 "  Position: %s\n"
                 "  Funding rate: %.6f | Research: %s",
                 state.regime.value, state.htf_bias, state.htf_bias_strength,
                 state.last_btc_price, state.mode,
                 len(state.active_strategies), len(ALL_STRATEGY_DEFS),
-                state.signals_checked, state.signals_blocked,
+                state.strategy_evals, state.signals_checked, state.signals_blocked,
                 state.trades_today, MAX_TRADES_PER_DAY,
                 state.losses_today, MAX_LOSSES_PER_DAY,
                 state.daily_pnl,
@@ -3654,7 +3694,7 @@ def _calc_backtest_stats(strategy: str, trades: list) -> dict:
         return {
             "strategy": strategy, "total_trades": 0, "wins": 0, "losses": 0,
             "win_rate": 0.0, "total_pnl": 0.0, "avg_r": 0.0, "max_drawdown": 0.0,
-            "max_consec_losses": 0, "passed": False,
+            "max_consec_losses": 0, "profit_factor": 0.0, "passed": False,
         }
 
     wins = sum(1 for t in trades if t["pnl"] > 0)
@@ -3691,12 +3731,22 @@ def _calc_backtest_stats(strategy: str, trades: list) -> dict:
     # Max drawdown as percentage of account
     max_dd_pct = max_dd / ACCOUNT_CAPITAL * 100
 
-    # PASS criteria -- positive dollar PnL + minimum 20 trades
-    # Win rate is NOT the sole threshold; positive expectancy with good R:R is sufficient
+    # Profit factor = gross profit / gross loss
+    gross_profit = sum(t["pnl"] for t in trades if t["pnl"] > 0)
+    gross_loss = abs(sum(t["pnl"] for t in trades if t["pnl"] < 0))
+    if gross_loss > 0:
+        profit_factor = gross_profit / gross_loss
+    elif gross_profit > 0:
+        profit_factor = float("inf")
+    else:
+        profit_factor = 0.0
+
+    # PASS criteria -- profit factor >= 1.3 AND positive PnL (+ min 20 trades, max DD < 30%)
     passed = (
-        total_pnl > 0 and                       # Positive total dollar PnL over 90 days
-        len(trades) >= 20 and                   # Minimum 20 trades
-        max_dd_pct < 30                         # Max drawdown < 30%
+        total_pnl > 0 and
+        profit_factor >= 1.3 and
+        len(trades) >= 20 and
+        max_dd_pct < 30
     )
 
     return {
@@ -3705,6 +3755,7 @@ def _calc_backtest_stats(strategy: str, trades: list) -> dict:
         "avg_r": round(avg_r, 2), "max_drawdown": round(max_dd, 2),
         "max_drawdown_pct": round(max_dd_pct, 1),
         "max_consec_losses": max_consec,
+        "profit_factor": round(profit_factor, 2) if profit_factor != float("inf") else 999.0,
         "passed": passed,
         "trades": trades[-10:],
     }
