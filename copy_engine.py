@@ -357,21 +357,28 @@ async def copy_monitor_loop(equity_fn, execute_fn=None, tg_fn=None,
 
     while True:
         try:
-            if is_paused and is_paused():
-                await asyncio.sleep(10)
-                continue
-
+            # Always refresh leaderboard + poll positions (even when paused — keeps data fresh)
             await refresh_leaderboard()
             equity = await equity_fn()
 
-            await poll_traders_once(
-                equity=equity,
-                execute_fn=execute_fn,
-                tg_fn=tg_fn,
-                fee_filter=fee_filter,
-                max_leverage=max_leverage,
-                check_can_trade=check_can_trade,
-            )
+            if is_paused and is_paused():
+                # Still poll to track trader positions, but don't execute
+                for trader in copy_state.traders:
+                    try:
+                        new_positions = await fetch_trader_positions(trader.address)
+                        trader.positions = new_positions
+                        trader.last_polled = time.time()
+                    except Exception:
+                        pass
+            else:
+                await poll_traders_once(
+                    equity=equity,
+                    execute_fn=execute_fn,
+                    tg_fn=tg_fn,
+                    fee_filter=fee_filter,
+                    max_leverage=max_leverage,
+                    check_can_trade=check_can_trade,
+                )
         except Exception as e:
             log.error(f"Copy monitor error: {e}")
 
