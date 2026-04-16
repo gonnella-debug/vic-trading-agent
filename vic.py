@@ -3531,24 +3531,29 @@ async def periodic_status_log():
                 p = state.current_position
                 pos_text = f"{p['strategy']}({p['side']}@{p['entry']:.0f})"
 
+            try:
+                from copy_engine import get_copy_status
+                cs = get_copy_status()
+                copy_text = f"Tracking {cs['tracked_traders']} traders | Copied: {cs['trades_executed']} | Skipped: {cs['trades_skipped']}"
+            except Exception:
+                copy_text = "copy engine status unavailable"
+
             log.info(
-                "=== PERIODIC STATUS ===\n"
+                "=== PERIODIC STATUS (v7 COPY ENGINE) ===\n"
                 "  Regime: %s | HTF Bias: %s (%s) | BTC: $%.2f | Mode: %s\n"
-                "  Active strategies: %d/%d\n"
-                "  Strategy evals: %d | Signals checked: %d | Signals blocked: %d\n"
+                "  Copy engine: %s\n"
                 "  Trades today: %d/%d | Losses: %d/%d | PnL: $%.2f\n"
                 "  Position: %s\n"
-                "  Funding rate: %.6f | Research: %s",
+                "  Equity: $%.2f | Paused: %s",
                 state.regime.value, state.htf_bias, state.htf_bias_strength,
                 state.last_btc_price, state.mode,
-                len(state.active_strategies), len(ALL_STRATEGY_DEFS),
-                state.strategy_evals, state.signals_checked, state.signals_blocked,
+                copy_text,
                 state.trades_today, MAX_TRADES_PER_DAY,
                 state.losses_today, MAX_LOSSES_PER_DAY,
                 state.daily_pnl,
                 pos_text,
-                state.current_funding_rate,
-                "complete" if state.research_complete else "pending",
+                state.live_equity,
+                "YES" if state.paused else "NO",
             )
         except Exception as exc:
             log.error("Periodic status error: %s", exc)
@@ -5079,17 +5084,36 @@ async def ask_claude_market_question(question: str) -> str:
         wr = (m.get("wins", 0) / tc * 100) if tc > 0 else 0
         metrics_lines.append(f"  {n}: {tc} trades, WR {wr:.0f}%, PnL ${m.get('current_pnl', 0):+,.2f}")
 
+    # Get copy engine status for context
+    try:
+        from copy_engine import get_copy_status, copy_state
+        cs = get_copy_status()
+        copy_info = (
+            f"Tracked traders: {cs['tracked_traders']}\n"
+            f"Copy trades executed: {cs['trades_executed']} | Skipped: {cs['trades_skipped']}\n"
+            f"Top traders: {', '.join(t.get('display', t.get('address','?')[:10]) for t in cs.get('top_traders', [])[:5])}"
+        )
+    except Exception:
+        copy_info = "Copy engine status unavailable"
+
     system_prompt = (
-        f"You are Vic v6, an AI BTC trading agent on Hyperliquid. "
-        f"50 strategies (research-first), dynamic leverage (10-20x), $370 account.\n\n"
-        f"=== STATE ===\n"
+        f"You are Vic v7, an AI copy-trading agent on Hyperliquid. "
+        f"You mirror positions from the top 15 Hyperliquid leaderboard traders by 90-day PnL. "
+        f"You do NOT run your own TA strategies — the old 58 strategies were scrapped. "
+        f"Your only job is to copy winning traders' entries with proper risk management.\n\n"
+        f"Account: ~$500 | Max leverage: 10x | SL: 2% of equity per trade | "
+        f"Drawdown killswitch: 20%\n\n"
+        f"=== LIVE STATE ===\n"
         f"BTC: ${state.last_btc_price:,.2f} | Regime: {state.regime.value} | "
         f"Bias: {state.htf_bias} | Mode: {state.mode.upper()}\n"
-        f"Funding: {state.current_funding_rate:.6f} | Losses: {state.losses_today}/{MAX_LOSSES_PER_DAY}\n"
+        f"Equity: ${state.live_equity:,.2f} | Losses today: {state.losses_today}/{MAX_LOSSES_PER_DAY}\n"
         f"PnL today: ${state.daily_pnl:+,.2f} | Lifetime: {state.total_trade_count} trades\n"
-        f"Active strategies: {len(state.active_strategies)} | Research: {'complete' if state.research_complete else 'pending'}\n\n"
+        f"Paused: {'YES' if state.paused else 'NO'}\n\n"
+        f"=== COPY ENGINE ===\n{copy_info}\n\n"
         f"=== POSITION ===\n{pos_text}\n\n"
-        f"=== METRICS ===\n" + "\n".join(metrics_lines) + "\n\n"
+        f"RULES: Never suggest opening manual trades. Never propose TA-based entries. "
+        f"You copy traders, that's it. If GG asks why you aren't trading, explain the copy engine "
+        f"is waiting for a tracked trader to open/change a position. "
         f"Answer concisely. Use numbers. Under 300 words."
     )
 
