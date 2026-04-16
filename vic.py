@@ -5140,7 +5140,7 @@ async def health():
 
 
 VIC_VERSION_SHA = os.getenv("RAILWAY_GIT_COMMIT_SHA", "unknown")[:7]
-VIC_VERSION_TAG = "safety-v2-10x-cap-drawdown-killswitch-fee-aware"
+VIC_VERSION_TAG = "v7-copy-engine-hl-leaderboard"
 
 
 @app.get("/hl-dump")
@@ -5374,27 +5374,25 @@ async def test_trade():
 
 @app.on_event("startup")
 async def startup():
+    from copy_engine import copy_monitor_loop, backtest_copy_engine, get_copy_status, refresh_leaderboard
+
     _required = ["HL_WALLET_ADDRESS", "HL_PRIVATE_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "CLAUDE_API_KEY"]
     _missing = [v for v in _required if not os.getenv(v)]
     if _missing:
         log.error(f"MISSING REQUIRED ENV VARS: {', '.join(_missing)} -- Vic cannot start properly")
 
-    # Ensure data directories exist
     for filepath in [JOURNAL_FILE, STATE_FILE, BACKTEST_FILE, FAILED_STRATEGIES_FILE, INTELLIGENCE_FILE, REVIEW_FILE]:
         d = os.path.dirname(filepath)
         if d:
             os.makedirs(d, exist_ok=True)
 
     state.startup_time = datetime.now(timezone.utc).isoformat()
-    log.info("Vic v6 starting up -- mode: %s", state.mode)
+    log.info("Vic v7 COPY ENGINE starting up -- mode: %s", state.mode)
 
-    # Start paused for research phase
-    state.paused = True
-
-    # Load persisted state
+    state.paused = True  # Always start paused — GG sends /resume when ready
     loaded = load_state()
+    state.paused = True  # Override any persisted state — safety first
 
-    # Initialize candle boundary tracking
     now_ts = datetime.now(timezone.utc).timestamp()
     state.last_1m_candle_ts = int(now_ts // 60) * 60
     state.last_5m_candle_ts = int(now_ts // 300) * 300
@@ -5402,58 +5400,91 @@ async def startup():
     state.last_1h_candle_ts = int(now_ts // 3600) * 3600
 
     init_exchange()
-
-    # Orphaned position recovery
     await recover_orphaned_positions()
 
-    # Startup message
-    startup_msg = (
-        f"\U0001f916 <b>Vic v6 is online -- {state.mode.upper()} MODE</b>\n"
-        f"BTC/USDC perp | {BASE_LEVERAGE}x+ leverage | ${ACCOUNT_CAPITAL:.0f} account\n\n"
-        f"58 strategies (5 perp-native) | 2% risk per trade | Max {MAX_TRADES_PER_DAY} trades/day\n"
-        f"Sessions: London 07-11 UTC | NY 13-17 UTC\n"
-        f"Backtest criteria: positive PnL, 20+ trades, bias filter mandatory\n\n"
-        f"\U0001f50d <b>Research phase starting...</b>"
-    )
-    await tg_send(startup_msg)
+    # Fetch live equity
+    equity = await fetch_live_equity()
 
-    # Run initial 90-day backtest
+    # Run copy-engine backtest
+    bt_msg = ""
     try:
-        bt_results, passed_names, failed_names = await run_full_backtest()
-        state.backtest_results = bt_results
-        state.active_strategies = passed_names
-
-        # Initialize metrics for active strategies
-        for name in passed_names:
-            state._ensure_strategy_metrics(name)
-            state.strategy_paused[name] = False
-
+        bt = await backtest_copy_engine(days=90, equity=500.0, fee_per_trade=FEE_PER_TRADE_USD)
+        state.backtest_results = bt
         state.research_complete = True
-        state.paused = False  # Unpause after research
         state.backtest_complete = True
         save_state()
 
-        result_msg = (
-            f"\u2705 <b>Research complete!</b>\n\n"
-            f"<b>{len(passed_names)}/{len(ALL_STRATEGY_DEFS)}</b> strategies passed backtest criteria.\n"
-            f"Trading ACTIVE with {len(passed_names)} strategies.\n"
-            f"All background tasks starting."
+        bt_msg = (
+            f"\n\n<b>90-day backtest (top-trader copy):</b>\n"
+            f"Trades: {bt['total_trades']} | Wins: {bt['wins']} | Losses: {bt['losses']}\n"
+            f"Win rate: {bt['win_rate_pct']}%\n"
+            f"PnL: ${bt['total_pnl']:+,.2f} (${bt['starting_equity']:.0f} → ${bt['final_equity']:,.2f})\n"
+            f"Max drawdown: ${bt['max_drawdown_usd']:,.2f} ({bt['max_drawdown_pct']}%)\n"
+            f"Fee/trade: ${bt['fee_per_trade']:.2f} | Traders analysed: {bt['traders_analysed']}"
         )
-        await tg_send(result_msg)
-
     except Exception as exc:
-        log.error("Startup backtest failed: %s", exc)
-        await tg_send(f"\u26a0\ufe0f Research phase failed: {sanitize_html(str(exc))}\nStarting with no active strategies. Run /backtest to retry.")
-        state.active_strategies = []
-        state.research_complete = False
-        state.paused = True  # Stay paused if research failed
-        state.backtest_complete = False
-        save_state()
+        log.error("Copy engine backtest failed: %s", exc)
+        bt_msg = f"\n\n⚠️ Backtest failed: {exc}"
 
-    # Start all background tasks
+    # Startup announcement to GG
+    startup_msg = (
+        f"🤖 <b>Vic v7 COPY ENGINE deployed</b>\n"
+        f"Commit: {VIC_VERSION_SHA} | Tag: {VIC_VERSION_TAG}\n"
+        f"Mode: {state.mode.upper()} | Equity: ${equity:,.2f}\n\n"
+        f"<b>What changed:</b>\n"
+        f"• 58 TA strategies DISABLED\n"
+        f"• Copy engine: mirrors top 15 Hyperliquid traders by month PnL\n"
+        f"• Position sizing: SL = 2% of equity per trade\n"
+        f"• Leverage hard cap: {MAX_LEVERAGE_HARD_CAP}x\n"
+        f"• Drawdown killswitch: {EQUITY_DRAWDOWN_KILLSWITCH*100:.0f}%\n"
+        f"• Fee filter: ${FEE_PER_TRADE_USD*2*2:.0f} min TP"
+        f"{bt_msg}\n\n"
+        f"⏸ <b>PAUSED — send /resume to go live</b>"
+    )
+    await tg_send(startup_msg)
+
+    # Copy engine execution adapter
+    async def _copy_execute(coin, side, size, entry, sl, tp, leverage, strategy_name):
+        """Adapter: maps copy_engine calls to vic's execute_trade interface."""
+        if coin != "BTC":
+            # For non-BTC coins, use hl_exchange directly
+            try:
+                loop = asyncio.get_running_loop()
+                is_buy = side == "long"
+                result = await loop.run_in_executor(
+                    None, lambda: hl_exchange.market_open(coin, is_buy=is_buy, sz=size)
+                )
+                if result.get("status") != "ok":
+                    raise Exception(f"Order rejected: {result}")
+                # Record position
+                state.current_position = {
+                    "strategy": strategy_name, "side": side, "entry": entry,
+                    "sl": sl, "tp": tp, "size": size, "coin": coin,
+                    "leverage": leverage, "opened_at": datetime.now(timezone.utc).isoformat(),
+                }
+                state.trades_today += 1
+                save_state()
+                return True
+            except Exception as e:
+                log.error(f"Copy execute {coin} failed: {e}")
+                return False
+        else:
+            # BTC uses existing execute_trade with full safety
+            await execute_trade(strategy_name, side, entry, sl, tp, confidence=7, max_leverage=leverage)
+            return state.current_position is not None
+
+    # Start background tasks (copy engine replaces strategy_monitor_loop)
+    asyncio.create_task(copy_monitor_loop(
+        equity_fn=fetch_live_equity,
+        execute_fn=_copy_execute,
+        tg_fn=tg_send,
+        fee_filter=FEE_PER_TRADE_USD * 2 * 2,
+        max_leverage=MAX_LEVERAGE_HARD_CAP,
+        check_can_trade=can_open_trade,
+        is_paused=lambda: state.paused,
+    ))
     asyncio.create_task(regime_update_loop())
     asyncio.create_task(funding_rate_loop())
-    asyncio.create_task(strategy_monitor_loop())
     asyncio.create_task(position_monitor_loop())
     asyncio.create_task(news_sentiment_monitor())
     asyncio.create_task(daily_summary_scheduler())
@@ -5461,10 +5492,13 @@ async def startup():
     asyncio.create_task(periodic_status_log())
     asyncio.create_task(telegram_polling_watchdog())
     asyncio.create_task(intelligence_loop())
-    asyncio.create_task(sunday_report_scheduler())
-    asyncio.create_task(backtest_scheduler())
 
-    log.info("All background tasks started -- %d tasks.", 12)
+    # Add copy status to /status endpoint
+    @app.get("/copy-status")
+    async def copy_status():
+        return get_copy_status()
+
+    log.info("Vic v7 COPY ENGINE — all background tasks started.")
 
 
 @app.on_event("shutdown")
