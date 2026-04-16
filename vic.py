@@ -5305,28 +5305,20 @@ async def clear_phantom_position(token: str = Query("")):
 
 @app.get("/status")
 async def full_status():
-    strategies_status = {}
-    for name in ALL_STRATEGY_DEFS:
-        m = state.metrics.get(name, {})
-        tc = m.get("trade_count", 0)
-        win_rate = (m.get("wins", 0) / tc * 100) if tc > 0 else 0.0
-        strategies_status[name] = {
-            "active": name in state.active_strategies,
-            "paused": state.strategy_paused.get(name, False),
-            "metrics": {
-                "win_rate": round(win_rate, 1),
-                "total_trades": tc,
-                "pnl": m.get("current_pnl", 0),
-                "max_drawdown": m.get("max_drawdown", 0),
-            },
-        }
+    # Copy engine status
+    try:
+        from copy_engine import get_copy_status
+        cs = get_copy_status()
+        copy_engine_data = cs
+    except Exception as e:
+        copy_engine_data = {"error": str(e)}
 
     return {
-        "bot": "Vic v6",
+        "bot": "Vic v7 (Copy Engine)",
+        "engine": "copy-trading — mirrors top Hyperliquid leaderboard traders",
         "mode": state.mode,
         "base_leverage": BASE_LEVERAGE,
         "max_leverage_hard_cap": MAX_LEVERAGE_HARD_CAP,
-        "account_capital_fallback": ACCOUNT_CAPITAL_FALLBACK,
         "live_equity": round(state.live_equity, 2) if state.live_equity else None,
         "peak_equity": round(state.peak_equity, 2) if state.peak_equity else None,
         "drawdown_killswitch_hit": state.drawdown_killswitch_hit,
@@ -5334,15 +5326,11 @@ async def full_status():
         "max_risk_pct": MAX_RISK_PCT,
         "fee_per_trade_usd": FEE_PER_TRADE_USD,
         "global_paused": state.paused,
-        "research_complete": state.research_complete,
         "regime": state.regime.value,
         "htf_bias": f"{state.htf_bias} ({state.htf_bias_strength})",
         "btc_price": state.last_btc_price,
         "funding_rate": state.current_funding_rate,
-        "strategies": strategies_status,
-        "active_strategy_count": len(state.active_strategies),
-        "total_strategy_count": len(ALL_STRATEGY_DEFS),
-        "active_strategies": state.active_strategies,
+        "copy_engine": copy_engine_data,
         "current_position": state.current_position,
         "trades_today": state.trades_today,
         "max_trades_per_day": MAX_TRADES_PER_DAY,
