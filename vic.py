@@ -4752,9 +4752,74 @@ async def telegram_polling_loop():
 
                     if cmd == "/start":
                         await tg_reply(chat_id,
-                            "Hey! I'm Vic v6, your BTC trading agent.\n\n"
-                            "Commands: /strategies /backtest /funding /journal /metrics /regime /news "
-                            "/intelligence /review /approve /reject /closeall"
+                            "Hey! I'm Vic v7 COPY ENGINE.\n\n"
+                            "Commands: /resume /pause /status /equity /copystatus /closeall"
+                        )
+                        continue
+
+                    if cmd == "/resume":
+                        from copy_engine import copy_state
+                        state.paused = False
+                        if state.drawdown_killswitch_hit:
+                            state.drawdown_killswitch_hit = False
+                            try:
+                                eq = await fetch_live_equity()
+                                state.peak_equity = eq
+                            except Exception:
+                                pass
+                        save_state()
+                        eq = state.live_equity or 0
+                        await tg_reply(chat_id,
+                            f"▶️ Vic v7 COPY ENGINE is now LIVE.\n"
+                            f"Equity: ${eq:,.2f} | Tracking {len(copy_state.traders)} top traders.\n"
+                            f"Drawdown killswitch: {EQUITY_DRAWDOWN_KILLSWITCH*100:.0f}%\n"
+                            f"Next trade mirrors the next position change from a tracked trader."
+                        )
+                        continue
+
+                    if cmd == "/pause":
+                        state.paused = True
+                        save_state()
+                        await tg_reply(chat_id, "⏸ Vic PAUSED. No new trades. Send /resume to restart.")
+                        continue
+
+                    if cmd == "/equity":
+                        try:
+                            eq = await fetch_live_equity()
+                            dd = (1 - eq / state.peak_equity) * 100 if state.peak_equity > 0 else 0
+                            await tg_reply(chat_id,
+                                f"💰 Equity: ${eq:,.2f}\n"
+                                f"Peak: ${state.peak_equity:,.2f}\n"
+                                f"Drawdown: {dd:.1f}%\n"
+                                f"Killswitch: {'HIT' if state.drawdown_killswitch_hit else f'armed at {EQUITY_DRAWDOWN_KILLSWITCH*100:.0f}%'}"
+                            )
+                        except Exception as e:
+                            await tg_reply(chat_id, f"Equity check error: {e}")
+                        continue
+
+                    if cmd == "/copystatus":
+                        from copy_engine import get_copy_status
+                        cs = get_copy_status()
+                        lines = [f"📋 <b>Copy Engine Status</b>",
+                                 f"Tracked traders: {cs['tracked_traders']}",
+                                 f"Trades executed: {cs['trades_executed']}",
+                                 f"Trades skipped: {cs['trades_skipped']}"]
+                        for t in cs.get("top_traders", [])[:5]:
+                            lines.append(f"  • {t['name']}({t['address']}) — {t['active_positions']} positions")
+                        await tg_reply(chat_id, "\n".join(lines))
+                        continue
+
+                    if cmd == "/status":
+                        eq = state.live_equity or 0
+                        pos = state.current_position
+                        pos_str = f"{pos['strategy']} {pos['side']} {pos.get('coin','BTC')} @ ${pos['entry']:,.2f}" if pos else "None"
+                        await tg_reply(chat_id,
+                            f"🤖 <b>Vic v7 Copy Engine</b>\n"
+                            f"Mode: {state.mode} | {'PAUSED' if state.paused else 'LIVE'}\n"
+                            f"Equity: ${eq:,.2f} | Position: {pos_str}\n"
+                            f"Trades today: {state.trades_today}/{MAX_TRADES_PER_DAY}\n"
+                            f"Losses: {state.losses_today}/{MAX_LOSSES_PER_DAY}\n"
+                            f"Daily PnL: ${state.daily_pnl:+,.2f}"
                         )
                         continue
 
