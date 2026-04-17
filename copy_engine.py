@@ -29,11 +29,17 @@ HL_API = "https://api.hyperliquid.xyz/info"
 HL_LEADERBOARD = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
 
 MAX_TRACKED_TRADERS = 15
-MIN_ACCOUNT_VALUE = 500_000            # accountValue threshold from leaderboard (historical peak)
-MIN_LIVE_ACCOUNT_VALUE = 500_000       # must still have this equity NOW via clearinghouseState
-MIN_ALLTIME_PNL = 100_000
-MIN_MONTH_ROI = 0.0
-LEADERBOARD_CANDIDATE_POOL = 60        # pull this many from leaderboard then live-filter down to MAX_TRACKED_TRADERS
+
+# Ranking is by WIN RATE only — not account size, not PnL, not ROI.
+# Account size / PnL are used only as activity proxies to build a candidate pool
+# (a wallet that has never traded has no win rate to measure).
+LEADERBOARD_CANDIDATE_POOL = 200       # pull this many from leaderboard, then win-rate rank them
+MIN_CLOSING_TRADES = 50                # need this many closed trades for win rate to be statistically meaningful
+MIN_WIN_RATE = 0.55                    # 55% floor — below that, edge is coin-flip territory
+MAX_WIN_RATE = 0.90                    # anything above is an MM/arb bot booking tiny wins, not a copyable human
+MAX_CLOSES_PER_DAY = 30                # above this a trader is HFT/market-maker — not copyable by a human follower
+MIN_LIVE_EQUITY_USD = 1                # must have ANY live equity so they can still trade going forward (dead wallets waste a slot)
+
 LEADERBOARD_REFRESH_SECS = 300
 POSITION_POLL_SECS = 30
 COINS_ALLOWED = None  # None = trade whatever top traders trade
@@ -48,6 +54,9 @@ class TrackedTrader:
     alltime_roi: float
     month_pnl: float
     month_roi: float
+    win_rate: float = 0.0          # fraction in [0,1]
+    closing_trades: int = 0        # closed trades used to compute win_rate
+    closes_per_day: float = 0.0    # activity measure — high = HFT/MM, not copyable
     positions: dict = field(default_factory=dict)  # coin → {side, size, entry, leverage}
     last_polled: float = 0.0
 
@@ -62,6 +71,13 @@ class CopyState:
 
 
 copy_state = CopyState()
+
+# Win-rate cache — HL rate-limits userFills to ~6 req/s, so we can't re-query
+# hundreds of candidates every 5 minutes. Cache stats per address for STATS_TTL
+# and only fetch missing/stale ones on each refresh.
+STATS_TTL_SECS = 1800        # 30 min — win rate doesn't move fast
+STATS_RATE_LIMIT_DELAY = 0.20  # 200ms between userFills calls = 5 req/s sustained
+_stats_cache: dict = {}      # address -> (win_rate, closing_trades, closes_per_day, cached_at)
 
 
 async def fetch_leaderboard() -> list[dict]:
@@ -78,52 +94,40 @@ async def fetch_leaderboard() -> list[dict]:
         return []
 
 
-def filter_top_traders(rows: list[dict]) -> list[TrackedTrader]:
+def build_candidate_pool(rows: list[dict]) -> list[TrackedTrader]:
+    """Build the pool of candidates to compute win rate for.
+
+    Ranking is by win rate — this function exists only to narrow ~10K leaderboard
+    rows down to a pool we can actually query. We use MONTH PnL as the activity
+    proxy (not all-time): traders actively winning THIS MONTH are almost certainly
+    still trading and still have funds in the wallet. All-time-PnL sorting
+    surfaced withdrawn wallets that scored huge but have zero live equity now."""
     candidates = []
     for r in rows:
-        av = float(r.get("accountValue", 0) or 0)
-        if av < MIN_ACCOUNT_VALUE:
-            continue
-
         perfs = {wp[0]: wp[1] for wp in r.get("windowPerformances", [])}
         at = perfs.get("allTime", {})
         mo = perfs.get("month", {})
-        wk = perfs.get("week", {})
-
-        at_pnl = float(at.get("pnl", 0) or 0)
-        at_roi = float(at.get("roi", 0) or 0)
         mo_pnl = float(mo.get("pnl", 0) or 0)
-        mo_roi = float(mo.get("roi", 0) or 0)
-        wk_pnl = float(wk.get("pnl", 0) or 0)
-
-        if at_pnl < MIN_ALLTIME_PNL:
+        # Activity proxy: must have positive PnL this month. Traders with $0 or negative
+        # monthly PnL either aren't trading or aren't winning — no win-rate story to tell.
+        if mo_pnl <= 0:
             continue
-        if mo_pnl <= MIN_MONTH_ROI:
-            continue
-        if wk_pnl < 0:
-            continue
-
-        candidates.append(TrackedTrader(
+        candidates.append((mo_pnl, TrackedTrader(
             address=r["ethAddress"],
             name=r.get("displayName") or "anon",
-            account_value=av,
-            alltime_pnl=at_pnl,
-            alltime_roi=at_roi,
+            account_value=float(r.get("accountValue", 0) or 0),
+            alltime_pnl=float(at.get("pnl", 0) or 0),
+            alltime_roi=float(at.get("roi", 0) or 0),
             month_pnl=mo_pnl,
-            month_roi=mo_roi,
-        ))
+            month_roi=float(mo.get("roi", 0) or 0),
+        )))
 
-    # Sort by month PnL (who's winning RIGHT NOW) then take a wider candidate pool.
-    # Leaderboard's accountValue is historical/peak — many top rows are dead/withdrawn
-    # wallets that show zero current equity. refresh_leaderboard() re-filters these
-    # against live clearinghouseState before trimming to MAX_TRACKED_TRADERS.
-    candidates.sort(key=lambda t: t.month_pnl, reverse=True)
-    return candidates[:LEADERBOARD_CANDIDATE_POOL]
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return [t for _, t in candidates[:LEADERBOARD_CANDIDATE_POOL]]
 
 
 async def fetch_live_equity(address: str) -> float:
-    """Current accountValue via clearinghouseState. Leaderboard's accountValue is
-    historical peak and doesn't reflect withdrawals — this is the truth."""
+    """Current accountValue via clearinghouseState."""
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.post(HL_API, json={"type": "clearinghouseState", "user": address})
@@ -134,6 +138,53 @@ async def fetch_live_equity(address: str) -> float:
     except Exception as e:
         log.error(f"Live equity fetch for {address[:10]}: {e}")
         return 0.0
+
+
+async def _fetch_stats_raw(address: str) -> Optional[tuple[float, int, float]]:
+    """Single userFills call — returns None on HTTP failure (incl. 429) so the
+    caller can keep any previous cached value. Returns zeros only when the API
+    returned an empty list (genuinely inactive wallet)."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(HL_API, json={"type": "userFills", "user": address})
+            if r.status_code != 200:
+                return None
+            fills = r.json()
+            if not isinstance(fills, list):
+                return None
+            if not fills:
+                return (0.0, 0, 0.0)
+            closes = [f for f in fills if float(f.get("closedPnl", 0) or 0) != 0]
+            if not closes:
+                return (0.0, 0, 0.0)
+            wins = sum(1 for f in closes if float(f["closedPnl"]) > 0)
+            times = [int(f.get("time", 0) or 0) for f in closes if f.get("time")]
+            if len(times) >= 2:
+                span_days = max((max(times) - min(times)) / 86_400_000.0, 1 / 24)
+            else:
+                span_days = 1.0
+            return (wins / len(closes), len(closes), len(closes) / span_days)
+    except Exception as e:
+        log.error(f"Stats fetch for {address[:10]}: {e}")
+        return None
+
+
+async def get_trader_stats(address: str) -> tuple[float, int, float]:
+    """Cache-first. Returns (win_rate, closing_trades, closes_per_day).
+    Serialized + throttled to respect HL's userFills rate limit."""
+    cached = _stats_cache.get(address)
+    now = time.time()
+    if cached and now - cached[3] < STATS_TTL_SECS:
+        return cached[:3]
+    fresh = await _fetch_stats_raw(address)
+    if fresh is None:
+        # Rate-limited or transient failure — keep stale cached value if we have one,
+        # otherwise return zeros (which the filter will reject, safely).
+        if cached:
+            return cached[:3]
+        return (0.0, 0, 0.0)
+    _stats_cache[address] = (*fresh, now)
+    return fresh
 
 
 async def fetch_trader_positions(address: str) -> dict:
@@ -178,32 +229,65 @@ async def refresh_leaderboard():
         log.warning("Leaderboard returned 0 rows, keeping existing traders")
         return
 
-    candidates = filter_top_traders(rows)
+    candidates = build_candidate_pool(rows)
     if not candidates:
-        log.warning("No traders passed filter, keeping existing list")
+        log.warning("No candidates in pool, keeping existing list")
         return
 
-    # Second-pass: re-check live equity. HL leaderboard's accountValue is the
-    # historical peak, so dead/withdrawn whales look like top traders even when
-    # they haven't touched the exchange in weeks. Drop any whose current equity
-    # is below MIN_LIVE_ACCOUNT_VALUE so we never copy from a corpse.
-    live_equities = await asyncio.gather(*(fetch_live_equity(t.address) for t in candidates))
-    alive = []
-    dead_count = 0
-    for t, live_av in zip(candidates, live_equities):
-        if live_av < MIN_LIVE_ACCOUNT_VALUE:
-            dead_count += 1
+    # Stats must be throttled (HL rate-limits userFills at ~6 req/s), so we serialize
+    # them with a small delay and rely on the per-address cache. Equity calls go out
+    # in parallel — clearinghouseState is a different endpoint and tolerates more.
+    stats_list: list[tuple[float, int, float]] = []
+    for t in candidates:
+        stats_list.append(await get_trader_stats(t.address))
+        await asyncio.sleep(STATS_RATE_LIMIT_DELAY)
+
+    equity_sem = asyncio.Semaphore(10)
+    async def _eq(addr):
+        async with equity_sem:
+            return await fetch_live_equity(addr)
+    equity_list = await asyncio.gather(*(_eq(t.address) for t in candidates))
+
+    # Apply all filters (NOT ranking — ranking happens only by win_rate below):
+    #   - Need enough closing trades for a meaningful rate
+    #   - Filter below MIN_WIN_RATE
+    #   - Drop HFT/market-makers (very high close-per-day rate)
+    #   - Drop wallets with zero live equity (can't open new positions anyway)
+    qualifying: list[TrackedTrader] = []
+    rejected = {"few_trades": 0, "low_winrate": 0, "bot_winrate": 0, "hft_bot": 0}
+    dead_but_ranked = 0
+    for t, (wr, n, cpd), live_av in zip(candidates, stats_list, equity_list):
+        if n < MIN_CLOSING_TRADES:
+            rejected["few_trades"] += 1
             continue
-        t.account_value = live_av  # use the current number, not the peak
-        alive.append(t)
-        if len(alive) >= MAX_TRACKED_TRADERS:
-            break
+        if wr < MIN_WIN_RATE:
+            rejected["low_winrate"] += 1
+            continue
+        if wr > MAX_WIN_RATE:
+            rejected["bot_winrate"] += 1
+            continue
+        if cpd > MAX_CLOSES_PER_DAY:
+            rejected["hft_bot"] += 1
+            continue
+        # Note: we do NOT reject dead wallets. Tracking a zero-equity wallet is
+        # harmless (they can't open a position, so we get no signal) and dropping
+        # them here would blow holes in the top-of-win-rate ranking.
+        if live_av < MIN_LIVE_EQUITY_USD:
+            dead_but_ranked += 1
+        t.win_rate = wr
+        t.closing_trades = n
+        t.closes_per_day = cpd
+        t.account_value = live_av
+        qualifying.append(t)
 
-    if not alive:
-        log.warning(f"All {len(candidates)} candidates failed live-equity check — keeping existing list")
+    # Rank by WIN RATE. Nothing else.
+    qualifying.sort(key=lambda t: t.win_rate, reverse=True)
+    new_traders = qualifying[:MAX_TRACKED_TRADERS]
+
+    if not new_traders:
+        log.warning(f"No traders qualified out of {len(candidates)} candidates "
+                    f"(rejected: {rejected}) — keeping existing list")
         return
-
-    new_traders = alive
 
     # Preserve position snapshots for traders we're already tracking
     old_positions = {t.address: t.positions for t in copy_state.traders}
@@ -213,8 +297,11 @@ async def refresh_leaderboard():
 
     copy_state.traders = new_traders
     copy_state.last_leaderboard_refresh = now
-    trader_names = ", ".join(f"{t.name}({t.address[:8]},${t.account_value/1e6:.1f}M)" for t in new_traders[:5])
-    log.info(f"Leaderboard refreshed: {len(new_traders)} live traders (dropped {dead_count} dead wallets). Top 5: {trader_names}")
+    top = ", ".join(f"{t.address[:8]}({t.win_rate*100:.0f}%/{t.closing_trades}t)" for t in new_traders[:5])
+    alive_count = sum(1 for t in new_traders if t.account_value >= MIN_LIVE_EQUITY_USD)
+    log.info(f"Leaderboard refreshed by WIN RATE: {len(new_traders)} tracked "
+             f"({alive_count} live, {len(new_traders)-alive_count} dormant) out of {len(candidates)} "
+             f"candidates. Rejected — {rejected}. Top 5: {top}")
 
 
 def detect_changes(trader: TrackedTrader, new_positions: dict) -> list[dict]:
@@ -456,7 +543,7 @@ async def backtest_copy_engine(days: int = 90, equity: float = 500.0,
     simulates what Vic would have done following them.
     """
     rows = await fetch_leaderboard()
-    traders = filter_top_traders(rows)
+    traders = build_candidate_pool(rows)
     if not traders:
         return {"error": "no traders found"}
 
