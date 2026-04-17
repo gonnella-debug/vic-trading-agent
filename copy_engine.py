@@ -76,7 +76,7 @@ copy_state = CopyState()
 # hundreds of candidates every 5 minutes. Cache stats per address for STATS_TTL
 # and only fetch missing/stale ones on each refresh.
 STATS_TTL_SECS = 1800        # 30 min — win rate doesn't move fast
-STATS_RATE_LIMIT_DELAY = 0.20  # 200ms between userFills calls = 5 req/s sustained
+STATS_RATE_LIMIT_DELAY = 0.30  # 300ms between userFills calls = 3.3 req/s sustained (Railway IP pool needs headroom)
 _stats_cache: dict = {}      # address -> (win_rate, closing_trades, closes_per_day, cached_at)
 
 
@@ -141,32 +141,37 @@ async def fetch_live_equity(address: str) -> float:
 
 
 async def _fetch_stats_raw(address: str) -> Optional[tuple[float, int, float]]:
-    """Single userFills call — returns None on HTTP failure (incl. 429) so the
-    caller can keep any previous cached value. Returns zeros only when the API
-    returned an empty list (genuinely inactive wallet)."""
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(HL_API, json={"type": "userFills", "user": address})
-            if r.status_code != 200:
-                return None
-            fills = r.json()
-            if not isinstance(fills, list):
-                return None
-            if not fills:
-                return (0.0, 0, 0.0)
-            closes = [f for f in fills if float(f.get("closedPnl", 0) or 0) != 0]
-            if not closes:
-                return (0.0, 0, 0.0)
-            wins = sum(1 for f in closes if float(f["closedPnl"]) > 0)
-            times = [int(f.get("time", 0) or 0) for f in closes if f.get("time")]
-            if len(times) >= 2:
-                span_days = max((max(times) - min(times)) / 86_400_000.0, 1 / 24)
-            else:
-                span_days = 1.0
-            return (wins / len(closes), len(closes), len(closes) / span_days)
-    except Exception as e:
-        log.error(f"Stats fetch for {address[:10]}: {e}")
-        return None
+    """Single userFills call with one retry on rate-limit. Returns None on
+    terminal failure so the caller can keep any previous cached value.
+    Returns zeros only when the API returned an empty list."""
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.post(HL_API, json={"type": "userFills", "user": address})
+                if r.status_code == 429:
+                    await asyncio.sleep(2.0 + attempt)
+                    continue
+                if r.status_code != 200:
+                    return None
+                fills = r.json()
+                if not isinstance(fills, list):
+                    return None
+                if not fills:
+                    return (0.0, 0, 0.0)
+                closes = [f for f in fills if float(f.get("closedPnl", 0) or 0) != 0]
+                if not closes:
+                    return (0.0, 0, 0.0)
+                wins = sum(1 for f in closes if float(f["closedPnl"]) > 0)
+                times = [int(f.get("time", 0) or 0) for f in closes if f.get("time")]
+                if len(times) >= 2:
+                    span_days = max((max(times) - min(times)) / 86_400_000.0, 1 / 24)
+                else:
+                    span_days = 1.0
+                return (wins / len(closes), len(closes), len(closes) / span_days)
+        except Exception as e:
+            log.error(f"Stats fetch for {address[:10]}: {e}")
+            return None
+    return None
 
 
 async def get_trader_stats(address: str) -> tuple[float, int, float]:
