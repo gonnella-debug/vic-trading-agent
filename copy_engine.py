@@ -29,9 +29,11 @@ HL_API = "https://api.hyperliquid.xyz/info"
 HL_LEADERBOARD = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
 
 MAX_TRACKED_TRADERS = 15
-MIN_ACCOUNT_VALUE = 500_000
+MIN_ACCOUNT_VALUE = 500_000            # accountValue threshold from leaderboard (historical peak)
+MIN_LIVE_ACCOUNT_VALUE = 500_000       # must still have this equity NOW via clearinghouseState
 MIN_ALLTIME_PNL = 100_000
 MIN_MONTH_ROI = 0.0
+LEADERBOARD_CANDIDATE_POOL = 60        # pull this many from leaderboard then live-filter down to MAX_TRACKED_TRADERS
 LEADERBOARD_REFRESH_SECS = 300
 POSITION_POLL_SECS = 30
 COINS_ALLOWED = None  # None = trade whatever top traders trade
@@ -111,9 +113,27 @@ def filter_top_traders(rows: list[dict]) -> list[TrackedTrader]:
             month_roi=mo_roi,
         ))
 
-    # Sort by month PnL (who's winning RIGHT NOW) then take top N
+    # Sort by month PnL (who's winning RIGHT NOW) then take a wider candidate pool.
+    # Leaderboard's accountValue is historical/peak — many top rows are dead/withdrawn
+    # wallets that show zero current equity. refresh_leaderboard() re-filters these
+    # against live clearinghouseState before trimming to MAX_TRACKED_TRADERS.
     candidates.sort(key=lambda t: t.month_pnl, reverse=True)
-    return candidates[:MAX_TRACKED_TRADERS]
+    return candidates[:LEADERBOARD_CANDIDATE_POOL]
+
+
+async def fetch_live_equity(address: str) -> float:
+    """Current accountValue via clearinghouseState. Leaderboard's accountValue is
+    historical peak and doesn't reflect withdrawals — this is the truth."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(HL_API, json={"type": "clearinghouseState", "user": address})
+            if r.status_code != 200:
+                return 0.0
+            data = r.json()
+            return float(data.get("marginSummary", {}).get("accountValue", 0) or 0)
+    except Exception as e:
+        log.error(f"Live equity fetch for {address[:10]}: {e}")
+        return 0.0
 
 
 async def fetch_trader_positions(address: str) -> dict:
@@ -158,10 +178,32 @@ async def refresh_leaderboard():
         log.warning("Leaderboard returned 0 rows, keeping existing traders")
         return
 
-    new_traders = filter_top_traders(rows)
-    if not new_traders:
+    candidates = filter_top_traders(rows)
+    if not candidates:
         log.warning("No traders passed filter, keeping existing list")
         return
+
+    # Second-pass: re-check live equity. HL leaderboard's accountValue is the
+    # historical peak, so dead/withdrawn whales look like top traders even when
+    # they haven't touched the exchange in weeks. Drop any whose current equity
+    # is below MIN_LIVE_ACCOUNT_VALUE so we never copy from a corpse.
+    live_equities = await asyncio.gather(*(fetch_live_equity(t.address) for t in candidates))
+    alive = []
+    dead_count = 0
+    for t, live_av in zip(candidates, live_equities):
+        if live_av < MIN_LIVE_ACCOUNT_VALUE:
+            dead_count += 1
+            continue
+        t.account_value = live_av  # use the current number, not the peak
+        alive.append(t)
+        if len(alive) >= MAX_TRACKED_TRADERS:
+            break
+
+    if not alive:
+        log.warning(f"All {len(candidates)} candidates failed live-equity check — keeping existing list")
+        return
+
+    new_traders = alive
 
     # Preserve position snapshots for traders we're already tracking
     old_positions = {t.address: t.positions for t in copy_state.traders}
@@ -171,8 +213,8 @@ async def refresh_leaderboard():
 
     copy_state.traders = new_traders
     copy_state.last_leaderboard_refresh = now
-    trader_names = ", ".join(f"{t.name}({t.address[:8]})" for t in new_traders[:5])
-    log.info(f"Leaderboard refreshed: {len(new_traders)} traders tracked. Top 5: {trader_names}")
+    trader_names = ", ".join(f"{t.name}({t.address[:8]},${t.account_value/1e6:.1f}M)" for t in new_traders[:5])
+    log.info(f"Leaderboard refreshed: {len(new_traders)} live traders (dropped {dead_count} dead wallets). Top 5: {trader_names}")
 
 
 def detect_changes(trader: TrackedTrader, new_positions: dict) -> list[dict]:
