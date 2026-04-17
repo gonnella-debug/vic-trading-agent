@@ -526,11 +526,13 @@ def get_copy_status() -> dict:
             {
                 "address": t.address[:12] + "...",
                 "name": t.name,
-                "account_value": round(t.account_value),
-                "month_pnl": round(t.month_pnl),
+                "win_rate_pct": round(t.win_rate * 100, 1),
+                "closing_trades": t.closing_trades,
+                "closes_per_day": round(t.closes_per_day, 1),
+                "live_equity": round(t.account_value),
                 "active_positions": len(t.positions),
             }
-            for t in copy_state.traders[:5]
+            for t in copy_state.traders[:15]
         ],
         "copy_positions": copy_state.copy_positions,
         "trades_executed": copy_state.trades_executed,

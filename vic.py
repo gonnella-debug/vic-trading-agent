@@ -4805,12 +4805,20 @@ async def telegram_polling_loop():
                     if cmd == "/copystatus":
                         from copy_engine import get_copy_status
                         cs = get_copy_status()
-                        lines = [f"📋 <b>Copy Engine Status</b>",
-                                 f"Tracked traders: {cs['tracked_traders']}",
-                                 f"Trades executed: {cs['trades_executed']}",
-                                 f"Trades skipped: {cs['trades_skipped']}"]
-                        for t in cs.get("top_traders", [])[:5]:
-                            lines.append(f"  • {t['name']}({t['address']}) — {t['active_positions']} positions")
+                        lines = [f"<b>Copy engine</b>",
+                                 f"Tracked: {cs['tracked_traders']} | Executed: {cs['trades_executed']} | Skipped: {cs['trades_skipped']}",
+                                 f"Last refresh: {cs.get('last_leaderboard_refresh') or 'never'}",
+                                 ""]
+                        if not cs.get("top_traders"):
+                            lines.append("No traders tracked yet — refresh in progress.")
+                        for t in cs.get("top_traders", []):
+                            eq = t.get("live_equity", 0)
+                            live = f"${eq:,}" if eq > 0 else "dormant"
+                            lines.append(
+                                f"{t['address']}  wr={t['win_rate_pct']}%  "
+                                f"trades={t['closing_trades']}  cpd={t['closes_per_day']}  "
+                                f"{live}  positions={t['active_positions']}"
+                            )
                         await tg_reply(chat_id, "\n".join(lines))
                         continue
 
@@ -5483,17 +5491,12 @@ async def startup():
     equity = await fetch_live_equity()
 
     # Startup announcement to GG
+    status_word = "paused" if state.paused else "active"
     startup_msg = (
-        f"🤖 <b>Vic v7 COPY ENGINE deployed</b>\n"
-        f"Commit: {VIC_VERSION_SHA} | Tag: {VIC_VERSION_TAG}\n"
-        f"Mode: {state.mode.upper()} | Equity: ${equity:,.2f}\n\n"
-        f"<b>Trader selection:</b>\n"
-        f"• Ranked by WIN RATE only (not account size, not PnL)\n"
-        f"• Candidate pool: top 200 by month PnL (activity proxy)\n"
-        f"• Filters: ≥50 closing trades, 55%–90% win rate, ≤30 closes/day\n"
-        f"• Position sizing: SL = 2% of equity per trade\n"
-        f"• Leverage cap: {MAX_LEVERAGE_HARD_CAP}x | DD killswitch: {EQUITY_DRAWDOWN_KILLSWITCH*100:.0f}%\n\n"
-        f"⏸ <b>PAUSED — send /resume to go live</b>"
+        f"Vic restarted.\n"
+        f"Equity: ${equity:,.2f} | Status: {status_word}\n"
+        f"Commit: {VIC_VERSION_SHA} | {VIC_VERSION_TAG}\n"
+        f"Send /status for current traders and positions."
     )
     await tg_send(startup_msg)
 
