@@ -5482,40 +5482,17 @@ async def startup():
     # Fetch live equity
     equity = await fetch_live_equity()
 
-    # Run copy-engine backtest
-    bt_msg = ""
-    try:
-        bt = await backtest_copy_engine(days=90, equity=500.0, fee_per_trade=FEE_PER_TRADE_USD)
-        state.backtest_results = bt
-        state.research_complete = True
-        state.backtest_complete = True
-        save_state()
-
-        bt_msg = (
-            f"\n\n<b>90-day backtest (top-trader copy):</b>\n"
-            f"Trades: {bt['total_trades']} | Wins: {bt['wins']} | Losses: {bt['losses']}\n"
-            f"Win rate: {bt['win_rate_pct']}%\n"
-            f"PnL: ${bt['total_pnl']:+,.2f} (${bt['starting_equity']:.0f} → ${bt['final_equity']:,.2f})\n"
-            f"Max drawdown: ${bt['max_drawdown_usd']:,.2f} ({bt['max_drawdown_pct']}%)\n"
-            f"Fee/trade: ${bt['fee_per_trade']:.2f} | Traders analysed: {bt['traders_analysed']}"
-        )
-    except Exception as exc:
-        log.error("Copy engine backtest failed: %s", exc)
-        bt_msg = f"\n\n⚠️ Backtest failed: {exc}"
-
     # Startup announcement to GG
     startup_msg = (
         f"🤖 <b>Vic v7 COPY ENGINE deployed</b>\n"
         f"Commit: {VIC_VERSION_SHA} | Tag: {VIC_VERSION_TAG}\n"
         f"Mode: {state.mode.upper()} | Equity: ${equity:,.2f}\n\n"
-        f"<b>What changed:</b>\n"
-        f"• 58 TA strategies DISABLED\n"
-        f"• Copy engine: mirrors top 15 Hyperliquid traders by month PnL\n"
+        f"<b>Trader selection:</b>\n"
+        f"• Ranked by WIN RATE only (not account size, not PnL)\n"
+        f"• Candidate pool: top 200 by month PnL (activity proxy)\n"
+        f"• Filters: ≥50 closing trades, 55%–90% win rate, ≤30 closes/day\n"
         f"• Position sizing: SL = 2% of equity per trade\n"
-        f"• Leverage hard cap: {MAX_LEVERAGE_HARD_CAP}x\n"
-        f"• Drawdown killswitch: {EQUITY_DRAWDOWN_KILLSWITCH*100:.0f}%\n"
-        f"• Fee filter: ${FEE_PER_TRADE_USD*2*2:.0f} min TP"
-        f"{bt_msg}\n\n"
+        f"• Leverage cap: {MAX_LEVERAGE_HARD_CAP}x | DD killswitch: {EQUITY_DRAWDOWN_KILLSWITCH*100:.0f}%\n\n"
         f"⏸ <b>PAUSED — send /resume to go live</b>"
     )
     await tg_send(startup_msg)
