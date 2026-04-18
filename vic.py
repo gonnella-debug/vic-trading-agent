@@ -5415,6 +5415,212 @@ async def get_backtest():
     return {"status": "no backtest results available"}
 
 
+@app.post("/tradingview")
+async def tradingview_webhook(req: Request):
+    """Execute a buy/sell when TradingView alert fires.
+
+    Body JSON: {"secret":"<VIC_TV_WEBHOOK_TOKEN>", "symbol":"ETH", "side":"buy"|"sell", "price":<optional>}
+    Normalises common TV symbol formats (ETHUSDT.P, BINANCE:ETHUSDT, ETH/USDT → ETH).
+    Applies Vic's standard risk stack: 2% SL, 4% TP, 10x leverage, 2% account risk, fee filter.
+    """
+    expected = os.getenv("VIC_TV_WEBHOOK_TOKEN", "")
+    try:
+        body = await req.json()
+    except Exception:
+        return JSONResponse({"ok": False, "reason": "invalid_json"}, status_code=400)
+    if not expected or body.get("secret") != expected:
+        return JSONResponse({"ok": False, "reason": "unauthorized"}, status_code=401)
+
+    raw_symbol = str(body.get("symbol", "")).upper().strip()
+    side_raw = str(body.get("side", "")).lower().strip()
+    if side_raw in ("buy", "long"):
+        side = "long"
+    elif side_raw in ("sell", "short"):
+        side = "short"
+    else:
+        return JSONResponse({"ok": False, "reason": f"invalid_side:{side_raw}"}, status_code=400)
+    if not raw_symbol:
+        return JSONResponse({"ok": False, "reason": "missing_symbol"}, status_code=400)
+
+    # Normalise TV symbol: BINANCE:ETHUSDT.P → ETH, ETH/USDT → ETH, ETHUSDT → ETH
+    symbol = raw_symbol.split(":", 1)[1] if ":" in raw_symbol else raw_symbol
+    symbol = symbol.replace("/", "").replace(".P", "").replace("PERP", "")
+    for suffix in ("USDT", "USDC", "USD"):
+        if symbol.endswith(suffix):
+            symbol = symbol[: -len(suffix)]
+            break
+    symbol = symbol.strip()
+    if not symbol:
+        return JSONResponse({"ok": False, "reason": f"bad_symbol:{raw_symbol}"}, status_code=400)
+
+    if state.paused:
+        log.info(f"AYN webhook ignored — Vic paused ({symbol} {side})")
+        return {"ok": False, "reason": "vic_paused", "symbol": symbol, "side": side}
+    if state.drawdown_killswitch_hit:
+        return {"ok": False, "reason": "drawdown_killswitch"}
+
+    strategy = f"ayn_{symbol}"
+    allowed, reason = can_open_trade(strategy, side)
+    if not allowed:
+        await tg_send(f"⏩ AYN {side.upper()} {symbol} skip — {reason}")
+        return {"ok": False, "reason": reason}
+
+    # Price: use body value if provided, else query HL mids
+    try:
+        price = float(body.get("price") or 0)
+    except Exception:
+        price = 0.0
+    if price <= 0:
+        try:
+            loop = asyncio.get_running_loop()
+            mids = await loop.run_in_executor(None, hl_info.all_mids)
+            price = float(mids.get(symbol, 0))
+        except Exception as e:
+            log.error(f"AYN {symbol} all_mids failed: {e}")
+            price = 0.0
+    if price <= 0:
+        await tg_send(f"❌ AYN {side.upper()} {symbol} — no price available on HL")
+        return {"ok": False, "reason": "no_price_hl"}
+
+    equity = await fetch_live_equity()
+    if equity <= 0:
+        return {"ok": False, "reason": "no_equity"}
+
+    # Vic risk stack: 2% SL, 4% TP, 2% account risk, 10x cap
+    sl_dist = price * (MIN_SL_PCT / 100.0)
+    tp_dist = price * 0.04
+    if side == "long":
+        sl_price = price - sl_dist
+        tp_price = price + tp_dist
+    else:
+        sl_price = price + sl_dist
+        tp_price = price - tp_dist
+
+    risk_dollars = equity * TARGET_RISK_PCT
+    size = math.floor(risk_dollars / sl_dist * 100000) / 100000
+    notional = size * price
+    if size <= 0 or notional < 10:
+        await tg_send(f"❌ AYN {side.upper()} {symbol} — notional ${notional:.2f} below HL $10 min")
+        return {"ok": False, "reason": "size_too_small", "notional": round(notional, 2)}
+
+    # Fee filter: gross TP must clear 2× round-trip fees × safety mult
+    expected_tp_gross = size * tp_dist
+    min_required = FEE_PER_TRADE_USD * 2 * MIN_NET_PROFIT_MULT
+    if expected_tp_gross < min_required:
+        await tg_send(
+            f"⏩ AYN {side.upper()} {symbol} skip — TP gross ${expected_tp_gross:.2f} "
+            f"< ${min_required:.2f} fee floor"
+        )
+        return {"ok": False, "reason": "fee_filter"}
+
+    if state.mode != "live" or not hl_exchange:
+        return {"ok": False, "reason": "not_live"}
+
+    loop = asyncio.get_running_loop()
+    is_buy = side == "long"
+
+    try:
+        await loop.run_in_executor(
+            None, lambda: hl_exchange.update_leverage(MAX_LEVERAGE_HARD_CAP, symbol, is_cross=True)
+        )
+    except Exception as e:
+        log.warning(f"AYN {symbol} leverage set failed (continuing): {e}")
+
+    try:
+        open_result = await loop.run_in_executor(
+            None, lambda: hl_exchange.market_open(symbol, is_buy=is_buy, sz=size)
+        )
+        if open_result.get("status") != "ok":
+            raise Exception(f"rejected: {open_result}")
+        statuses = open_result.get("response", {}).get("data", {}).get("statuses", [])
+        for s in statuses:
+            if "error" in s:
+                raise Exception(f"error: {s['error']}")
+    except Exception as e:
+        log.error(f"AYN {symbol} market_open failed: {e}")
+        await tg_send(f"❌ AYN {side.upper()} {symbol} OPEN FAILED: {sanitize_html(str(e))}")
+        return {"ok": False, "reason": f"open_failed:{e}"}
+
+    # Round SL/TP sensibly for non-crypto-major coins (avoid sub-cent precision on equities)
+    def _round_px(p: float) -> float:
+        if p >= 1000: return round(p, 2)
+        if p >= 10: return round(p, 3)
+        return round(p, 5)
+    sl_price = _round_px(sl_price)
+    tp_price = _round_px(tp_price)
+
+    sl_placed = False
+    tp_placed = False
+    try:
+        sl_result = await loop.run_in_executor(
+            None, lambda: hl_exchange.order(
+                symbol, is_buy=(not is_buy), sz=size, limit_px=sl_price,
+                order_type={"trigger": {"triggerPx": sl_price, "isMarket": True, "tpsl": "sl"}},
+                reduce_only=True,
+            )
+        )
+        sl_placed = sl_result.get("status") == "ok" and not any(
+            "error" in s for s in sl_result.get("response", {}).get("data", {}).get("statuses", [])
+        )
+        if not sl_placed:
+            log.error(f"AYN {symbol} SL order rejected: {sl_result}")
+    except Exception as e:
+        log.error(f"AYN {symbol} SL failed: {e}")
+
+    try:
+        tp_result = await loop.run_in_executor(
+            None, lambda: hl_exchange.order(
+                symbol, is_buy=(not is_buy), sz=size, limit_px=tp_price,
+                order_type={"trigger": {"triggerPx": tp_price, "isMarket": True, "tpsl": "tp"}},
+                reduce_only=True,
+            )
+        )
+        tp_placed = tp_result.get("status") == "ok" and not any(
+            "error" in s for s in tp_result.get("response", {}).get("data", {}).get("statuses", [])
+        )
+        if not tp_placed:
+            log.error(f"AYN {symbol} TP order rejected: {tp_result}")
+    except Exception as e:
+        log.error(f"AYN {symbol} TP failed: {e}")
+
+    state.current_position = {
+        "strategy": strategy, "side": side, "entry": price,
+        "sl": sl_price, "tp": tp_price, "size": size, "coin": symbol,
+        "leverage": MAX_LEVERAGE_HARD_CAP,
+        "opened_at": datetime.now(timezone.utc).isoformat(),
+    }
+    state.trades_today += 1
+    save_state()
+
+    # Emergency close if both SL and TP failed — we're unhedged
+    if not sl_placed and not tp_placed:
+        try:
+            await loop.run_in_executor(None, lambda: hl_exchange.market_close(symbol, sz=size))
+            await tg_send(
+                f"🚨 AYN {side.upper()} {symbol} — BOTH SL/TP placement failed, position closed immediately."
+            )
+            state.current_position = None
+            save_state()
+            return {"ok": False, "reason": "both_stops_failed_emergency_closed"}
+        except Exception as close_exc:
+            await tg_send(
+                f"🚨🚨 CRITICAL: AYN {symbol} naked position — SL/TP and emergency close both failed. "
+                f"CLOSE MANUALLY: {sanitize_html(str(close_exc))}"
+            )
+
+    await tg_send(
+        f"📈 <b>AYN {side.upper()} {symbol}</b>\n"
+        f"Entry: ${price:,.4f} | Size: {size}\n"
+        f"SL: ${sl_price:,.4f} ({MIN_SL_PCT}%) [{'✓' if sl_placed else '✗'}]\n"
+        f"TP: ${tp_price:,.4f} (4%) [{'✓' if tp_placed else '✗'}]\n"
+        f"Risk: ${risk_dollars:.2f} | Lev: {MAX_LEVERAGE_HARD_CAP}x"
+    )
+    return {
+        "ok": True, "coin": symbol, "side": side, "entry": price, "size": size,
+        "sl": sl_price, "tp": tp_price, "sl_placed": sl_placed, "tp_placed": tp_placed,
+    }
+
+
 @app.post("/test_trade")
 async def test_trade():
     if not hl_exchange:
