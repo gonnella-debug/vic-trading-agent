@@ -4764,7 +4764,9 @@ async def telegram_polling_loop():
 
                     if cmd == "/start":
                         await tg_reply(chat_id,
-                            "Hey! I'm Vic v7 COPY ENGINE.\n\n"
+                            "Hey! I'm Vic.\n"
+                            "Primary: AYN 15m flip-on-signal (TradingView webhook).\n"
+                            "Secondary: HL leaderboard copy (running in background).\n\n"
                             "Commands: /resume /pause /status /equity /copystatus /closeall"
                         )
                         continue
@@ -4781,11 +4783,22 @@ async def telegram_polling_loop():
                                 pass
                         save_state()
                         eq = state.live_equity or 0
+                        pos = state.current_position
+                        if pos:
+                            next_line = (
+                                f"Currently holding <b>{pos['side'].upper()} {pos.get('coin','?')}</b> "
+                                f"@ ${pos['entry']:,.2f} — will flip on opposite AYN signal."
+                            )
+                        else:
+                            next_line = "Flat. Will enter on next AYN Buy/Sell webhook from TradingView."
                         await tg_reply(chat_id,
-                            f"▶️ Vic v7 COPY ENGINE is now LIVE.\n"
-                            f"Equity: ${eq:,.2f} | Tracking {len(copy_state.traders)} top traders.\n"
+                            f"▶️ Vic is LIVE.\n"
+                            f"Equity: ${eq:,.2f}\n"
+                            f"Primary: AYN 15m flip-on-signal — 2% SL, breakeven at +{AYN_BREAKEVEN_TRIGGER_PCT:.0f}%, no TP, "
+                            f"flip on opposite signal.\n"
+                            f"Secondary: HL leaderboard copy ({len(copy_state.traders)} tracked).\n"
                             f"Drawdown killswitch: {EQUITY_DRAWDOWN_KILLSWITCH*100:.0f}%\n"
-                            f"Next trade mirrors the next position change from a tracked trader."
+                            f"{next_line}"
                         )
                         continue
 
@@ -4830,15 +4843,24 @@ async def telegram_polling_loop():
                         continue
 
                     if cmd == "/status":
+                        from copy_engine import copy_state
                         eq = state.live_equity or 0
                         pos = state.current_position
-                        pos_str = f"{pos['strategy']} {pos['side']} {pos.get('coin','BTC')} @ ${pos['entry']:,.2f}" if pos else "None"
+                        if pos:
+                            be = " (BE set)" if pos.get("breakeven_set") else ""
+                            pos_str = (
+                                f"{pos['side'].upper()} {pos.get('coin','?')} @ ${pos['entry']:,.4f} | "
+                                f"SL ${pos['sl']:,.4f}{be} | size {pos['size']} | strat {pos['strategy']}"
+                            )
+                        else:
+                            pos_str = "flat"
                         await tg_reply(chat_id,
-                            f"🤖 <b>Vic v7 Copy Engine</b>\n"
-                            f"Mode: {state.mode} | {'PAUSED' if state.paused else 'LIVE'}\n"
-                            f"Equity: ${eq:,.2f} | Position: {pos_str}\n"
-                            f"Trades today: {state.trades_today}/{MAX_TRADES_PER_DAY}\n"
-                            f"Losses: {state.losses_today}/{MAX_LOSSES_PER_DAY}\n"
+                            f"🤖 <b>Vic</b> — {state.mode.upper()} | {'PAUSED' if state.paused else 'LIVE'}\n"
+                            f"Equity: ${eq:,.2f} (peak ${state.peak_equity:,.2f})\n"
+                            f"Position: {pos_str}\n"
+                            f"Primary: AYN 15m flip-on-signal (2% SL, BE at +{AYN_BREAKEVEN_TRIGGER_PCT:.0f}%, no TP).\n"
+                            f"Secondary: HL copy ({len(copy_state.traders)} tracked, "
+                            f"{copy_state.trades_executed} exec, {copy_state.trades_skipped} skip).\n"
                             f"Daily PnL: ${state.daily_pnl:+,.2f}"
                         )
                         continue
