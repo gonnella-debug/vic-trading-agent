@@ -92,6 +92,7 @@ ACCOUNT_CAPITAL = ACCOUNT_CAPITAL_FALLBACK  # Legacy alias (display/backtest onl
 MAX_RISK_PCT = 0.02               # 2% hard cap per trade — no confidence scaling
 TARGET_RISK_PCT = 0.02            # 2% target risk per trade
 MIN_SL_PCT = 2.0                  # 2% minimum stop distance (was 0.5%)
+AYN_BREAKEVEN_TRIGGER_PCT = 1.0   # +1% unrealized profit → move SL to entry (breakeven)
 MAX_TRADES_PER_DAY = 4            # Max 4 trades per day
 MAX_LOSSES_PER_DAY = 3            # 3 losing trades = stop for the day
 FEE_PER_TRADE_USD = 3.0           # Hyperliquid fee per entry/exit (round trip ~ $6)
@@ -3332,6 +3333,12 @@ async def position_monitor_loop():
                 await asyncio.sleep(5)
                 continue
 
+            # AYN flip-model positions are managed by the /tradingview webhook (flip on signal)
+            # and ayn_breakeven_watcher (BE stop). Skip them here.
+            if pos.get("strategy", "").startswith("ayn_"):
+                await asyncio.sleep(10)
+                continue
+
             price = await get_btc_price()
             if price <= 0:
                 await asyncio.sleep(10)
@@ -5415,13 +5422,151 @@ async def get_backtest():
     return {"status": "no backtest results available"}
 
 
+def _round_px(p: float) -> float:
+    """Round a price to a precision that HL accepts across majors / alts / equity perps."""
+    if p >= 1000: return round(p, 2)
+    if p >= 10: return round(p, 3)
+    return round(p, 5)
+
+
+def _normalise_symbol(raw: str) -> str:
+    s = raw.split(":", 1)[1] if ":" in raw else raw
+    s = s.replace("/", "").replace(".P", "").replace("PERP", "")
+    for suffix in ("USDT", "USDC", "USD"):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)]
+            break
+    return s.strip()
+
+
+async def _ayn_cancel_sl(coin: str, oid) -> bool:
+    if not oid or not hl_exchange:
+        return False
+    try:
+        loop = asyncio.get_running_loop()
+        res = await loop.run_in_executor(None, lambda: hl_exchange.cancel(coin, oid))
+        return res.get("status") == "ok"
+    except Exception as e:
+        log.error(f"AYN cancel SL {coin} oid={oid}: {e}")
+        return False
+
+
+async def _ayn_place_sl(coin: str, side: str, size: float, sl_price: float):
+    """Place a reduce-only stop-loss trigger. Returns (placed: bool, oid: Optional[int])."""
+    loop = asyncio.get_running_loop()
+    is_buy_for_close = side == "short"
+    try:
+        res = await loop.run_in_executor(None, lambda: hl_exchange.order(
+            coin, is_buy=is_buy_for_close, sz=size, limit_px=sl_price,
+            order_type={"trigger": {"triggerPx": sl_price, "isMarket": True, "tpsl": "sl"}},
+            reduce_only=True,
+        ))
+        statuses = res.get("response", {}).get("data", {}).get("statuses", [])
+        for s in statuses:
+            if "resting" in s:
+                return True, s["resting"].get("oid")
+            if "error" in s:
+                log.error(f"AYN {coin} SL placement error: {s['error']}")
+                return False, None
+        log.error(f"AYN {coin} SL unexpected response: {res}")
+        return False, None
+    except Exception as e:
+        log.error(f"AYN {coin} SL failed: {e}")
+        return False, None
+
+
+async def _ayn_open(symbol: str, side: str, signal_price: float, equity: float) -> dict:
+    """Market-open a position for AYN with a 2% hard SL. No TP — exit on opposite signal or breakeven stop."""
+    sl_dist = signal_price * (MIN_SL_PCT / 100.0)
+    risk_dollars = equity * TARGET_RISK_PCT
+    size = math.floor(risk_dollars / sl_dist * 100000) / 100000
+    notional = size * signal_price
+    if size <= 0 or notional < 10:
+        return {"ok": False, "reason": "size_too_small", "notional": round(notional, 2)}
+
+    loop = asyncio.get_running_loop()
+    is_buy = side == "long"
+    try:
+        await loop.run_in_executor(
+            None, lambda: hl_exchange.update_leverage(MAX_LEVERAGE_HARD_CAP, symbol, is_cross=True)
+        )
+    except Exception as e:
+        log.warning(f"AYN {symbol} leverage set failed (continuing): {e}")
+
+    try:
+        open_result = await loop.run_in_executor(
+            None, lambda: hl_exchange.market_open(symbol, is_buy=is_buy, sz=size)
+        )
+        if open_result.get("status") != "ok":
+            raise Exception(f"rejected: {open_result}")
+        for s in open_result.get("response", {}).get("data", {}).get("statuses", []):
+            if "error" in s:
+                raise Exception(f"status error: {s['error']}")
+    except Exception as e:
+        log.error(f"AYN {symbol} market_open failed: {e}")
+        return {"ok": False, "reason": f"open_failed:{e}"}
+
+    # Use signal price as entry estimate; breakeven watcher will self-correct via HL pnl
+    entry = signal_price
+    sl_price = _round_px(entry - sl_dist if side == "long" else entry + sl_dist)
+
+    placed, sl_oid = await _ayn_place_sl(symbol, side, size, sl_price)
+
+    # If SL placement failed, emergency close — we won't trade naked
+    if not placed:
+        try:
+            await loop.run_in_executor(None, lambda: hl_exchange.market_close(symbol, sz=size))
+            return {"ok": False, "reason": "sl_failed_emergency_closed"}
+        except Exception as close_exc:
+            await tg_send(
+                f"🚨🚨 CRITICAL: AYN {symbol} naked position — SL AND emergency close failed. "
+                f"CLOSE MANUALLY: {sanitize_html(str(close_exc))}"
+            )
+            return {"ok": False, "reason": "naked_position_manual_required"}
+
+    return {
+        "ok": True, "coin": symbol, "side": side, "entry": entry, "size": size,
+        "sl": sl_price, "sl_oid": sl_oid, "risk_dollars": risk_dollars,
+    }
+
+
+async def _ayn_close_current() -> dict:
+    """Cancel SL of current AYN position and market-close it. Returns {ok, coin, side, size}."""
+    pos = state.current_position
+    if not pos:
+        return {"ok": False, "reason": "no_position"}
+    coin = pos["coin"]
+    size = pos["size"]
+    side = pos["side"]
+    sl_oid = pos.get("sl_oid")
+
+    await _ayn_cancel_sl(coin, sl_oid)
+
+    loop = asyncio.get_running_loop()
+    try:
+        res = await loop.run_in_executor(None, lambda: hl_exchange.market_close(coin, sz=size))
+        if res.get("status") != "ok":
+            raise Exception(f"close rejected: {res}")
+    except Exception as e:
+        log.error(f"AYN close {coin} failed: {e}")
+        return {"ok": False, "reason": f"close_failed:{e}", "coin": coin, "side": side, "size": size}
+
+    state.current_position = None
+    save_state()
+    return {"ok": True, "coin": coin, "side": side, "size": size}
+
+
 @app.post("/tradingview")
 async def tradingview_webhook(req: Request):
-    """Execute a buy/sell when TradingView alert fires.
+    """Execute a Buy/Sell when an AYN TradingView alert fires. Flip-on-signal model.
 
     Body JSON: {"secret":"<VIC_TV_WEBHOOK_TOKEN>", "symbol":"ETH", "side":"buy"|"sell", "price":<optional>}
-    Normalises common TV symbol formats (ETHUSDT.P, BINANCE:ETHUSDT, ETH/USDT → ETH).
-    Applies Vic's standard risk stack: 2% SL, 4% TP, 10x leverage, 2% account risk, fee filter.
+
+    Behaviour:
+      - Flat + signal → open position, 2% hard SL, no TP.
+      - Same-direction signal → ignore (no stacking, no re-entry).
+      - Opposite signal → cancel SL, market-close current, open opposite direction.
+      - Breakeven watcher moves SL to entry once price is +1% in our favour.
     """
     expected = os.getenv("VIC_TV_WEBHOOK_TOKEN", "")
     try:
@@ -5431,7 +5576,6 @@ async def tradingview_webhook(req: Request):
     if not expected or body.get("secret") != expected:
         return JSONResponse({"ok": False, "reason": "unauthorized"}, status_code=401)
 
-    raw_symbol = str(body.get("symbol", "")).upper().strip()
     side_raw = str(body.get("side", "")).lower().strip()
     if side_raw in ("buy", "long"):
         side = "long"
@@ -5439,33 +5583,52 @@ async def tradingview_webhook(req: Request):
         side = "short"
     else:
         return JSONResponse({"ok": False, "reason": f"invalid_side:{side_raw}"}, status_code=400)
+
+    raw_symbol = str(body.get("symbol", "")).upper().strip()
     if not raw_symbol:
         return JSONResponse({"ok": False, "reason": "missing_symbol"}, status_code=400)
-
-    # Normalise TV symbol: BINANCE:ETHUSDT.P → ETH, ETH/USDT → ETH, ETHUSDT → ETH
-    symbol = raw_symbol.split(":", 1)[1] if ":" in raw_symbol else raw_symbol
-    symbol = symbol.replace("/", "").replace(".P", "").replace("PERP", "")
-    for suffix in ("USDT", "USDC", "USD"):
-        if symbol.endswith(suffix):
-            symbol = symbol[: -len(suffix)]
-            break
-    symbol = symbol.strip()
+    symbol = _normalise_symbol(raw_symbol)
     if not symbol:
         return JSONResponse({"ok": False, "reason": f"bad_symbol:{raw_symbol}"}, status_code=400)
 
+    # Minimal gates — paused and killswitch only. can_open_trade's daily caps / regime /
+    # active_strategies registry don't apply to the flip-model flow.
     if state.paused:
         log.info(f"AYN webhook ignored — Vic paused ({symbol} {side})")
         return {"ok": False, "reason": "vic_paused", "symbol": symbol, "side": side}
     if state.drawdown_killswitch_hit:
+        await tg_send(f"⏩ AYN {side.upper()} {symbol} blocked — drawdown killswitch active")
         return {"ok": False, "reason": "drawdown_killswitch"}
+    if state.mode != "live" or not hl_exchange:
+        return {"ok": False, "reason": "not_live"}
 
     strategy = f"ayn_{symbol}"
-    allowed, reason = can_open_trade(strategy, side)
-    if not allowed:
-        await tg_send(f"⏩ AYN {side.upper()} {symbol} skip — {reason}")
-        return {"ok": False, "reason": reason}
 
-    # Price: use body value if provided, else query HL mids
+    # Position handling: same direction = ignore; opposite = flip
+    current = state.current_position
+    if current and current.get("strategy", "").startswith("ayn_"):
+        cur_coin = current.get("coin")
+        cur_side = current.get("side")
+        if cur_coin != symbol:
+            await tg_send(
+                f"⏩ AYN {side.upper()} {symbol} skip — already in {cur_side.upper()} on {cur_coin} "
+                f"(one AYN symbol at a time)"
+            )
+            return {"ok": False, "reason": "different_symbol_already_open",
+                    "current": cur_coin, "requested": symbol}
+        if cur_side == side:
+            log.info(f"AYN {symbol} {side} ignored — already {cur_side}")
+            return {"ok": False, "reason": "already_in_direction", "symbol": symbol, "side": side}
+        # opposite → flip below
+    elif current:
+        # Non-AYN legacy position open — refuse to touch it
+        await tg_send(
+            f"⚠️ AYN {side.upper()} {symbol} skip — non-AYN position open ({current.get('strategy')}). "
+            f"Close that first."
+        )
+        return {"ok": False, "reason": "non_ayn_position_blocking"}
+
+    # Price: body value or HL mids
     try:
         price = float(body.get("price") or 0)
     except Exception:
@@ -5486,139 +5649,116 @@ async def tradingview_webhook(req: Request):
     if equity <= 0:
         return {"ok": False, "reason": "no_equity"}
 
-    # Vic risk stack: 2% SL, 4% TP, 2% account risk, 10x cap
-    sl_dist = price * (MIN_SL_PCT / 100.0)
-    tp_dist = price * 0.04
-    if side == "long":
-        sl_price = price - sl_dist
-        tp_price = price + tp_dist
-    else:
-        sl_price = price + sl_dist
-        tp_price = price - tp_dist
-
-    risk_dollars = equity * TARGET_RISK_PCT
-    size = math.floor(risk_dollars / sl_dist * 100000) / 100000
-    notional = size * price
-    if size <= 0 or notional < 10:
-        await tg_send(f"❌ AYN {side.upper()} {symbol} — notional ${notional:.2f} below HL $10 min")
-        return {"ok": False, "reason": "size_too_small", "notional": round(notional, 2)}
-
-    # Fee filter: gross TP must clear 2× round-trip fees × safety mult
-    expected_tp_gross = size * tp_dist
-    min_required = FEE_PER_TRADE_USD * 2 * MIN_NET_PROFIT_MULT
-    if expected_tp_gross < min_required:
-        await tg_send(
-            f"⏩ AYN {side.upper()} {symbol} skip — TP gross ${expected_tp_gross:.2f} "
-            f"< ${min_required:.2f} fee floor"
-        )
-        return {"ok": False, "reason": "fee_filter"}
-
-    if state.mode != "live" or not hl_exchange:
-        return {"ok": False, "reason": "not_live"}
-
-    loop = asyncio.get_running_loop()
-    is_buy = side == "long"
-
-    try:
-        await loop.run_in_executor(
-            None, lambda: hl_exchange.update_leverage(MAX_LEVERAGE_HARD_CAP, symbol, is_cross=True)
-        )
-    except Exception as e:
-        log.warning(f"AYN {symbol} leverage set failed (continuing): {e}")
-
-    try:
-        open_result = await loop.run_in_executor(
-            None, lambda: hl_exchange.market_open(symbol, is_buy=is_buy, sz=size)
-        )
-        if open_result.get("status") != "ok":
-            raise Exception(f"rejected: {open_result}")
-        statuses = open_result.get("response", {}).get("data", {}).get("statuses", [])
-        for s in statuses:
-            if "error" in s:
-                raise Exception(f"error: {s['error']}")
-    except Exception as e:
-        log.error(f"AYN {symbol} market_open failed: {e}")
-        await tg_send(f"❌ AYN {side.upper()} {symbol} OPEN FAILED: {sanitize_html(str(e))}")
-        return {"ok": False, "reason": f"open_failed:{e}"}
-
-    # Round SL/TP sensibly for non-crypto-major coins (avoid sub-cent precision on equities)
-    def _round_px(p: float) -> float:
-        if p >= 1000: return round(p, 2)
-        if p >= 10: return round(p, 3)
-        return round(p, 5)
-    sl_price = _round_px(sl_price)
-    tp_price = _round_px(tp_price)
-
-    sl_placed = False
-    tp_placed = False
-    try:
-        sl_result = await loop.run_in_executor(
-            None, lambda: hl_exchange.order(
-                symbol, is_buy=(not is_buy), sz=size, limit_px=sl_price,
-                order_type={"trigger": {"triggerPx": sl_price, "isMarket": True, "tpsl": "sl"}},
-                reduce_only=True,
+    # Flip: close current opposite-side position
+    flipped_from = None
+    if current and current.get("strategy", "").startswith("ayn_"):
+        flipped_from = current.get("side")
+        close_res = await _ayn_close_current()
+        if not close_res.get("ok"):
+            await tg_send(
+                f"🚨 AYN flip {symbol} failed — couldn't close {flipped_from}. "
+                f"Reason: {close_res.get('reason')}. NOT opening new position."
             )
-        )
-        sl_placed = sl_result.get("status") == "ok" and not any(
-            "error" in s for s in sl_result.get("response", {}).get("data", {}).get("statuses", [])
-        )
-        if not sl_placed:
-            log.error(f"AYN {symbol} SL order rejected: {sl_result}")
-    except Exception as e:
-        log.error(f"AYN {symbol} SL failed: {e}")
+            return {"ok": False, "reason": f"flip_close_failed:{close_res.get('reason')}"}
 
-    try:
-        tp_result = await loop.run_in_executor(
-            None, lambda: hl_exchange.order(
-                symbol, is_buy=(not is_buy), sz=size, limit_px=tp_price,
-                order_type={"trigger": {"triggerPx": tp_price, "isMarket": True, "tpsl": "tp"}},
-                reduce_only=True,
-            )
-        )
-        tp_placed = tp_result.get("status") == "ok" and not any(
-            "error" in s for s in tp_result.get("response", {}).get("data", {}).get("statuses", [])
-        )
-        if not tp_placed:
-            log.error(f"AYN {symbol} TP order rejected: {tp_result}")
-    except Exception as e:
-        log.error(f"AYN {symbol} TP failed: {e}")
+    # Open new position
+    opened = await _ayn_open(symbol, side, price, equity)
+    if not opened.get("ok"):
+        await tg_send(f"❌ AYN {side.upper()} {symbol} OPEN FAILED: {opened.get('reason')}")
+        return opened
 
+    # Persist position with the SL oid so breakeven-watcher can cancel it later
     state.current_position = {
-        "strategy": strategy, "side": side, "entry": price,
-        "sl": sl_price, "tp": tp_price, "size": size, "coin": symbol,
+        "strategy": strategy, "side": side, "entry": opened["entry"],
+        "sl": opened["sl"], "sl_oid": opened.get("sl_oid"),
+        "size": opened["size"], "coin": symbol,
         "leverage": MAX_LEVERAGE_HARD_CAP,
+        "breakeven_set": False,
         "opened_at": datetime.now(timezone.utc).isoformat(),
+        "open_time": datetime.now(timezone.utc).isoformat(),  # legacy field used by monitors
     }
     state.trades_today += 1
     save_state()
 
-    # Emergency close if both SL and TP failed — we're unhedged
-    if not sl_placed and not tp_placed:
-        try:
-            await loop.run_in_executor(None, lambda: hl_exchange.market_close(symbol, sz=size))
-            await tg_send(
-                f"🚨 AYN {side.upper()} {symbol} — BOTH SL/TP placement failed, position closed immediately."
-            )
-            state.current_position = None
-            save_state()
-            return {"ok": False, "reason": "both_stops_failed_emergency_closed"}
-        except Exception as close_exc:
-            await tg_send(
-                f"🚨🚨 CRITICAL: AYN {symbol} naked position — SL/TP and emergency close both failed. "
-                f"CLOSE MANUALLY: {sanitize_html(str(close_exc))}"
-            )
-
+    flip_note = f"\n🔁 Flipped from {flipped_from.upper()}" if flipped_from else ""
     await tg_send(
-        f"📈 <b>AYN {side.upper()} {symbol}</b>\n"
-        f"Entry: ${price:,.4f} | Size: {size}\n"
-        f"SL: ${sl_price:,.4f} ({MIN_SL_PCT}%) [{'✓' if sl_placed else '✗'}]\n"
-        f"TP: ${tp_price:,.4f} (4%) [{'✓' if tp_placed else '✗'}]\n"
-        f"Risk: ${risk_dollars:.2f} | Lev: {MAX_LEVERAGE_HARD_CAP}x"
+        f"📈 <b>AYN {side.upper()} {symbol}</b>{flip_note}\n"
+        f"Entry: ${opened['entry']:,.4f} | Size: {opened['size']}\n"
+        f"SL: ${opened['sl']:,.4f} ({MIN_SL_PCT}%) ✓\n"
+        f"Risk: ${opened['risk_dollars']:.2f} | Lev: {MAX_LEVERAGE_HARD_CAP}x\n"
+        f"Next: breakeven stop at +{AYN_BREAKEVEN_TRIGGER_PCT}%, flip on opposite signal."
     )
     return {
-        "ok": True, "coin": symbol, "side": side, "entry": price, "size": size,
-        "sl": sl_price, "tp": tp_price, "sl_placed": sl_placed, "tp_placed": tp_placed,
+        "ok": True, "coin": symbol, "side": side, "entry": opened["entry"],
+        "size": opened["size"], "sl": opened["sl"], "flipped_from": flipped_from,
     }
+
+
+async def ayn_breakeven_watcher():
+    """Move the AYN SL to entry once the position is +AYN_BREAKEVEN_TRIGGER_PCT% in profit."""
+    while True:
+        try:
+            pos = state.current_position
+            if not pos or not pos.get("strategy", "").startswith("ayn_") or pos.get("breakeven_set"):
+                await asyncio.sleep(15)
+                continue
+
+            coin = pos["coin"]
+            entry = float(pos["entry"])
+            side = pos["side"]
+            size = pos["size"]
+
+            loop = asyncio.get_running_loop()
+            try:
+                mids = await loop.run_in_executor(None, hl_info.all_mids)
+                price = float(mids.get(coin, 0))
+            except Exception as e:
+                log.error(f"AYN BE watcher all_mids: {e}")
+                await asyncio.sleep(15)
+                continue
+            if price <= 0:
+                await asyncio.sleep(15)
+                continue
+
+            pnl_pct = (price - entry) / entry * 100 if side == "long" else (entry - price) / entry * 100
+
+            if pnl_pct < AYN_BREAKEVEN_TRIGGER_PCT:
+                await asyncio.sleep(15)
+                continue
+
+            # Move SL to entry
+            old_oid = pos.get("sl_oid")
+            await _ayn_cancel_sl(coin, old_oid)
+            be_price = _round_px(entry)
+            placed, new_oid = await _ayn_place_sl(coin, side, size, be_price)
+            if not placed:
+                # Try to restore original SL as a fallback before giving up
+                orig_sl = pos.get("sl")
+                if orig_sl:
+                    _p, restored_oid = await _ayn_place_sl(coin, side, size, orig_sl)
+                    if _p:
+                        pos["sl_oid"] = restored_oid
+                        state.current_position = pos
+                        save_state()
+                await tg_send(
+                    f"⚠️ AYN {side.upper()} {coin} — breakeven SL place FAILED at +{pnl_pct:.2f}%. "
+                    f"Original SL restored. Will retry."
+                )
+                await asyncio.sleep(30)
+                continue
+
+            pos["sl"] = be_price
+            pos["sl_oid"] = new_oid
+            pos["breakeven_set"] = True
+            state.current_position = pos
+            save_state()
+            await tg_send(
+                f"🛡️ <b>AYN {side.upper()} {coin}</b> breakeven set at +{pnl_pct:.2f}%\n"
+                f"SL moved to ${be_price:,.4f} (entry). Trade is risk-free."
+            )
+        except Exception as e:
+            log.error(f"AYN breakeven watcher loop: {e}")
+        await asyncio.sleep(15)
 
 
 @app.post("/test_trade")
@@ -5749,6 +5889,7 @@ async def startup():
     asyncio.create_task(regime_update_loop())
     asyncio.create_task(funding_rate_loop())
     asyncio.create_task(position_monitor_loop())
+    asyncio.create_task(ayn_breakeven_watcher())
     asyncio.create_task(news_sentiment_monitor())
     asyncio.create_task(daily_summary_scheduler())
     asyncio.create_task(daily_reset_scheduler())
