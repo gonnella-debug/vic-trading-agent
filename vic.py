@@ -5423,10 +5423,17 @@ async def get_backtest():
 
 
 def _round_px(p: float) -> float:
-    """Round a price to a precision that HL accepts across majors / alts / equity perps."""
-    if p >= 1000: return round(p, 2)
-    if p >= 10: return round(p, 3)
-    return round(p, 5)
+    """Round to 5 significant figures — HL's trigger-order precision rule.
+
+    HL rejects SL/TP trigger prices with > 5 significant figures as
+    "Invalid TP/SL price". Rounding to 5 sig figs (not N decimal places)
+    is the correct rule across majors / alts / equity perps.
+    """
+    if p <= 0:
+        return p
+    exp = math.floor(math.log10(abs(p)))
+    decimals = max(0, 4 - exp)
+    return round(p, decimals)
 
 
 def _normalise_symbol(raw: str) -> str:
