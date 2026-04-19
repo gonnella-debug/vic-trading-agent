@@ -3622,13 +3622,26 @@ async def _run_macro_scan():
                     "max_tokens": 1024,
                     "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
                     "messages": [{"role": "user", "content": (
-                        "Search for the latest macro events affecting Bitcoin and crypto markets RIGHT NOW. "
-                        "Check: 1) Fed/FOMC decisions or speeches today, 2) US CPI/jobs data releases, "
-                        "3) Tariff or trade war developments, 4) SEC/regulatory actions on crypto, "
-                        "5) Major exchange issues or hacks, 6) Geopolitical events affecting risk assets. "
+                        "Search for macro events that could affect Bitcoin RIGHT NOW or within the next 4 hours.\n\n"
+                        "STRICT RULES for classifying RISK_LEVEL:\n"
+                        "- CRITICAL is reserved ONLY for events happening in the next 4 hours "
+                        "AND that have already caused or are causing immediate market-moving action "
+                        "(e.g. live Fed speech right now, surprise CPI print just released, "
+                        "active exchange hack / flash crash happening in real time).\n"
+                        "- A scheduled event more than 4 hours away (e.g. FOMC next week, CPI tomorrow, "
+                        "a speech at 8pm tonight when it's currently 9am) is NOT critical. "
+                        "It is at most MEDIUM. Future calendar risk is not live risk.\n"
+                        "- If nothing imminent is happening, RISK_LEVEL: LOW.\n\n"
+                        "Check: 1) Fed/FOMC live decisions or speeches in the next 4h, "
+                        "2) US CPI/jobs data already released today, "
+                        "3) Breaking news on tariffs or regulation, "
+                        "4) SEC/regulatory actions on crypto in the last 24h, "
+                        "5) Active exchange issues/hacks happening now, "
+                        "6) Geopolitical events breaking right now. "
                         + (_get_intelligence_summary() + "\n\nFactor in what top traders are doing. " if _get_intelligence_summary() else "")
-                        + "Give a concise factual summary. Flag anything that should STOP a trader from "
-                        "entering new BTC positions right now. End with: RISK_LEVEL: LOW/MEDIUM/HIGH/CRITICAL"
+                        + "Give a concise factual summary with timestamps where possible. "
+                        "End with exactly one of: RISK_LEVEL: LOW / RISK_LEVEL: MEDIUM / "
+                        "RISK_LEVEL: HIGH / RISK_LEVEL: CRITICAL"
                     )}],
                 },
             )
@@ -3646,11 +3659,27 @@ async def _run_macro_scan():
                 log.info("Macro scan complete")
 
                 if "RISK_LEVEL: CRITICAL" in result.upper():
-                    if not state.paused:
+                    # Safety gate: refuse to auto-pause for scheduled future events
+                    # (the prompt should prevent this, but double-check here)
+                    lower = result.lower()
+                    future_event_markers = [
+                        "tomorrow", "next week", "next month", "scheduled for",
+                        "upcoming", "in 9 days", "in 8 days", "in 7 days", "in 6 days",
+                        "in 5 days", "in 4 days", "in 3 days", "in 2 days",
+                        "days away", "day away", "hours away", "later this week",
+                        "later today at", "tonight at", "this evening",
+                    ]
+                    is_future = any(marker in lower for marker in future_event_markers)
+                    if is_future:
+                        log.warning(
+                            "Macro scan labelled CRITICAL but cited future/scheduled event. "
+                            "Refusing to auto-pause. Details: %s", result[:400]
+                        )
+                    elif not state.paused:
                         state.paused = True
                         await tg_send(
                             f"\U0001f6a8 <b>MACRO RISK -- CRITICAL</b>\n\n"
-                            f"Auto-scan detected critical macro conditions.\n"
+                            f"Auto-scan detected critical macro conditions HAPPENING NOW.\n"
                             f"ALL trading PAUSED.\n\n"
                             f"Details:\n{result[:500]}"
                         )
