@@ -5280,7 +5280,7 @@ async def health():
 
 
 VIC_VERSION_SHA = os.getenv("RAILWAY_GIT_COMMIT_SHA", "unknown")[:7]
-VIC_VERSION_TAG = "v7-copy-engine-hl-leaderboard"
+VIC_VERSION_TAG = "v7-ayn-primary-hl-copy-secondary"
 
 
 @app.get("/hl-dump")
